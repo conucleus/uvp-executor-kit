@@ -1,0 +1,13 @@
+{
+  "name": "uvp-executor-kit",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "check": "pnpm --filter @uvp-eth/executor-kit run typecheck",
+    "typecheck": "pnpm --filter @uvp-eth/executor-kit run typecheck",
+    "test": "pnpm --filter @uvp-eth/executor-kit run test",
+    "build": "pnpm --filter @uvp-eth/executor-kit run build"
+  }
+}

@@ -1,0 +1,16 @@
+.DS_Store
+*.log
+
+node_modules/
+dist/
+coverage/
+test-results/
+playwright-report/
+
+.env
+.env.*
+!.env.example
+
+out/
+cache/
+broadcast/

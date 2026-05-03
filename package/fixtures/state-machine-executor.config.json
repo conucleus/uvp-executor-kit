@@ -1,0 +1,35 @@
+{
+  "supplierId": "logistics-provider-a",
+  "executorId": "logistics-provider-a",
+  "walletAddress": "0x0000000000000000000000000000000000000002",
+  "chainId": 84532,
+  "stateMachineAddress": "0x0000000000000000000000000000000000000001",
+  "stateMachines": [
+    {
+      "deploymentId": "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "stateMachineAddress": "0x0000000000000000000000000000000000000001",
+      "status": "active"
+    }
+  ],
+  "chainServicesUrl": "http://127.0.0.1:3001",
+  "stages": ["export.customs"],
+  "callbackMode": "auto",
+  "dryRun": true,
+  "authTokenRef": "UVP_EXECUTOR_TOKEN",
+  "retry": {
+    "maxAttempts": 3,
+    "baseDelayMs": 0
+  },
+  "handlers": {
+    "export.customs#START": {
+      "signals": [
+        {
+          "source": "logistics-provider-a",
+          "stageIdentifier": "export.customs",
+          "signalName": "cmp",
+          "payloadHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    }
+  }
+}
