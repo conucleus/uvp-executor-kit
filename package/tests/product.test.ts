@@ -17,6 +17,7 @@ import {
   type ProductApiFetchInit,
   type ProductApiFetchResponse,
 } from '../src/product.js';
+import { UnsupportedChainTargetError } from '../src/chain-target.js';
 import { ValidationError } from '../src/validation.js';
 
 const privateKey = '0x1111111111111111111111111111111111111111111111111111111111111111' as const;
@@ -108,6 +109,14 @@ describe('Product API mode', () => {
     } finally {
       restoreEnv(envName, previous);
     }
+  });
+
+  it('reserves Solana prepared signal signing behind an explicit error', async () => {
+    await expect(signPreparedSignalContainer({
+      target: 'solana',
+      prepared: preparedSubmission(),
+      privateKeyEnv: 'UVP_PRODUCT_TEST_PRIVATE_KEY',
+    })).rejects.toBeInstanceOf(UnsupportedChainTargetError);
   });
 
   it('requires an explicit private key env value before signing', async () => {

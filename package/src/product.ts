@@ -3,6 +3,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import type { ProductSubmitTypedData, ProductSubmitTypedDataField } from '@uvp-eth/protocol-bindings';
 import { hashEvidenceFile, type EvidenceHashResult } from './evidence.js';
 import { loadPrivateKeyFromEnv } from './signing.js';
+import { UnsupportedChainTargetError, type ChainTarget } from './chain-target.js';
 import {
   ExecutorKitError,
   normalizeAddress,
@@ -57,6 +58,7 @@ export interface PrepareSignalContainerInput extends ProductApiClientOptions {
 }
 
 export interface SignPreparedSignalContainerInput {
+  readonly target?: ChainTarget;
   readonly prepared: PreparedSignalContainer | Record<string, unknown>;
   readonly privateKeyEnv: string;
   readonly walletAddress?: Address | string;
@@ -260,6 +262,9 @@ export async function prepareSignalContainer(input: PrepareSignalContainerInput)
 export async function signPreparedSignalContainer(
   input: SignPreparedSignalContainerInput,
 ): Promise<SignedPreparedSignalContainer> {
+  if (input.target === 'solana') {
+    throw new UnsupportedChainTargetError('solana', 'solana prepared signal signing is reserved but not implemented');
+  }
   const prepared = parsePreparedSignalContainer(input.prepared, 'prepared submission');
   const privateKey = loadProductPrivateKeyFromEnv(input.privateKeyEnv);
   const account = privateKeyToAccount(privateKey);

@@ -1,3 +1,4 @@
+export * from './chain-target.js';
 export * from './constants.js';
 export * from './doctor.js';
 export * from './evidence.js';
