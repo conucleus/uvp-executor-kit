@@ -10,6 +10,7 @@ import {
   getSignalContainerProof,
   listSignalContainers,
   prepareSignalContainer,
+  productApiAuthHeadersFromEnv,
   signPreparedSignalContainer,
   summarizeSignalContainer,
   type PreparedSignalContainer,
@@ -84,6 +85,74 @@ describe('Product API mode', () => {
       walletAddress: submitter,
       intent: 'confirm_stage',
     });
+  });
+
+  it('loads Product API bearer auth only from the named env var', () => {
+    const envName = 'UVP_PRODUCT_API_TEST_TOKEN';
+    const previous = process.env[envName];
+    process.env[envName] = 'secret-product-token';
+    try {
+      const auth = productApiAuthHeadersFromEnv(envName);
+      expect(auth.headers.Authorization).toBe('Bearer secret-product-token');
+      expect(auth.status).toEqual({
+        bearerTokenEnv: envName,
+        bearerTokenConfigured: true,
+        redacted: true,
+      });
+      expect(JSON.stringify(auth.status)).not.toContain('secret-product-token');
+    } finally {
+      restoreEnv(envName, previous);
+    }
+  });
+
+  it('passes Product API auth token env headers from the CLI without printing the token', async () => {
+    const logs: string[] = [];
+    const envName = 'UVP_PRODUCT_API_CLI_TOKEN';
+    const token = 'secret-cli-product-token';
+    const previousEnv = process.env[envName];
+    const originalLog = console.log;
+    const originalFetch = globalThis.fetch;
+    let authorizationHeader: string | undefined;
+    process.env[envName] = token;
+    console.log = (message?: unknown) => {
+      logs.push(String(message));
+    };
+    globalThis.fetch = (async (_url, init) => {
+      authorizationHeader = (init?.headers as Record<string, string> | undefined)?.Authorization;
+      return jsonResponse({
+        tasks: [
+          {
+            taskId: 'task_auth',
+            orderId: 'order_auth',
+            title: 'Auth task',
+            status: 'open',
+          },
+        ],
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    try {
+      await main([
+        'node',
+        'uvp-executor',
+        'product',
+        'tasks',
+        '--chain-services-url',
+        'http://chain.local',
+        '--wallet-address',
+        submitter,
+        '--auth-token-env',
+        envName,
+      ]);
+      expect(authorizationHeader).toBe(`Bearer ${token}`);
+      expect(logs[0]).toContain('"taskId":"task_auth"');
+      expect(logs[0]).not.toContain(token);
+      expect(logs[0]).not.toContain('Authorization');
+    } finally {
+      console.log = originalLog;
+      restoreFetch(originalFetch);
+      restoreEnv(envName, previousEnv);
+    }
   });
 
   it('fails closed on malformed Product API task responses', async () => {

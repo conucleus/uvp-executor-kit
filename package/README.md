@@ -95,11 +95,13 @@ Use Product API task mode for participant-facing signal containers:
 ```bash
 uvp-executor product tasks \
   --chain-services-url http://127.0.0.1:8787 \
-  --wallet-address 0x0000000000000000000000000000000000000002
+  --wallet-address 0x0000000000000000000000000000000000000002 \
+  --auth-token-env UVP_PRODUCT_API_AUTH_TOKEN
 
 uvp-executor product task get task_123 \
   --chain-services-url http://127.0.0.1:8787 \
-  --wallet-address 0x0000000000000000000000000000000000000002
+  --wallet-address 0x0000000000000000000000000000000000000002 \
+  --auth-token-env UVP_PRODUCT_API_AUTH_TOKEN
 
 uvp-executor product evidence hash ./evidence/customs.json
 
@@ -108,18 +110,22 @@ uvp-executor product prepare task_123 \
   --wallet-address 0x0000000000000000000000000000000000000002 \
   --evidence-id ev_123 \
   --intent confirm_stage \
-  --prepared-file .uvp-prepared-submit.json
+  --prepared-file .uvp-prepared-submit.json \
+  --auth-token-env UVP_PRODUCT_API_AUTH_TOKEN
 
 UVP_PARTICIPANT_PRIVATE_KEY=0x... uvp-executor product submit task_123 \
   --chain-services-url http://127.0.0.1:8787 \
   --prepared-file .uvp-prepared-submit.json \
-  --private-key-env UVP_PARTICIPANT_PRIVATE_KEY
+  --private-key-env UVP_PARTICIPANT_PRIVATE_KEY \
+  --auth-token-env UVP_PRODUCT_API_AUTH_TOKEN
 
 uvp-executor product proof sub_123 \
-  --chain-services-url http://127.0.0.1:8787
+  --chain-services-url http://127.0.0.1:8787 \
+  --auth-token-env UVP_PRODUCT_API_AUTH_TOKEN
 
 uvp-executor product status sub_123 \
-  --chain-services-url http://127.0.0.1:8787
+  --chain-services-url http://127.0.0.1:8787 \
+  --auth-token-env UVP_PRODUCT_API_AUTH_TOKEN
 ```
 
 Product commands print JSON summaries for automation. Normal stdout omits
@@ -127,6 +133,9 @@ low-level source/signal identifiers; pass `--verbose` when debugging typed data
 or the raw Product API payload. `product submit` loads wallet material only from
 the explicit `--private-key-env` name and verifies the prepared
 `typedData.message.submitter` matches the configured signer before signing.
+For authenticated Product APIs, pass `--auth-token-env <ENV_NAME>`; the CLI reads
+the bearer token only from that named env var and normal output reports only
+redacted auth status where applicable.
 Funding and guarantee placeholder tasks use the same commands; the task summary
 keeps `fulfillmentKind`, required inputs, settlement placeholder copy, proof
 rows, and funding impact language without treating UVP as a custodian,
@@ -152,14 +161,40 @@ uvp-executor doctor \
 uvp-executor doctor \
   --chain-services-url http://127.0.0.1:8787 \
   --wallet-address 0x0000000000000000000000000000000000000002 \
-  --task-id task_123
+  --task-id task_123 \
+  --auth-token-env UVP_PRODUCT_API_AUTH_TOKEN
 ```
 
 The doctor command needs no private key. It reports reachability, task visibility,
 proof-endpoint shape, and per-task readiness (assignee match, canSubmit,
 blockedReason, deadline status, required evidence, supplier trust, and a concrete
 `nextAction` label: `prepare`, `wait`, `proof`, or `blocked`). Normal output
-omits protocol fields; pass `--verbose` for raw API payloads.
+omits protocol fields and bearer token values; pass `--verbose` for raw API
+payloads.
+
+Run PRD113 live operator evidence against a live staging Product API:
+
+```bash
+pnpm exec tsx uvp-deploy/deploy/scripts/executor-live-evidence.ts \
+  --chain-services-url https://staging-chain-services.example.com \
+  --flow-summary logs/order-app-browser-e2e/<run_id>/order-app-full-flow-summary.json \
+  --task-id task_123 \
+  --private-key-env UVP_PARTICIPANT_PRIVATE_KEY \
+  --auth-token-env UVP_PRODUCT_API_AUTH_TOKEN \
+  --evidence-file ./evidence/customs-redacted.json \
+  --evidence-id ev_123 \
+  --allow-submit
+```
+
+The runner performs doctor, task list, task get, evidence hash, prepare,
+signer/submitter verification, submit, proof, and status calls. It writes a
+redacted summary under `logs/executor-live-evidence/<run-id>/` and blocks instead
+of claiming verification when the token is missing/rejected, demo or fixture mode
+is detected, supplier trust is missing or revoked, evidence is missing, signer
+and prepared submitter differ, or proof rows are absent. If a staging task does
+not require supplier attestation, pass
+`--supplier-trust-not-required-reason <text>`; the summary will avoid claiming
+supplier-attested operator readiness.
 
 The MCP adapter exposes the same checks via `uvp_doctor`:
 

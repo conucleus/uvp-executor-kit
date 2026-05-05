@@ -10,11 +10,14 @@ import {
   listSignalContainers,
   parsePreparedSignalContainer,
   prepareSignalContainer,
+  productApiAuthHeadersFromEnv,
   signPreparedSignalContainer,
   submitPreparedSignalContainer,
   summarizePreparedSignalContainer,
   summarizeSignalContainer,
   summarizeSubmittedSignalContainer,
+  type ProductApiAuthStatus,
+  type ProductApiClientOptions,
 } from './product.js';
 import { runProductDoctor } from './doctor.js';
 import { stringifyForTransport } from './transport.js';
@@ -104,7 +107,12 @@ interface FaucetInfoOptions {
 interface ProductClientCliOptions {
   chainServicesUrl: string;
   principalId?: string;
+  authTokenEnv?: string;
   verbose?: boolean;
+}
+
+interface ProductClientRuntimeOptions extends ProductApiClientOptions {
+  readonly auth?: ProductApiAuthStatus;
 }
 
 interface ProductTasksOptions extends ProductClientCliOptions {
@@ -155,6 +163,7 @@ interface DoctorOptions {
   taskId?: string;
   submissionId?: string;
   principalId?: string;
+  authTokenEnv?: string;
   verbose?: boolean;
 }
 
@@ -246,6 +255,7 @@ export function buildProgram(): Command {
     .option('--order-id <id>', 'filter by Product order id')
     .option('--status <status>', 'filter by Product task status')
     .option('--principal-id <id>', 'optional Product API principal id header')
+    .option('--auth-token-env <ENV_NAME>', 'env var containing Product API bearer token')
     .option('--verbose', 'include the raw Product API task payload')
     .action(async (options: ProductTasksOptions) => {
       const tasks = await listSignalContainers({
@@ -266,6 +276,7 @@ export function buildProgram(): Command {
     .requiredOption('--chain-services-url <url>', 'chain-services Product API base URL')
     .option('--wallet-address <address>', 'participant wallet address for local validation')
     .option('--principal-id <id>', 'optional Product API principal id header')
+    .option('--auth-token-env <ENV_NAME>', 'env var containing Product API bearer token')
     .option('--verbose', 'include the raw Product API task payload')
     .action(async (taskId: string, options: ProductTaskGetOptions) => {
       const task = await getSignalContainer({
@@ -293,6 +304,7 @@ export function buildProgram(): Command {
     .option('--evidence-id <id>', 'evidence id to include; repeat for multiple evidence records', collectRepeatedOption, [])
     .option('--prepared-file <path>', 'write the full prepared Product API response for later local signing')
     .option('--principal-id <id>', 'optional Product API principal id header')
+    .option('--auth-token-env <ENV_NAME>', 'env var containing Product API bearer token')
     .option('--verbose', 'include typed data and chain identifiers in stdout')
     .action(async (taskId: string, options: ProductPrepareOptions) => {
       const prepared = await prepareSignalContainer({
@@ -320,6 +332,7 @@ export function buildProgram(): Command {
     .option('--prepare-id <id>', 'expected prepare id; defaults to the prepared file prepareId')
     .option('--wallet-address <address>', 'expected signer wallet; defaults to the private key address')
     .option('--principal-id <id>', 'optional Product API principal id header')
+    .option('--auth-token-env <ENV_NAME>', 'env var containing Product API bearer token')
     .option('--verbose', 'include the raw Product API submission payload')
     .action(async (taskId: string, options: ProductSubmitOptions) => {
       const prepared = await readPreparedSignalContainerFile(options.preparedFile);
@@ -352,6 +365,7 @@ export function buildProgram(): Command {
     .description('query Product API submission proof/status')
     .requiredOption('--chain-services-url <url>', 'chain-services Product API base URL')
     .option('--principal-id <id>', 'optional Product API principal id header')
+    .option('--auth-token-env <ENV_NAME>', 'env var containing Product API bearer token')
     .option('--verbose', 'include the raw Product API submission payload')
     .action(async (submissionId: string, options: ProductProofOptions) => {
       await printProductSubmissionProof(submissionId, options);
@@ -362,6 +376,7 @@ export function buildProgram(): Command {
     .description('query Product API submission status/proof')
     .requiredOption('--chain-services-url <url>', 'chain-services Product API base URL')
     .option('--principal-id <id>', 'optional Product API principal id header')
+    .option('--auth-token-env <ENV_NAME>', 'env var containing Product API bearer token')
     .option('--verbose', 'include the raw Product API submission payload')
     .action(async (submissionId: string, options: ProductProofOptions) => {
       await printProductSubmissionProof(submissionId, options);
@@ -419,11 +434,11 @@ export function buildProgram(): Command {
     .option('--task-id <id>', 'specific task id for per-task readiness analysis (requires --wallet-address)')
     .option('--submission-id <id>', 'submission id for proof-endpoint shape check')
     .option('--principal-id <id>', 'optional Product API principal id header')
+    .option('--auth-token-env <ENV_NAME>', 'env var containing Product API bearer token')
     .option('--verbose', 'include raw Product API payloads in checks')
     .action(async (options: DoctorOptions) => {
       const report = await runProductDoctor({
-        chainServicesUrl: options.chainServicesUrl,
-        ...(options.principalId ? { principalId: options.principalId } : {}),
+        ...productClientOptions(options),
         ...(options.walletAddress ? { walletAddress: options.walletAddress } : {}),
         ...(options.taskId ? { taskId: options.taskId } : {}),
         ...(options.submissionId ? { submissionId: options.submissionId } : {}),
@@ -590,10 +605,14 @@ export function buildProgram(): Command {
   return program;
 }
 
-function productClientOptions(options: ProductClientCliOptions): ProductClientCliOptions {
+function productClientOptions(options: ProductClientCliOptions): ProductClientRuntimeOptions {
+  const auth = options.authTokenEnv
+    ? productApiAuthHeadersFromEnv(options.authTokenEnv)
+    : undefined;
   return {
     chainServicesUrl: options.chainServicesUrl,
     ...(options.principalId ? { principalId: options.principalId } : {}),
+    ...(auth ? { headers: auth.headers, auth: auth.status } : {}),
   };
 }
 

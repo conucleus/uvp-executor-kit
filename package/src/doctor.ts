@@ -6,6 +6,7 @@ import {
   summarizeSignalContainer,
   summarizeSubmittedSignalContainer,
   type ProductApiClientOptions,
+  type ProductApiAuthStatus,
   type ProductSignalContainer,
   type ProductTaskSummary,
   type SubmittedSignalContainer,
@@ -19,6 +20,7 @@ export interface ProductDoctorInput extends ProductApiClientOptions {
   readonly taskId?: string;
   readonly submissionId?: string;
   readonly verbose?: boolean;
+  readonly auth?: ProductApiAuthStatus;
 }
 
 export interface ProductDoctorCheck {
@@ -57,6 +59,7 @@ export interface ProductDoctorOutput {
   readonly chainServicesUrl: string;
   readonly timestamp: string;
   readonly principalId?: string;
+  readonly auth?: ProductApiAuthStatus;
   readonly walletAddress?: string;
   readonly tasks?: readonly ProductTaskSummary[];
   readonly proof?: SubmittedSignalContainerSummary;
@@ -126,6 +129,7 @@ export async function runProductDoctor(input: ProductDoctorInput): Promise<Produ
     chainServicesUrl: input.chainServicesUrl,
     timestamp,
     ...(input.principalId ? { principalId: input.principalId } : {}),
+    ...(input.auth ? { auth: input.auth } : {}),
     ...(walletAddress ? { walletAddress } : {}),
     ...(tasks ? { tasks } : {}),
     ...(proof ? { proof } : {}),
@@ -143,7 +147,14 @@ async function checkReachability(
   try {
     const fetchFn = resolveProductApiFetch(input.fetch);
     const url = stripTrailingSlash(input.chainServicesUrl);
-    const response = await fetchFn(url, { method: 'GET', headers: { Accept: 'application/json' } });
+    const headers: Record<string, string> = {
+      Accept: 'application/json',
+      ...input.headers,
+    };
+    if (input.principalId && input.principalId.trim().length > 0) {
+      headers['x-uvp-principal-id'] = input.principalId.trim();
+    }
+    const response = await fetchFn(url, { method: 'GET', headers });
     const latencyMs = Date.now() - started;
     if (response.ok || response.status < 500) {
       return { ok: true, label: 'reachability', detail: `Product API responded HTTP ${response.status}`, latencyMs };
