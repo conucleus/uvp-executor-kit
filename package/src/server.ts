@@ -10,7 +10,7 @@ import {
 import { ValidationError } from './validation.js';
 
 export const DEFAULT_EXECUTOR_TOKEN_ENV = 'UVP_EXECUTOR_TOKEN';
-export const DEFAULT_RUNTIME_TOKEN_ENV = 'UVP_RUNTIME_TOKEN';
+export const DEFAULT_CALLBACK_TOKEN_ENV = 'UVP_CALLBACK_TOKEN';
 
 export interface ExecutorStaticHandlerDefinition {
   readonly source: string;
@@ -58,7 +58,7 @@ export interface ExecutorServerOptions {
   readonly executorId: string;
   readonly handlers: Readonly<Record<string, RuntimeExecutorHandler>>;
   readonly executorToken: string;
-  readonly runtimeToken: string;
+  readonly callbackToken: string;
   readonly host?: string;
   readonly port?: number;
   readonly fetchImpl?: typeof fetch;
@@ -143,7 +143,7 @@ export async function startExecutorServer(options: ExecutorServerOptions): Promi
   const bindHost = options.host ?? '127.0.0.1';
   const port = options.port ?? 0;
   const executorToken = requireNonEmpty(options.executorToken, 'executorToken');
-  const runtimeToken = requireNonEmpty(options.runtimeToken, 'runtimeToken');
+  const callbackToken = requireNonEmpty(options.callbackToken, 'callbackToken');
   const now = options.now ?? (() => new Date().toISOString());
   const fetchImpl = options.fetchImpl ?? fetch;
   const jobStore = options.jobStore ?? new InMemoryExecutorJobStore();
@@ -152,7 +152,7 @@ export async function startExecutorServer(options: ExecutorServerOptions): Promi
       {
         executorId: options.executorId,
         executorToken,
-        runtimeToken,
+        callbackToken,
         handlers: options.handlers,
         fetchImpl,
         now,
@@ -182,7 +182,7 @@ export async function startExecutorServer(options: ExecutorServerOptions): Promi
 
 async function handleExecutorRequest(
   context: Required<Pick<ExecutorServerOptions, 'executorId' | 'handlers' | 'fetchImpl' | 'now' | 'jobStore'>> &
-    Pick<ExecutorServerOptions, 'executorToken' | 'runtimeToken'>,
+    Pick<ExecutorServerOptions, 'executorToken' | 'callbackToken'>,
   request: IncomingMessage,
   response: ServerResponse,
 ): Promise<void> {
@@ -199,7 +199,7 @@ async function handleExecutorRequest(
 
 async function routeExecutorRequest(
   context: Required<Pick<ExecutorServerOptions, 'executorId' | 'handlers' | 'fetchImpl' | 'now' | 'jobStore'>> &
-    Pick<ExecutorServerOptions, 'executorToken' | 'runtimeToken'>,
+    Pick<ExecutorServerOptions, 'executorToken' | 'callbackToken'>,
   request: IncomingMessage,
 ): Promise<{ readonly status: number; readonly body: unknown }> {
   const method = request.method ?? 'GET';
@@ -255,7 +255,7 @@ async function routeExecutorRequest(
 }
 
 async function processDispatch(
-  context: Required<Pick<ExecutorServerOptions, 'fetchImpl' | 'now' | 'jobStore'>> & Pick<ExecutorServerOptions, 'runtimeToken'>,
+  context: Required<Pick<ExecutorServerOptions, 'fetchImpl' | 'now' | 'jobStore'>> & Pick<ExecutorServerOptions, 'callbackToken'>,
   job: ExecutorJob,
   dispatch: ExecutorDispatchRequest,
   handler: RuntimeExecutorHandler,
@@ -272,7 +272,7 @@ async function processDispatch(
     }
 
     for (const signal of result.signals ?? []) {
-      await postSignalCallback(context.fetchImpl, dispatch.callbackUrl, context.runtimeToken, signal);
+      await postSignalCallback(context.fetchImpl, dispatch.callbackUrl, context.callbackToken, signal);
     }
     await context.jobStore.update(job.id, {
       status: 'callback_succeeded',
@@ -290,19 +290,19 @@ async function processDispatch(
 async function postSignalCallback(
   fetchImpl: typeof fetch,
   callbackUrl: string,
-  runtimeToken: string,
+  callbackToken: string,
   signal: RuntimeSignalEnvelope,
 ): Promise<void> {
   const response = await fetchImpl(callbackUrl, {
     method: 'POST',
     headers: {
-      'authorization': `Bearer ${runtimeToken}`,
+      'authorization': `Bearer ${callbackToken}`,
       'content-type': 'application/json',
     },
     body: JSON.stringify({ signal }),
   });
   if (!response.ok) {
-    throw new Error(`runtime callback failed with ${response.status}: ${await response.text()}`);
+    throw new Error(`callback endpoint failed with ${response.status}: ${await response.text()}`);
   }
 }
 

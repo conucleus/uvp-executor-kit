@@ -313,15 +313,15 @@ order-level authorization, participant wallet signatures, and contract checks.
 
 ## ABI Boundary
 
-`createStateMachineWatcher` uses the fixed `UVPStateMachine v0.1` compact-hook
+`createStateMachineWatcher` uses the fixed `UVPStateMachine v0.7` compact-hook
 ABI recorded in
-`uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.1.json`:
+`uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.7.json`:
 
 - `HookReady(bytes32 orderId, bytes32 hookId, bytes32 stageId, bytes32 hookName)`;
 - `submitSignal(bytes32 orderId, bytes32 sourceId, bytes32 signalId, bytes32 payloadHash, bytes32 idempotencyKey)`.
 
 The contract also exposes `submitSignalFor(...)` and
-`signalSubmissionDigest(...)` for gas-relay adapters. This package does not
+EIP-712 typed-data builders for gas-relay adapters. This package does not
 build a separate legacy signed payload model; relayed business signatures must
 stay aligned with the contract's current EIP-712 digest.
 

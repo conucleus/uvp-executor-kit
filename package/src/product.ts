@@ -1,6 +1,10 @@
 import { isHex, type Address, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import type { ProductSubmitTypedData, ProductSubmitTypedDataField } from '@uvp-eth/protocol-bindings';
+import {
+  PRODUCT_SUBMIT_DOMAIN_VERSION,
+  type ProductSubmitTypedData,
+  type ProductSubmitTypedDataField,
+} from '@uvp-eth/protocol-bindings';
 import { hashEvidenceFile, type EvidenceHashResult } from './evidence.js';
 import { loadPrivateKeyFromEnv } from './signing.js';
 import { UnsupportedChainTargetError, type ChainTarget } from './chain-target.js';
@@ -480,8 +484,8 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
     throw new ValidationError(`${label}.domain.name must be UVPStateMachine`);
   }
   const domainVersion = requiredString(domain, 'version', `${label}.domain`);
-  if (domainVersion !== '0.2') {
-    throw new ValidationError(`${label}.domain.version must be 0.2`);
+  if (domainVersion !== PRODUCT_SUBMIT_DOMAIN_VERSION) {
+    throw new ValidationError(`${label}.domain.version must be ${PRODUCT_SUBMIT_DOMAIN_VERSION}`);
   }
   const chainId = domain.chainId;
   if (typeof chainId !== 'number' || !Number.isSafeInteger(chainId) || chainId <= 0) {

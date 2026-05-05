@@ -20,8 +20,8 @@ import { runProductDoctor } from './doctor.js';
 import { stringifyForTransport } from './transport.js';
 import {
   createHandlersFromExecutorConfig,
+  DEFAULT_CALLBACK_TOKEN_ENV,
   DEFAULT_EXECUTOR_TOKEN_ENV,
-  DEFAULT_RUNTIME_TOKEN_ENV,
   loadExecutorConfig,
   startExecutorServer,
 } from './server.js';
@@ -139,8 +139,8 @@ interface ServeOptions {
   port: string;
   executorToken?: string;
   executorTokenEnv: string;
-  runtimeToken?: string;
-  runtimeTokenEnv: string;
+  callbackToken?: string;
+  callbackTokenEnv: string;
   readyJson?: boolean;
 }
 
@@ -375,8 +375,8 @@ export function buildProgram(): Command {
     .option('--port <port>', 'port to bind', '0')
     .option('--executor-token <token>', 'bearer token for executor dispatch API')
     .option('--executor-token-env <name>', 'env var containing executor dispatch bearer token', DEFAULT_EXECUTOR_TOKEN_ENV)
-    .option('--runtime-token <token>', 'bearer token for runtime-host callback API')
-    .option('--runtime-token-env <name>', 'env var containing runtime-host callback bearer token', DEFAULT_RUNTIME_TOKEN_ENV)
+    .option('--callback-token <token>', 'bearer token for executor callback endpoint')
+    .option('--callback-token-env <name>', 'env var containing executor callback bearer token', DEFAULT_CALLBACK_TOKEN_ENV)
     .option('--ready-json', 'print a ready JSON line after the server starts')
     .action(async (options: ServeOptions) => {
       const config = await loadExecutorConfig(options.config);
@@ -384,7 +384,7 @@ export function buildProgram(): Command {
         executorId: config.executorId,
         handlers: createHandlersFromExecutorConfig(config),
         executorToken: readSecret(options.executorToken, options.executorTokenEnv, 'executor token'),
-        runtimeToken: readSecret(options.runtimeToken, options.runtimeTokenEnv, 'runtime token'),
+        callbackToken: readSecret(options.callbackToken, options.callbackTokenEnv, 'callback token'),
         host: options.host,
         port: parsePort(options.port),
       });
