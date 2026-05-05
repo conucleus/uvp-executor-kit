@@ -8,8 +8,13 @@ import {
   hashEvidenceJson,
   recoverProductSubmitSigner,
   requestProductSubmitSignature,
+  requestProductSubmitSignatureForTarget,
   type Eip1193Provider,
 } from '@uvp-eth/executor-kit/participant';
+import {
+  UnsupportedChainTargetError,
+  requestSolanaProductSubmitSignature,
+} from '@uvp-eth/executor-kit/participant/solana';
 
 const privateKey = '0x1111111111111111111111111111111111111111111111111111111111111111' as const;
 const account = privateKeyToAccount(privateKey);
@@ -39,7 +44,7 @@ describe('participant entrypoint', () => {
     expect(typedData).toEqual({
       domain: {
         name: 'UVPStateMachine',
-        version: '0.2',
+        version: '0.7',
         chainId: 31337,
         verifyingContract,
       },
@@ -149,6 +154,33 @@ describe('participant entrypoint', () => {
         params: [submitter, JSON.stringify(typedData)],
       },
     ]);
+  });
+
+  it('keeps EVM as the default participant signer target and reserves Solana', async () => {
+    const typedData = buildProductSubmitTypedData({
+      chainId: 31337,
+      verifyingContract,
+      orderId,
+      sourceId,
+      signalId,
+      payloadHash,
+      idempotencyKey,
+      submitter,
+      deadline,
+    });
+    const signature = `0x${'cc'.repeat(65)}` as const;
+    const provider: Eip1193Provider = {
+      request: async () => signature,
+    };
+
+    await expect(requestProductSubmitSignatureForTarget({ provider, typedData, submitter })).resolves.toBe(signature);
+    await expect(requestProductSubmitSignatureForTarget({
+      target: 'solana',
+      provider,
+      typedData,
+      submitter,
+    })).rejects.toBeInstanceOf(UnsupportedChainTargetError);
+    expect(() => requestSolanaProductSubmitSignature()).toThrow(UnsupportedChainTargetError);
   });
 
   it('hashes canonical JSON through the browser-safe helper', () => {

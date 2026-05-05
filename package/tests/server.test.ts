@@ -11,7 +11,7 @@ import {
 } from '../src/server.js';
 
 const executorToken = 'executor-token';
-const runtimeToken = 'runtime-token';
+const callbackToken = 'callback-token';
 const effect = {
   type: 'HookReady',
   eventId: 'event-1',
@@ -23,11 +23,11 @@ const effect = {
 } as const;
 
 describe('executor HTTP server', () => {
-  it('accepts dispatches and posts callback signals to runtime-host', async () => {
+  it('accepts dispatches and posts callback signals to a webhook endpoint', async () => {
     const callbackBodies: unknown[] = [];
-    const runtime = createServer((request, response) => {
+    const callbackEndpoint = createServer((request, response) => {
       void (async () => {
-        if (request.headers.authorization !== `Bearer ${runtimeToken}`) {
+        if (request.headers.authorization !== `Bearer ${callbackToken}`) {
           response.statusCode = 401;
           response.end('unauthorized');
           return;
@@ -38,16 +38,16 @@ describe('executor HTTP server', () => {
         response.end(JSON.stringify({ ok: true }));
       })();
     });
-    await new Promise<void>((resolve) => runtime.listen(0, '127.0.0.1', resolve));
-    const runtimeAddress = runtime.address();
-    if (!runtimeAddress || typeof runtimeAddress === 'string') {
-      throw new Error('runtime test server did not bind to a TCP address');
+    await new Promise<void>((resolve) => callbackEndpoint.listen(0, '127.0.0.1', resolve));
+    const callbackAddress = callbackEndpoint.address();
+    if (!callbackAddress || typeof callbackAddress === 'string') {
+      throw new Error('callback test server did not bind to a TCP address');
     }
-    const callbackUrl = `http://127.0.0.1:${runtimeAddress.port}/v0/signals`;
+    const callbackUrl = `http://127.0.0.1:${callbackAddress.port}/v0/signals`;
     const executor = await startExecutorServer({
       executorId: 'exec-executor',
       executorToken,
-      runtimeToken,
+      callbackToken,
       handlers: createHandlersFromExecutorConfig({
         executorId: 'exec-executor',
         handlers: {
@@ -93,7 +93,7 @@ describe('executor HTTP server', () => {
       ]);
     } finally {
       await executor.close();
-      await new Promise<void>((resolve) => runtime.close(() => resolve()));
+      await new Promise<void>((resolve) => callbackEndpoint.close(() => resolve()));
     }
   });
 
@@ -101,7 +101,7 @@ describe('executor HTTP server', () => {
     const executor = await startExecutorServer({
       executorId: 'exec-executor',
       executorToken,
-      runtimeToken,
+      callbackToken,
       handlers: {},
       port: 0,
     });
@@ -131,7 +131,7 @@ describe('executor HTTP server', () => {
     const handlerFailure = await startExecutorServer({
       executorId: 'exec-executor',
       executorToken,
-      runtimeToken,
+      callbackToken,
       handlers: {
         'exec.main#START': () => ({ status: 'failed', error: 'local executor failed' }),
       },
@@ -159,7 +159,7 @@ describe('executor HTTP server', () => {
     const callbackFailure = await startExecutorServer({
       executorId: 'exec-executor',
       executorToken,
-      runtimeToken,
+      callbackToken,
       handlers: createHandlersFromExecutorConfig({
         executorId: 'exec-executor',
         handlers: {
@@ -171,7 +171,7 @@ describe('executor HTTP server', () => {
         },
       }),
       port: 0,
-      fetchImpl: async () => new Response('runtime rejected callback', { status: 500 }),
+      fetchImpl: async () => new Response('callback rejected', { status: 500 }),
     });
     try {
       const response = await fetch(`${callbackFailure.url}/v0/dispatches`, {
@@ -186,7 +186,7 @@ describe('executor HTTP server', () => {
       await eventually(async () => {
         const jobs = await getJobs(callbackFailure.url);
         expect(jobs[0]?.status).toBe('callback_failed');
-        expect(jobs[0]?.lastError).toContain('runtime callback failed with 500');
+        expect(jobs[0]?.lastError).toContain('callback endpoint failed with 500');
       });
     } finally {
       await callbackFailure.close();
