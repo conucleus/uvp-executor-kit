@@ -43,6 +43,17 @@ export interface ProductApiClientOptions {
   readonly principalId?: string;
 }
 
+export interface ProductApiAuthStatus {
+  readonly bearerTokenEnv: string;
+  readonly bearerTokenConfigured: true;
+  readonly redacted: true;
+}
+
+export interface ProductApiAuthHeaders {
+  readonly headers: Readonly<Record<string, string>>;
+  readonly status: ProductApiAuthStatus;
+}
+
 export interface ListSignalContainersInput extends ProductApiClientOptions {
   readonly walletAddress: Address | string;
   readonly orderId?: string;
@@ -468,6 +479,34 @@ export function loadProductPrivateKeyFromEnv(envName: string): Hex {
     throw new ValidationError(`missing private key env var ${normalizedEnvName}`);
   }
   return privateKey;
+}
+
+export function productApiAuthHeadersFromEnv(
+  authTokenEnv: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ProductApiAuthHeaders {
+  const envName = requiredText(authTokenEnv, 'authTokenEnv');
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(envName)) {
+    throw new ValidationError('authTokenEnv must be an environment variable name');
+  }
+  const token = env[envName];
+  if (!token || token.trim().length === 0) {
+    throw new ValidationError(`missing auth token env var ${envName}`);
+  }
+  const normalizedToken = token.trim();
+  if (/[\r\n]/u.test(normalizedToken)) {
+    throw new ValidationError(`auth token env var ${envName} must not contain newline characters`);
+  }
+  return {
+    headers: {
+      Authorization: `Bearer ${normalizedToken}`,
+    },
+    status: {
+      bearerTokenEnv: envName,
+      bearerTokenConfigured: true,
+      redacted: true,
+    },
+  };
 }
 
 function parseProductSubmitTypedData(value: unknown, label: string): ProductSubmitTypedData {

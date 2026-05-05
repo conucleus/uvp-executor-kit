@@ -448,6 +448,71 @@ describe('Product API doctor', () => {
 });
 
 describe('doctor CLI', () => {
+  it('passes Product API auth token env headers and reports only redacted auth status', async () => {
+    const logs: string[] = [];
+    const envName = 'UVP_DOCTOR_PRODUCT_API_TOKEN';
+    const token = 'doctor-secret-token';
+    const previousEnv = process.env[envName];
+    const originalLog = console.log;
+    const originalFetch = globalThis.fetch;
+    const authorizationHeaders: string[] = [];
+    process.env[envName] = token;
+    console.log = (message?: unknown) => {
+      logs.push(String(message));
+    };
+    globalThis.fetch = (async (_url: unknown, init?: { headers?: Record<string, string> }) => {
+      if (init?.headers?.Authorization) {
+        authorizationHeaders.push(init.headers.Authorization);
+      }
+      return jsonResponse({
+        tasks: [
+          {
+            taskId: 'task_auth_doctor',
+            orderId: 'order_auth',
+            title: 'Auth doctor task',
+            status: 'open',
+          },
+        ],
+      });
+    }) as unknown as typeof globalThis.fetch;
+
+    try {
+      await main([
+        'node',
+        'uvp-executor',
+        'doctor',
+        '--chain-services-url',
+        'http://chain.local/api',
+        '--wallet-address',
+        submitter,
+        '--auth-token-env',
+        envName,
+      ]);
+      const output = JSON.parse(logs[0] ?? '{}') as {
+        auth?: { bearerTokenEnv?: string; bearerTokenConfigured?: boolean; redacted?: boolean };
+      };
+      expect(authorizationHeaders).toContain(`Bearer ${token}`);
+      expect(output.auth).toEqual({
+        bearerTokenEnv: envName,
+        bearerTokenConfigured: true,
+        redacted: true,
+      });
+      expect(logs[0]).not.toContain(token);
+    } finally {
+      console.log = originalLog;
+      if (originalFetch) {
+        globalThis.fetch = originalFetch;
+      } else {
+        delete (globalThis as { fetch?: unknown }).fetch;
+      }
+      if (previousEnv === undefined) {
+        delete process.env[envName];
+      } else {
+        process.env[envName] = previousEnv;
+      }
+    }
+  });
+
   it('prints per-task readiness from the CLI with --task-id', async () => {
     const logs: string[] = [];
     const originalLog = console.log;
