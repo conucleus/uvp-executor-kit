@@ -196,6 +196,11 @@ not require supplier attestation, pass
 `--supplier-trust-not-required-reason <text>`; the summary will avoid claiming
 supplier-attested operator readiness.
 
+The summary also includes `prd101EvidenceClassification`. Local mocks, fixture
+schemas, dry-run summaries, and non-Base-Sepolia flow summaries can complete the
+runner for regression coverage, but they stay `not-verified` for PRD101 live
+operator evidence.
+
 The MCP adapter exposes the same checks via `uvp_doctor`:
 
 ```ts
