@@ -1,5 +1,8 @@
 .DS_Store
 AGENTS*md
+AGENT*md
+Agent*md
+agent*md
 *.log
 
 node_modules/
