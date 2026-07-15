@@ -46,8 +46,6 @@ export interface TaskReadinessResult {
   readonly deadline?: string;
   readonly deadlineExpired?: boolean;
   readonly requiredEvidence: readonly string[];
-  readonly supplierTrustStatus?: string;
-  readonly fulfillmentKind?: string;
   readonly primaryActionLabel?: string;
   readonly nextAction: 'prepare' | 'wait' | 'proof' | 'blocked';
   readonly nextActionLabel: string;
@@ -311,8 +309,6 @@ async function checkTaskReadiness(
         ...(summary.deadline ? { deadline: summary.deadline } : {}),
         ...(deadlineExpired !== undefined ? { deadlineExpired } : {}),
         requiredEvidence: summary.requiredEvidence ?? [],
-        ...(summary.supplierTrustStatus ? { supplierTrustStatus: summary.supplierTrustStatus } : {}),
-        ...(summary.fulfillmentKind ? { fulfillmentKind: summary.fulfillmentKind } : {}),
         ...(summary.primaryActionLabel ? { primaryActionLabel: summary.primaryActionLabel } : {}),
         nextAction,
         nextActionLabel,

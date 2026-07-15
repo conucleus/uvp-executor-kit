@@ -225,7 +225,6 @@ describe('Product API mode', () => {
       status: 'open',
       sourceId: bytes32('02'),
       signalId: bytes32('03'),
-      fulfillmentKind: 'payment_placeholder',
       fundingImpact: 'Adapter placeholder: records funding condition only; no custody or settlement by UVP.',
       primaryActionLabel: 'Confirm funding condition',
       requiredInputs: [
@@ -254,7 +253,6 @@ describe('Product API mode', () => {
 
     expect(summary).toMatchObject({
       taskId: 'task_funding',
-      fulfillmentKind: 'payment_placeholder',
       fundingImpact: expect.stringContaining('no custody'),
       primaryActionLabel: 'Confirm funding condition',
       businessPersonaLabels: ['Guarantor'],

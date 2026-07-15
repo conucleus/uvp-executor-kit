@@ -60,7 +60,6 @@ describe('Product MCP adapter boundary', () => {
       const tasks = await adapter.uvp_list_tasks({ walletAddress: submitter });
       expect(tasks.tasks[0]).toMatchObject({
         taskId: 'task_funding',
-        fulfillmentKind: 'payment_placeholder',
         fundingImpact: expect.stringContaining('no custody'),
       });
       expect(tasks.rawTasks).toBeUndefined();
@@ -134,7 +133,6 @@ function fundingTask(): Record<string, unknown> {
     deadline: '2026-05-01T00:05:00.000Z',
     sourceId: bytes32('02'),
     signalId: bytes32('03'),
-    fulfillmentKind: 'payment_placeholder',
     fundingImpact: 'Adapter placeholder: records funding condition only; no custody or settlement by UVP.',
     requiredEvidence: ['guarantee-proof'],
     requiredInputs: [

@@ -66,7 +66,6 @@ describe('executor CLI', () => {
           signalCount?: number;
           supplier?: {
             supplierId?: string;
-            attestationStatus?: string;
           };
           wallet?: {
             configured?: boolean;
@@ -86,7 +85,6 @@ describe('executor CLI', () => {
         signalCount: 1,
         supplier: {
           supplierId: 'logistics-provider-a',
-          attestationStatus: 'not_checked',
         },
         wallet: {
           configured: true,

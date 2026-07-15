@@ -283,7 +283,6 @@ export interface ExecutorJobDTO {
 export interface SupplierOpsSummaryDTO {
   readonly supplierId: string;
   readonly walletAddress?: Address;
-  readonly attestationStatus: 'not_checked' | 'attested' | 'not_attested' | 'unknown';
   readonly activeJobs: number;
   readonly failedJobs: number;
   readonly confirmedSignals: number;
@@ -980,7 +979,6 @@ export function summarizeSupplierOps(
   return {
     supplierId,
     ...(config.walletAddress ? { walletAddress: config.walletAddress } : {}),
-    attestationStatus: 'not_checked',
     activeJobs: jobs.filter((job) => ['detected', 'matched', 'submitted'].includes(job.status)).length,
     failedJobs: jobs.filter((job) => ['failed', 'dead_letter', 'ignored'].includes(job.status)).length,
     confirmedSignals: jobs.filter((job) => job.status === 'confirmed').length,

@@ -44,7 +44,7 @@ describe('participant entrypoint', () => {
     expect(typedData).toEqual({
       domain: {
         name: 'UVPStateMachine',
-        version: '0.7',
+        version: '0.8',
         chainId: 31337,
         verifyingContract,
       },

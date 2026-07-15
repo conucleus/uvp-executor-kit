@@ -730,7 +730,6 @@ function summarizeStateMachineExecutorConfig(config: Awaited<ReturnType<typeof l
     executorConfig,
     supplier: {
       supplierId: executorConfig.supplierId ?? 'unknown-supplier',
-      attestationStatus: 'not_checked',
       callbackMode: executorConfig.callbackMode,
       authTokenRef: executorConfig.authTokenRef ?? null,
     },
