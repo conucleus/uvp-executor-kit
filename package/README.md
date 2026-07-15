@@ -22,9 +22,6 @@ data, sign with an explicit participant key, submit, and fetch proof. It should
 consume executor, docked Zhixu, and resource-access surfaces from Product
 DTO/Product API.
 
-Legacy escrow payload builders, relayer submissions, placeholder notifier
-watching, and escrow replay commands have been removed from this package.
-
 ## Local Commands
 
 ```bash
@@ -137,7 +134,7 @@ For authenticated Product APIs, pass `--auth-token-env <ENV_NAME>`; the CLI read
 the bearer token only from that named env var and normal output reports only
 redacted auth status where applicable.
 Funding and guarantee placeholder tasks use the same commands; the task summary
-keeps `fulfillmentKind`, required inputs, settlement placeholder copy, proof
+keeps capability-plugin metadata, required inputs, settlement placeholder copy, proof
 rows, and funding impact language without treating UVP as a custodian,
 settlement rail, payment provider, exchange, or guarantor.
 
@@ -167,39 +164,10 @@ uvp-executor doctor \
 
 The doctor command needs no private key. It reports reachability, task visibility,
 proof-endpoint shape, and per-task readiness (assignee match, canSubmit,
-blockedReason, deadline status, required evidence, supplier trust, and a concrete
+blockedReason, deadline status, required evidence, and a concrete
 `nextAction` label: `prepare`, `wait`, `proof`, or `blocked`). Normal output
 omits protocol fields and bearer token values; pass `--verbose` for raw API
 payloads.
-
-Run PRD113 live operator evidence against a live staging Product API:
-
-```bash
-pnpm exec tsx uvp-deploy/deploy/scripts/executor-live-evidence.ts \
-  --chain-services-url https://staging-chain-services.example.com \
-  --flow-summary logs/order-app-browser-e2e/<run_id>/order-app-full-flow-summary.json \
-  --task-id task_123 \
-  --private-key-env UVP_PARTICIPANT_PRIVATE_KEY \
-  --auth-token-env UVP_PRODUCT_API_AUTH_TOKEN \
-  --evidence-file ./evidence/customs-redacted.json \
-  --evidence-id ev_123 \
-  --allow-submit
-```
-
-The runner performs doctor, task list, task get, evidence hash, prepare,
-signer/submitter verification, submit, proof, and status calls. It writes a
-redacted summary under `logs/executor-live-evidence/<run-id>/` and blocks instead
-of claiming verification when the token is missing/rejected, demo or fixture mode
-is detected, supplier trust is missing or revoked, evidence is missing, signer
-and prepared submitter differ, or proof rows are absent. If a staging task does
-not require supplier attestation, pass
-`--supplier-trust-not-required-reason <text>`; the summary will avoid claiming
-supplier-attested operator readiness.
-
-The summary also includes `prd101EvidenceClassification`. Local mocks, fixture
-schemas, dry-run summaries, and non-Base-Sepolia flow summaries can complete the
-runner for regression coverage, but they stay `not-verified` for PRD101 live
-operator evidence.
 
 The MCP adapter exposes the same checks via `uvp_doctor`:
 
@@ -353,16 +321,16 @@ order-level authorization, participant wallet signatures, and contract checks.
 
 ## ABI Boundary
 
-`createStateMachineWatcher` uses the fixed `UVPStateMachine v0.7` compact-hook
+`createStateMachineWatcher` uses the fixed `UVPStateMachine v0.8` compact-hook
 ABI recorded in
-`uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.7.json`:
+`uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.8.json`:
 
 - `HookReady(bytes32 orderId, bytes32 hookId, bytes32 stageId, bytes32 hookName)`;
 - `submitSignal(bytes32 orderId, bytes32 sourceId, bytes32 signalId, bytes32 payloadHash, bytes32 idempotencyKey)`.
 
 The contract also exposes `submitSignalFor(...)` and
 EIP-712 typed-data builders for gas-relay adapters. This package does not
-build a separate legacy signed payload model; relayed business signatures must
+build a separate signed payload model; relayed business signatures must
 stay aligned with the contract's current EIP-712 digest.
 
 ## Boundaries

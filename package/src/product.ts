@@ -150,14 +150,12 @@ export interface ProductTaskSummary {
   readonly subtitle?: string;
   readonly assigneeRole?: string;
   readonly assigneeWallet?: string;
-  readonly supplierTrustStatus?: string;
   readonly stageName?: string;
   readonly deadline?: string;
   readonly fundingImpact?: string;
   readonly requiredEvidence?: readonly string[];
   readonly canSubmit?: boolean;
   readonly blockedReason?: string;
-  readonly fulfillmentKind?: string;
   readonly performanceSlotId?: string;
   readonly performanceSlotLabel?: string;
   readonly businessPersonaLabels?: readonly string[];
@@ -350,14 +348,12 @@ export function summarizeSignalContainer(task: ProductSignalContainer | Record<s
     ...optionalString(parsed, 'subtitle'),
     ...optionalString(parsed, 'assigneeRole'),
     ...optionalString(parsed, 'assigneeWallet'),
-    ...optionalString(parsed, 'supplierTrustStatus'),
     ...optionalString(parsed, 'stageName'),
     ...optionalString(parsed, 'deadline'),
     ...optionalString(parsed, 'fundingImpact'),
     ...optionalStringArray(parsed, 'requiredEvidence'),
     ...optionalBoolean(parsed, 'canSubmit'),
     ...optionalString(parsed, 'blockedReason'),
-    ...optionalString(parsed, 'fulfillmentKind'),
     ...optionalString(parsed, 'performanceSlotId'),
     ...optionalString(parsed, 'performanceSlotLabel'),
     ...optionalStringArray(parsed, 'businessPersonaLabels'),

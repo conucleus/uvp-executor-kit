@@ -266,8 +266,6 @@ describe('Product API doctor', () => {
           deadline: '2099-01-01T00:00:00.000Z',
           requiredEvidence: ['customs-docs'],
           canSubmit: true,
-          supplierTrustStatus: 'attested',
-          fulfillmentKind: 'standard',
           primaryActionLabel: 'Confirm stage',
         },
       });
@@ -290,7 +288,6 @@ describe('Product API doctor', () => {
       assigneeMatch: true,
       nextAction: 'prepare',
       requiredEvidence: ['customs-docs'],
-      supplierTrustStatus: 'attested',
     });
     expect(report.taskReadiness?.nextActionLabel).toContain('Ready to prepare');
     expect(report.tasks).toBeUndefined();
@@ -318,7 +315,6 @@ describe('Product API doctor', () => {
           requiredEvidence: ['shipping-docs'],
           canSubmit: false,
           blockedReason: 'Required evidence not yet uploaded',
-          supplierTrustStatus: 'not_found',
         },
       });
     };
@@ -336,7 +332,6 @@ describe('Product API doctor', () => {
       blockedReason: 'Required evidence not yet uploaded',
       assigneeMatch: true,
       nextAction: 'wait',
-      supplierTrustStatus: 'not_found',
     });
     expect(report.taskReadiness?.nextActionLabel).toContain('Required evidence not yet uploaded');
     expect(report.ok).toBe(false);
@@ -536,7 +531,6 @@ describe('doctor CLI', () => {
           deadline: '2099-01-01T00:00:00.000Z',
           requiredEvidence: ['customs-docs'],
           canSubmit: true,
-          supplierTrustStatus: 'attested',
           primaryActionLabel: 'Confirm stage',
         },
       });
