@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -11,6 +12,9 @@ import { ValidationError } from './validation.js';
 
 export const DEFAULT_EXECUTOR_TOKEN_ENV = 'UVP_EXECUTOR_TOKEN';
 export const DEFAULT_CALLBACK_TOKEN_ENV = 'UVP_CALLBACK_TOKEN';
+export const DEFAULT_CALLBACK_HOST_ALLOWLIST_ENV = 'UVP_EXECUTOR_CALLBACK_HOST_ALLOWLIST';
+
+const LOOPBACK_CALLBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 
 export interface ExecutorStaticHandlerDefinition {
   readonly source: string;
@@ -64,6 +68,7 @@ export interface ExecutorServerOptions {
   readonly fetchImpl?: typeof fetch;
   readonly now?: () => string;
   readonly jobStore?: ExecutorJobStore;
+  readonly callbackHostAllowlist?: readonly string[];
 }
 
 export interface ExecutorServerHandle {
@@ -73,6 +78,17 @@ export interface ExecutorServerHandle {
   readonly port: number;
   readonly jobStore: ExecutorJobStore;
   close(): Promise<void>;
+}
+
+interface ExecutorRequestContext {
+  readonly executorId: string;
+  readonly executorToken: string;
+  readonly callbackToken: string;
+  readonly callbackHostAllowlist: readonly string[];
+  readonly handlers: Readonly<Record<string, RuntimeExecutorHandler>>;
+  readonly fetchImpl: typeof fetch;
+  readonly now: () => string;
+  readonly jobStore: ExecutorJobStore;
 }
 
 const MAX_BODY_BYTES = 1_000_000;
@@ -144,6 +160,7 @@ export async function startExecutorServer(options: ExecutorServerOptions): Promi
   const port = options.port ?? 0;
   const executorToken = requireNonEmpty(options.executorToken, 'executorToken');
   const callbackToken = requireNonEmpty(options.callbackToken, 'callbackToken');
+  const callbackHostAllowlist = options.callbackHostAllowlist ?? parseCallbackHostAllowlist(process.env[DEFAULT_CALLBACK_HOST_ALLOWLIST_ENV]);
   const now = options.now ?? (() => new Date().toISOString());
   const fetchImpl = options.fetchImpl ?? fetch;
   const jobStore = options.jobStore ?? new InMemoryExecutorJobStore();
@@ -153,6 +170,7 @@ export async function startExecutorServer(options: ExecutorServerOptions): Promi
         executorId: options.executorId,
         executorToken,
         callbackToken,
+        callbackHostAllowlist,
         handlers: options.handlers,
         fetchImpl,
         now,
@@ -181,8 +199,7 @@ export async function startExecutorServer(options: ExecutorServerOptions): Promi
 }
 
 async function handleExecutorRequest(
-  context: Required<Pick<ExecutorServerOptions, 'executorId' | 'handlers' | 'fetchImpl' | 'now' | 'jobStore'>> &
-    Pick<ExecutorServerOptions, 'executorToken' | 'callbackToken'>,
+  context: ExecutorRequestContext,
   request: IncomingMessage,
   response: ServerResponse,
 ): Promise<void> {
@@ -198,8 +215,7 @@ async function handleExecutorRequest(
 }
 
 async function routeExecutorRequest(
-  context: Required<Pick<ExecutorServerOptions, 'executorId' | 'handlers' | 'fetchImpl' | 'now' | 'jobStore'>> &
-    Pick<ExecutorServerOptions, 'executorToken' | 'callbackToken'>,
+  context: ExecutorRequestContext,
   request: IncomingMessage,
 ): Promise<{ readonly status: number; readonly body: unknown }> {
   const method = request.method ?? 'GET';
@@ -222,7 +238,7 @@ async function routeExecutorRequest(
   }
 
   if (method === 'POST' && url.pathname === '/v0/dispatches') {
-    const dispatch = toDispatchRequest(await readJsonBody(request));
+    const dispatch = toDispatchRequest(await readJsonBody(request), context.callbackHostAllowlist);
     const handler = resolveHandler(dispatch.effect, context.handlers);
     if (!handler) {
       return {
@@ -241,6 +257,9 @@ async function routeExecutorRequest(
       updatedAt: acceptedAt,
       callbackUrl: dispatch.callbackUrl,
     };
+    if (await context.jobStore.get(job.id)) {
+      return { status: 409, body: { error: 'job_already_exists', jobId: job.id } };
+    }
     await context.jobStore.create(job);
     queueMicrotask(() => {
       void processDispatch(context, job, dispatch, handler);
@@ -255,7 +274,7 @@ async function routeExecutorRequest(
 }
 
 async function processDispatch(
-  context: Required<Pick<ExecutorServerOptions, 'fetchImpl' | 'now' | 'jobStore'>> & Pick<ExecutorServerOptions, 'callbackToken'>,
+  context: Pick<ExecutorRequestContext, 'fetchImpl' | 'now' | 'jobStore' | 'callbackToken' | 'callbackHostAllowlist'>,
   job: ExecutorJob,
   dispatch: ExecutorDispatchRequest,
   handler: RuntimeExecutorHandler,
@@ -272,7 +291,7 @@ async function processDispatch(
     }
 
     for (const signal of result.signals ?? []) {
-      await postSignalCallback(context.fetchImpl, dispatch.callbackUrl, context.callbackToken, signal);
+      await postSignalCallback(context.fetchImpl, dispatch.callbackUrl, context.callbackToken, signal, context.callbackHostAllowlist);
     }
     await context.jobStore.update(job.id, {
       status: 'callback_succeeded',
@@ -292,7 +311,9 @@ async function postSignalCallback(
   callbackUrl: string,
   callbackToken: string,
   signal: RuntimeSignalEnvelope,
+  callbackHostAllowlist: readonly string[],
 ): Promise<void> {
+  assertCallbackUrlAllowed(callbackUrl, callbackHostAllowlist);
   const response = await fetchImpl(callbackUrl, {
     method: 'POST',
     headers: {
@@ -338,17 +359,13 @@ function normalizeHandlerDefinition(value: unknown, path: string): ExecutorStati
   };
 }
 
-function toDispatchRequest(value: unknown): ExecutorDispatchRequest {
+function toDispatchRequest(value: unknown, callbackHostAllowlist: readonly string[]): ExecutorDispatchRequest {
   if (!isRecord(value)) {
     throw new ValidationError('dispatch request must be an object');
   }
   const effect = toDispatchEffect(value.effect);
   const callbackUrl = asString(value.callbackUrl, 'callbackUrl');
-  try {
-    new URL(callbackUrl);
-  } catch {
-    throw new ValidationError('callbackUrl must be a valid URL');
-  }
+  assertCallbackUrlAllowed(callbackUrl, callbackHostAllowlist);
   return {
     effect,
     callbackUrl,
@@ -379,9 +396,54 @@ function resolveHandler(
 }
 
 function requireBearerToken(request: IncomingMessage, token: string | undefined): void {
-  if (request.headers.authorization !== `Bearer ${token}`) {
+  const header = request.headers.authorization;
+  const provided = typeof header === 'string' ? bearerTokenOf(header) : undefined;
+  if (!provided || !token || !secureTokenEquals(provided, token)) {
     throw new UnauthorizedError('missing or invalid bearer token');
   }
+}
+
+function bearerTokenOf(header: string): string | undefined {
+  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
+  return match?.[1]?.trim() || undefined;
+}
+
+function secureTokenEquals(provided: string, expected: string): boolean {
+  const providedDigest = createHash('sha256').update(provided, 'utf8').digest();
+  const expectedDigest = createHash('sha256').update(expected, 'utf8').digest();
+  return timingSafeEqual(providedDigest, expectedDigest);
+}
+
+export function parseCallbackHostAllowlist(raw: string | undefined): readonly string[] {
+  return (raw ?? '')
+    .split(',')
+    .map((entry) => normalizeCallbackHost(entry))
+    .filter((host) => host.length > 0);
+}
+
+export function assertCallbackUrlAllowed(callbackUrl: string, allowlist: readonly string[]): void {
+  let url: URL;
+  try {
+    url = new URL(callbackUrl);
+  } catch {
+    throw new ValidationError('callbackUrl must be a valid URL');
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new ValidationError(`callbackUrl scheme must be http or https, got ${url.protocol}`);
+  }
+  const hostname = normalizeCallbackHost(url.hostname);
+  if (LOOPBACK_CALLBACK_HOSTS.has(hostname) || allowlist.includes(hostname)) {
+    return;
+  }
+  throw new ValidationError(`callbackUrl host is not allowed: ${hostname}`);
+}
+
+function normalizeCallbackHost(host: string): string {
+  const trimmed = host.trim().toLowerCase();
+  if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
 }
 
 async function readJsonBody(request: IncomingMessage): Promise<unknown> {

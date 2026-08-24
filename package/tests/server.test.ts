@@ -4,8 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
+  assertCallbackUrlAllowed,
   createHandlersFromExecutorConfig,
   loadExecutorConfig,
+  parseCallbackHostAllowlist,
   startExecutorServer,
   type ExecutorJob,
 } from '../src/server.js';
@@ -191,6 +193,199 @@ describe('executor HTTP server', () => {
     } finally {
       await callbackFailure.close();
     }
+  });
+
+  it('rejects a duplicate dispatch job id instead of overwriting the existing job', async () => {
+    let outboundCalls = 0;
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+      fetchImpl: async () => {
+        outboundCalls += 1;
+        return new Response('ok', { status: 200 });
+      },
+    });
+    try {
+      const first = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-conflict', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' }),
+      });
+      expect(first.status).toBe(202);
+
+      const second = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-conflict', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' }),
+      });
+      expect(second.status).toBe(409);
+      expect(await second.json()).toMatchObject({
+        error: 'job_already_exists',
+        jobId: 'dispatch-conflict',
+      });
+
+      const jobs = await getJobs(executor.url);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]?.id).toBe('dispatch-conflict');
+    } finally {
+      await executor.close();
+    }
+  });
+
+  it('rejects non-loopback callback URLs before enqueuing and never sends the callback token', async () => {
+    let outboundCalls = 0;
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+      fetchImpl: async () => {
+        outboundCalls += 1;
+        return new Response('ok', { status: 200 });
+      },
+    });
+    try {
+      for (const callbackUrl of [
+        'http://169.254.169.254/latest/meta-data/',
+        'https://example.invalid/v0/signals',
+        'file:///etc/passwd',
+      ]) {
+        const response = await fetch(`${executor.url}/v0/dispatches`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${executorToken}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ dispatchId: `dispatch-ssrf-${outboundCalls}`, effect, callbackUrl }),
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ error: 'bad_request' });
+      }
+
+      expect(outboundCalls).toBe(0);
+      expect(await getJobs(executor.url)).toHaveLength(0);
+    } finally {
+      await executor.close();
+    }
+  });
+
+  it('sends the callback bearer token to non-loopback hosts only when allowlisted', async () => {
+    const outbound: { url: string; authorization?: string }[] = [];
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+      fetchImpl: async (input, init) => {
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        outbound.push({
+          url: String(input),
+          ...(typeof headers.authorization === 'string' ? { authorization: headers.authorization } : {}),
+        });
+        return new Response('ok', { status: 200 });
+      },
+      callbackHostAllowlist: ['callbacks.internal'],
+    });
+
+    try {
+      const response = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          dispatchId: 'dispatch-allowlisted',
+          effect,
+          callbackUrl: 'http://callbacks.internal/v0/signals',
+        }),
+      });
+      expect(response.status).toBe(202);
+      await eventually(async () => {
+        const jobs = await getJobs(executor.url);
+        expect(jobs[0]?.status).toBe('callback_succeeded');
+      });
+      expect(outbound).toEqual([
+        {
+          url: 'http://callbacks.internal/v0/signals',
+          authorization: `Bearer ${callbackToken}`,
+        },
+      ]);
+
+      const blocked = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          dispatchId: 'dispatch-not-allowlisted',
+          effect,
+          callbackUrl: 'http://other.internal/v0/signals',
+        }),
+      });
+      expect(blocked.status).toBe(400);
+      expect(outbound).toHaveLength(1);
+    } finally {
+      await executor.close();
+    }
+  });
+
+  it('parses the callback host allowlist env format and validates scheme/host', () => {
+    expect(parseCallbackHostAllowlist(undefined)).toEqual([]);
+    expect(parseCallbackHostAllowlist('')).toEqual([]);
+    expect(parseCallbackHostAllowlist('callbacks.internal:8443, 10.0.0.7 , [::2]')).toEqual([
+      'callbacks.internal:8443',
+      '10.0.0.7',
+      '::2',
+    ]);
+
+    expect(() => assertCallbackUrlAllowed('http://127.0.0.1:9/v0/signals', [])).not.toThrow();
+    expect(() => assertCallbackUrlAllowed('http://localhost/v0/signals', [])).not.toThrow();
+    expect(() => assertCallbackUrlAllowed('http://[::1]/v0/signals', [])).not.toThrow();
+    expect(() => assertCallbackUrlAllowed('http://internal.example/v0/signals', ['internal.example'])).not.toThrow();
+
+    expect(() => assertCallbackUrlAllowed('ftp://127.0.0.1/v0/signals', [])).toThrow(/scheme/);
+    expect(() => assertCallbackUrlAllowed('http://169.254.169.254/', [])).toThrow(/not allowed/);
+    expect(() => assertCallbackUrlAllowed('not a url', [])).toThrow(/valid URL/);
   });
 
   it('loads static handler config from JSON', async () => {
