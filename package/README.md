@@ -16,11 +16,10 @@ Two co-equal signal-producer surfaces:
   scripts, supervised AI agents, and future MCP clients. All producers dock at the
   same Product API prepare/sign/submit/proof boundary.
 
-For PRD109 repo-split convergence, executor-kit should keep using the same
-signal-container producer vocabulary as Order App: list tasks, prepare typed
-data, sign with an explicit participant key, submit, and fetch proof. It should
-consume executor, docked Zhixu, and resource-access surfaces from Product
-DTO/Product API.
+Executor-kit keeps using the same signal-container producer vocabulary as Order
+App: list tasks, prepare typed data, sign with an explicit participant key,
+submit, and fetch proof. It consumes executor, docked Zhixu, and resource-access
+surfaces from Product DTO/Product API.
 
 ## Local Commands
 
