@@ -20,6 +20,7 @@ import {
 import { ZERO_BYTES32 } from './constants.js';
 import { DEFAULT_SIGNING_KEY_ENV, loadPrivateKeyFromEnv } from './signing.js';
 import {
+  ExecutorKitError,
   ValidationError,
   normalizeAddress,
   normalizeBytes32,
@@ -32,6 +33,8 @@ export { STATE_MACHINE_ABI } from '@uvp-eth/protocol-bindings';
 
 export const DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV = DEFAULT_SIGNING_KEY_ENV;
 export const DEFAULT_STATE_MACHINE_POLL_INTERVAL_MS = 4_000;
+/** Consecutive full-poll failures tolerated by start() before the watch loop aborts. */
+export const MAX_CONSECUTIVE_POLL_FAILURES = 3;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as const;
 
 export const HOOK_READY_TOPIC = keccak256(stringToBytes('HookReady(bytes32,bytes32,bytes32,bytes32)'));
@@ -117,6 +120,12 @@ export type SubmitStateMachineSignalResult =
 
 export interface StateMachineWatchHandle {
   stop(): Promise<void> | void;
+  /**
+   * Resolves when the loop is stopped manually via stop().
+   * Rejects when the loop aborts because consecutive full-poll failures exceeded
+   * MAX_CONSECUTIVE_POLL_FAILURES; the rejection is the fatal error to propagate.
+   */
+  readonly done: Promise<void>;
 }
 
 export interface StateMachineHookReadyHandlerContext {
@@ -565,16 +574,10 @@ export class StateMachineWatcher {
     );
     const logs = logBatches.flat().sort(compareRawLogs);
     const results: StateMachineLogProcessResult[] = [];
+    // Fail fast: a log-processing error aborts the round before the cursor advances,
+    // so the failing block range is rescanned on the next successful poll.
     for (const log of logs) {
-      try {
-        results.push(await this.handleLog(log));
-      } catch (error) {
-        results.push({
-          status: 'skipped',
-          submissions: [],
-          error: classifyExecutorKitError(error),
-        });
-      }
+      results.push(await this.handleLog(log));
     }
     this.nextBlock = toBlock + 1n;
 
@@ -587,12 +590,18 @@ export class StateMachineWatcher {
   }
 
   async handleLog(log: StateMachineRawLog): Promise<StateMachineLogProcessResult> {
-    const event = decodeHookReadyLog(log, this.config.artifact);
-    if (!event) {
+    if (log.topics[0] !== HOOK_READY_TOPIC) {
       return {
         status: 'skipped',
         submissions: [],
       };
+    }
+
+    const event = decodeHookReadyLog(log, this.config.artifact);
+    if (!event) {
+      // Unreachable: decodeHookReadyLog returns undefined only for logs without the
+      // HookReady topic and throws when a topic-matching log fails to decode.
+      throw new ValidationError('HookReady log matched the topic but did not decode into an event');
     }
 
     const detectedAt = this.config.now();
@@ -781,16 +790,36 @@ export class StateMachineWatcher {
       const result = await this.pollOnce();
       this.config.onPoll?.(result);
     };
+    // First-round failures still fail fast: a rejection here propagates out of start() itself.
     await run();
     let running = false;
+    let consecutiveFailures = 0;
+    let resolveStopped: (() => void) | undefined;
+    let rejectFatal: ((error: unknown) => void) | undefined;
+    const done = new Promise<void>((resolve, reject) => {
+      resolveStopped = resolve;
+      rejectFatal = reject;
+    });
+    // Guard against unhandled rejections when a caller never observes `done`.
+    done.catch(() => {});
     const tick = (): void => {
       if (running) {
         return;
       }
       running = true;
       void run()
+        .then(() => {
+          consecutiveFailures = 0;
+        })
         .catch((error: unknown) => {
+          consecutiveFailures += 1;
           this.config.onError?.(error);
+          if (consecutiveFailures > MAX_CONSECUTIVE_POLL_FAILURES) {
+            clearInterval(timer);
+            rejectFatal?.(new ExecutorKitError(
+              `state machine watch aborted after ${consecutiveFailures} consecutive failed polls: ${describeError(error)}`,
+            ));
+          }
         })
         .finally(() => {
           running = false;
@@ -801,7 +830,9 @@ export class StateMachineWatcher {
     return {
       stop(): void {
         clearInterval(timer);
+        resolveStopped?.();
       },
+      done,
     };
   }
 
@@ -1017,8 +1048,8 @@ export function decodeHookReadyLog(
       data: log.data,
       topics: log.topics as [Hex, ...Hex[]],
     });
-  } catch {
-    return undefined;
+  } catch (error) {
+    throw new ValidationError(`failed to decode HookReady log data: ${describeError(error)}`);
   }
 
   const args = (decoded as { readonly args?: unknown }).args as {
@@ -1052,13 +1083,19 @@ export function decodeHookReadyLog(
 }
 
 export function hookReadyEventId(log: Pick<StateMachineRawLog, 'transactionHash' | 'logIndex'>): Hex {
-  const txHash = log.transactionHash ? normalizeBytes32(log.transactionHash, 'transactionHash') : ZERO_BYTES32;
+  if (!log.transactionHash) {
+    throw new ValidationError('HookReady log is missing transactionHash; refusing to derive an event id from zero values');
+  }
+  const logIndex = normalizeLogIndex(log.logIndex);
+  if (logIndex === undefined) {
+    throw new ValidationError('HookReady log is missing logIndex; refusing to derive an event id from zero values');
+  }
   return keccak256(encodeAbiParameters(
     [
       { type: 'bytes32' },
       { type: 'uint256' },
     ],
-    [txHash, normalizeLogIndex(log.logIndex) ?? 0n],
+    [normalizeBytes32(log.transactionHash, 'transactionHash'), logIndex],
   ));
 }
 
@@ -1191,6 +1228,9 @@ export function createStateMachineHandlersFromConfig(
       (event: StateMachineHookReady) => handler.signals.map((signal) => ({
         orderId: event.orderId,
         ...signal,
+        // Protocol-defined sentinel, not a fallback: UVPStateMachine.submitSignal
+        // treats bytes32(0) as the legal "no payload" value. Omitting payloadHash
+        // here is the producer's explicit declaration of an empty payload.
         payloadHash: signal.payloadHash ?? ZERO_BYTES32,
         readyEventId: signal.readyEventId ?? event.eventId,
         idempotencyKey: signal.idempotencyKey ?? `${event.orderId}:${event.hookId}:${signal.signalName ?? signal.signalId}`,
@@ -1272,7 +1312,12 @@ function normalizeSubmitConfig(config: SubmitStateMachineSignalConfig): Normaliz
     ...(config.walletAddress ? { walletAddress: normalizeAddress(config.walletAddress, 'walletAddress') } : {}),
     privateKeyEnv: config.privateKeyEnv ?? DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV,
     dryRun: config.dryRun ?? false,
-    waitForReceipt: config.waitForReceipt ?? false,
+    // Default ON: a broadcast whose receipt is never observed cannot be told
+    // apart from a reverted one, so waiting is the safe single path. Callers
+    // that explicitly opt out (`waitForReceipt: false`) keep unconfirmed jobs
+    // non-terminal so the outcome is re-checked on a later scan instead of
+    // being trusted.
+    waitForReceipt: config.waitForReceipt ?? true,
     ...(config.publicClient ? { publicClient: config.publicClient } : {}),
   };
 }
@@ -1338,6 +1383,9 @@ function normalizeRetryConfig(config: StateMachineRetryConfig | Record<string, u
 
 function normalizeStateMachineSignal(signal: StateMachineSignal): StateMachineSignalCallArgs {
   const orderId = normalizeBytes32(signal.orderId, 'orderId');
+  // Protocol-defined sentinel, not a fallback: per the UVPStateMachine submitSignal
+  // ABI, bytes32(0) is the legitimate encoding of "no payload" (see EXEC-3 ruling).
+  // A producer omitting payloadHash is asserting an empty payload on chain.
   const payloadHash = signal.payloadHash ? normalizeBytes32(signal.payloadHash, 'payloadHash') : ZERO_BYTES32;
   const sourceId = signal.sourceId
     ? normalizeBytes32(signal.sourceId, 'sourceId')
@@ -1588,15 +1636,18 @@ function jobStatusForError(error: ClassifiedExecutorKitError): StateMachineJobSt
 }
 
 function isTerminalJobStatus(status: StateMachineJobStatus): boolean {
-  return status === 'submitted'
-    || status === 'confirmed'
+  // 'submitted' means a transaction was broadcast but no receipt confirmed it.
+  // That is deliberately NON-terminal: until the chain confirms success the job
+  // stays open so a later scan or manual retry can observe the real outcome
+  // instead of trusting the broadcast (a reverted tx must never freeze as done).
+  return status === 'confirmed'
     || status === 'failed'
     || status === 'ignored'
     || status === 'dead_letter';
 }
 
 function isRetriableStateMachineJobStatus(status: StateMachineJobStatus): boolean {
-  return status === 'failed' || status === 'matched';
+  return status === 'failed' || status === 'matched' || status === 'submitted';
 }
 
 function stateMachineJobStatusToExecutorStatus(status: StateMachineJobStatus): ExecutorJobStatusDTO {
@@ -1739,6 +1790,10 @@ function normalizeCallbackMode(value: string): ExecutorCallbackMode {
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && 'code' in error;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 }
 
 function delay(ms: number): Promise<void> {

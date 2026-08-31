@@ -236,8 +236,8 @@ async function checkProofEndpoint(
 
 interface TaskReadinessCheckResult {
   readonly check: ProductDoctorCheck;
-  readonly readiness: TaskReadinessResult;
-  readonly rawTask: ProductSignalContainer;
+  readonly readiness?: TaskReadinessResult;
+  readonly rawTask?: ProductSignalContainer;
 }
 
 async function checkTaskReadiness(
@@ -317,6 +317,7 @@ async function checkTaskReadiness(
     };
   } catch (error) {
     const classified = classifyExecutorKitError(error, 'unknown');
+    // No synthesized placeholder task/readiness data: the report only carries the failed check.
     return {
       check: {
         ok: false,
@@ -324,21 +325,6 @@ async function checkTaskReadiness(
         detail: classified.message,
         latencyMs: Date.now() - started,
       },
-      readiness: {
-        ok: false,
-        check: { ok: false, label: 'task-readiness', detail: classified.message, latencyMs: Date.now() - started },
-        taskId,
-        orderId: '',
-        title: '',
-        status: 'unknown',
-        canSubmit: false,
-        assigneeMatch: false,
-        configuredWallet: walletAddress ?? '',
-        requiredEvidence: [],
-        nextAction: 'blocked',
-        nextActionLabel: classified.message,
-      },
-      rawTask: { taskId, orderId: '', title: '', status: 'unknown' } as unknown as ProductSignalContainer,
     };
   }
 }

@@ -86,6 +86,11 @@ uvp-executor chain-signal \
   --dry-run
 ```
 
+In the three chain examples above, `--dry-run` is an explicit test aid: the
+flag only builds and prints what would be sent without broadcasting. The
+behavior of the commands is unchanged — without the flag they perform the real
+action, and real execution is always the default.
+
 Use Product API task mode for participant-facing signal containers:
 
 ```bash
@@ -275,6 +280,25 @@ uvp-executor jobs dead-letter <jobId> \
   --reason "manual review required"
 ```
 
+Watcher job semantics:
+
+- Callback transactions wait for the receipt by default (`waitForReceipt`
+  defaults to `true`). A job whose transaction was broadcast but not yet
+  receipted stays in the non-terminal `submitted` state, so later scans or
+  manual retries can observe the real on-chain outcome instead of trusting
+  the broadcast.
+- Failures are classified by explicit machine-readable error codes only. An
+  error without a known code is never auto-retried: the job falls to a terminal
+  `failed` state and waits for human review via `jobs retry` or
+  `jobs dead-letter`.
+- Process exit codes are honest: when a scan result carries an error, or any
+  job ends in `failed`/`dead_letter`, the process exits with status 1 even
+  though result objects were produced without throwing.
+- Runtime-host callback delivery has built-in retries: up to 3 attempts with
+  exponential backoff from the configured base delay. Multi-signal callback
+  runs record per-signal delivery results, so partial success stays visible
+  instead of being collapsed into a single outcome.
+
 ## SDK Surface
 
 - `createStateMachineWatcher`: watches `HookReady` logs, resolves handlers, and
@@ -331,6 +355,20 @@ The contract also exposes `submitSignalFor(...)` and
 EIP-712 typed-data builders for gas-relay adapters. This package does not
 build a separate signed payload model; relayed business signatures must
 stay aligned with the contract's current EIP-712 digest.
+
+### Zero `payloadHash` Semantics
+
+In `submitSignal(bytes32 ..., bytes32 payloadHash, bytes32 ...)`, the value
+`bytes32(0)` (`0x0000000000000000000000000000000000000000000000000000000000000000`)
+is the **protocol-defined encoding of "no payload"**. It is a legitimate
+constant of the `UVPStateMachine` protocol — not a runtime fallback or default.
+
+Consequently, when a handler/config signal definition omits `payloadHash`, the
+kit encodes exactly `bytes32(0)`: this is the producer's explicit declaration
+that the signal carries no off-chain payload, and it is indistinguishable on
+chain from a producer passing the zero hash by hand. Any non-empty payload must
+be declared with its full 32-byte hash.
+
 
 ## Boundaries
 

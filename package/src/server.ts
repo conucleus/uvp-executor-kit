@@ -13,6 +13,9 @@ import { ValidationError } from './validation.js';
 export const DEFAULT_EXECUTOR_TOKEN_ENV = 'UVP_EXECUTOR_TOKEN';
 export const DEFAULT_CALLBACK_TOKEN_ENV = 'UVP_CALLBACK_TOKEN';
 export const DEFAULT_CALLBACK_HOST_ALLOWLIST_ENV = 'UVP_EXECUTOR_CALLBACK_HOST_ALLOWLIST';
+/** Bounded in-process callback delivery retries before a job lands in callback_failed. */
+export const DEFAULT_CALLBACK_MAX_ATTEMPTS = 3;
+export const DEFAULT_CALLBACK_RETRY_BASE_DELAY_MS = 250;
 
 const LOOPBACK_CALLBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 
@@ -33,12 +36,24 @@ export interface ExecutorConfig {
 }
 
 export interface ExecutorDispatchRequest {
-  readonly dispatchId?: string;
+  readonly dispatchId: string;
   readonly effect: RuntimeDispatchEffect;
   readonly callbackUrl: string;
 }
 
 export type ExecutorJobStatus = 'accepted' | 'callback_succeeded' | 'callback_failed' | 'handler_failed';
+
+/**
+ * Truthful per-signal callback delivery record: which signals were delivered,
+ * how many attempts each took, and the terminal error when delivery was
+ * abandoned after exhausting the bounded retries.
+ */
+export interface ExecutorCallbackDelivery {
+  readonly signalIndex: number;
+  readonly delivered: boolean;
+  readonly attempts: number;
+  readonly error?: string;
+}
 
 export interface ExecutorJob {
   readonly id: string;
@@ -49,11 +64,15 @@ export interface ExecutorJob {
   readonly updatedAt: string;
   readonly callbackUrl: string;
   readonly lastError?: string;
+  readonly callbacks?: readonly ExecutorCallbackDelivery[];
 }
 
 export interface ExecutorJobStore {
   create(job: ExecutorJob): Promise<void>;
-  update(jobId: string, patch: Pick<ExecutorJob, 'status' | 'updatedAt'> & Partial<Pick<ExecutorJob, 'lastError'>>): Promise<void>;
+  update(
+    jobId: string,
+    patch: Pick<ExecutorJob, 'status' | 'updatedAt'> & Partial<Pick<ExecutorJob, 'lastError' | 'callbacks'>>,
+  ): Promise<void>;
   get(jobId: string): Promise<ExecutorJob | undefined>;
   list(): Promise<readonly ExecutorJob[]>;
 }
@@ -69,6 +88,11 @@ export interface ExecutorServerOptions {
   readonly now?: () => string;
   readonly jobStore?: ExecutorJobStore;
   readonly callbackHostAllowlist?: readonly string[];
+  /** Bounded in-process retry policy for callback POST failures. */
+  readonly callbackRetry?: {
+    readonly maxAttempts?: number | string;
+    readonly baseDelayMs?: number | string;
+  };
 }
 
 export interface ExecutorServerHandle {
@@ -89,6 +113,8 @@ interface ExecutorRequestContext {
   readonly fetchImpl: typeof fetch;
   readonly now: () => string;
   readonly jobStore: ExecutorJobStore;
+  readonly callbackMaxAttempts: number;
+  readonly callbackRetryBaseDelayMs: number;
 }
 
 const MAX_BODY_BYTES = 1_000_000;
@@ -102,7 +128,7 @@ export class InMemoryExecutorJobStore implements ExecutorJobStore {
 
   async update(
     jobId: string,
-    patch: Pick<ExecutorJob, 'status' | 'updatedAt'> & Partial<Pick<ExecutorJob, 'lastError'>>,
+    patch: Pick<ExecutorJob, 'status' | 'updatedAt'> & Partial<Pick<ExecutorJob, 'lastError' | 'callbacks'>>,
   ): Promise<void> {
     const current = this.jobs.get(jobId);
     if (!current) {
@@ -113,6 +139,7 @@ export class InMemoryExecutorJobStore implements ExecutorJobStore {
       status: patch.status,
       updatedAt: patch.updatedAt,
       ...(patch.lastError ? { lastError: patch.lastError } : {}),
+      ...(patch.callbacks ? { callbacks: patch.callbacks } : {}),
     });
   }
 
@@ -164,6 +191,8 @@ export async function startExecutorServer(options: ExecutorServerOptions): Promi
   const now = options.now ?? (() => new Date().toISOString());
   const fetchImpl = options.fetchImpl ?? fetch;
   const jobStore = options.jobStore ?? new InMemoryExecutorJobStore();
+  const callbackMaxAttempts = normalizeCallbackMaxAttempts(options.callbackRetry?.maxAttempts);
+  const callbackRetryBaseDelayMs = normalizeCallbackBaseDelayMs(options.callbackRetry?.baseDelayMs);
   const server = createServer((request, response) => {
     void handleExecutorRequest(
       {
@@ -175,6 +204,8 @@ export async function startExecutorServer(options: ExecutorServerOptions): Promi
         fetchImpl,
         now,
         jobStore,
+        callbackMaxAttempts,
+        callbackRetryBaseDelayMs,
       },
       request,
       response,
@@ -249,8 +280,8 @@ async function routeExecutorRequest(
 
     const acceptedAt = context.now();
     const job: ExecutorJob = {
-      id: dispatch.dispatchId ?? `${dispatch.effect.orderId}:${dispatch.effect.hookId}:${acceptedAt}`,
-      dispatchId: dispatch.dispatchId ?? `${dispatch.effect.orderId}:${dispatch.effect.hookId}`,
+      id: dispatch.dispatchId,
+      dispatchId: dispatch.dispatchId,
       hookId: dispatch.effect.hookId,
       status: 'accepted',
       acceptedAt,
@@ -274,7 +305,7 @@ async function routeExecutorRequest(
 }
 
 async function processDispatch(
-  context: Pick<ExecutorRequestContext, 'fetchImpl' | 'now' | 'jobStore' | 'callbackToken' | 'callbackHostAllowlist'>,
+  context: Pick<ExecutorRequestContext, 'fetchImpl' | 'now' | 'jobStore' | 'callbackToken' | 'callbackHostAllowlist' | 'callbackMaxAttempts' | 'callbackRetryBaseDelayMs'>,
   job: ExecutorJob,
   dispatch: ExecutorDispatchRequest,
   handler: RuntimeExecutorHandler,
@@ -290,12 +321,27 @@ async function processDispatch(
       return;
     }
 
-    for (const signal of result.signals ?? []) {
-      await postSignalCallback(context.fetchImpl, dispatch.callbackUrl, context.callbackToken, signal, context.callbackHostAllowlist);
+    // Validate once up front so a rejected callback URL fails fast instead of
+    // being retried; per-signal failures below are delivery failures.
+    assertCallbackUrlAllowed(dispatch.callbackUrl, context.callbackHostAllowlist);
+
+    const signals = result.signals ?? [];
+    // Each signal is retried independently and recorded truthfully: a partial
+    // failure must never erase the fact that earlier signals were delivered.
+    const deliveries: ExecutorCallbackDelivery[] = [];
+    for (const [signalIndex, signal] of signals.entries()) {
+      deliveries.push(await deliverSignalCallback(context, dispatch.callbackUrl, signal, signalIndex));
     }
+    const failedDeliveries = deliveries.filter((delivery) => !delivery.delivered);
     await context.jobStore.update(job.id, {
-      status: 'callback_succeeded',
+      status: failedDeliveries.length === 0 ? 'callback_succeeded' : 'callback_failed',
       updatedAt: context.now(),
+      ...(deliveries.length > 0 ? { callbacks: deliveries } : {}),
+      ...(failedDeliveries.length > 0 ? {
+        lastError: `callback delivery failed for ${failedDeliveries.length}/${deliveries.length} signal(s)`
+          + `${deliveries.length - failedDeliveries.length > 0 ? ` (${deliveries.length - failedDeliveries.length} signal(s) were delivered)` : ''}`
+          + `: ${failedDeliveries[0]?.error ?? 'unknown error'}`,
+      } : {}),
     });
   } catch (error) {
     await context.jobStore.update(job.id, {
@@ -304,6 +350,35 @@ async function processDispatch(
       lastError: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+/**
+ * POST one signal callback with bounded in-process retries (exponential
+ * backoff starting at the configured base delay). Returns the truthful
+ * delivery record; only after all attempts are exhausted is the failure
+ * reported (with an error log) back to the caller.
+ */
+async function deliverSignalCallback(
+  context: Pick<ExecutorRequestContext, 'fetchImpl' | 'callbackToken' | 'callbackHostAllowlist' | 'callbackMaxAttempts' | 'callbackRetryBaseDelayMs'>,
+  callbackUrl: string,
+  signal: RuntimeSignalEnvelope,
+  signalIndex: number,
+): Promise<ExecutorCallbackDelivery> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= context.callbackMaxAttempts; attempt += 1) {
+    try {
+      await postSignalCallback(context.fetchImpl, callbackUrl, context.callbackToken, signal, context.callbackHostAllowlist);
+      return { signalIndex, delivered: true, attempts: attempt };
+    } catch (error) {
+      lastError = error;
+      if (attempt < context.callbackMaxAttempts && context.callbackRetryBaseDelayMs > 0) {
+        await delay(context.callbackRetryBaseDelayMs * 2 ** (attempt - 1));
+      }
+    }
+  }
+  const message = lastError instanceof Error ? lastError.message : String(lastError);
+  console.error(`executor-kit: callback delivery failed for signal ${signalIndex} after ${context.callbackMaxAttempts} attempt(s): ${message}`);
+  return { signalIndex, delivered: false, attempts: context.callbackMaxAttempts, error: message };
 }
 
 async function postSignalCallback(
@@ -363,13 +438,16 @@ function toDispatchRequest(value: unknown, callbackHostAllowlist: readonly strin
   if (!isRecord(value)) {
     throw new ValidationError('dispatch request must be an object');
   }
+  if (typeof value.dispatchId !== 'string' || value.dispatchId.trim().length === 0) {
+    throw new ValidationError('dispatchId is required: provide a stable dispatchId so duplicate dispatches can be rejected');
+  }
   const effect = toDispatchEffect(value.effect);
   const callbackUrl = asString(value.callbackUrl, 'callbackUrl');
   assertCallbackUrlAllowed(callbackUrl, callbackHostAllowlist);
   return {
+    dispatchId: value.dispatchId,
     effect,
     callbackUrl,
-    ...(typeof value.dispatchId === 'string' ? { dispatchId: value.dispatchId } : {}),
   };
 }
 
@@ -486,6 +564,32 @@ function requireNonEmpty(value: string | undefined, fieldName: string): string {
     throw new ValidationError(`${fieldName} is required`);
   }
   return value;
+}
+
+function normalizeCallbackMaxAttempts(value: number | string | undefined): number {
+  if (value === undefined) {
+    return DEFAULT_CALLBACK_MAX_ATTEMPTS;
+  }
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new ValidationError('callbackRetry.maxAttempts must be a positive integer');
+  }
+  return parsed;
+}
+
+function normalizeCallbackBaseDelayMs(value: number | string | undefined): number {
+  if (value === undefined) {
+    return DEFAULT_CALLBACK_RETRY_BASE_DELAY_MS;
+  }
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new ValidationError('callbackRetry.baseDelayMs must be a non-negative integer');
+  }
+  return parsed;
+}
+
+function delay(ms: number): Promise<void> {
+  return ms > 0 ? new Promise((resolve) => setTimeout(resolve, ms)) : Promise.resolve();
 }
 
 function formatHost(host: string): string {

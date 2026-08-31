@@ -440,6 +440,29 @@ describe('Product API doctor', () => {
     expect(report.taskReadiness?.nextActionLabel).toContain('not the task assignee');
     expect(report.ok).toBe(false);
   });
+
+  it('omits readiness and raw-task data when the task lookup fails', async () => {
+    const fetch: ProductApiFetch = async (url) => {
+      if (!url.includes('/product/')) {
+        return jsonResponse({ service: 'chain-services' });
+      }
+      return { ok: false, status: 404, text: async () => JSON.stringify({ error: 'task_not_found' }) };
+    };
+
+    const report = await runProductDoctor({
+      chainServicesUrl: 'http://chain.local/api',
+      taskId: 'task_missing',
+      fetch,
+    });
+
+    const taskCheck = report.checks.find((c) => c.label === 'task-readiness');
+    expect(taskCheck?.ok).toBe(false);
+    expect(taskCheck?.detail).toBeTypeOf('string');
+    expect(report.taskReadiness).toBeUndefined();
+    expect(report.rawTaskReadiness).toBeUndefined();
+    expect(JSON.stringify(report)).not.toContain('"status":"unknown"');
+    expect(report.ok).toBe(false);
+  });
 });
 
 describe('doctor CLI', () => {
@@ -802,6 +825,44 @@ describe('doctor CLI', () => {
       } else {
         delete (globalThis as { fetch?: unknown }).fetch;
       }
+    }
+  });
+
+  it('sets a non-zero exit code while still printing the report when a doctor check fails', async () => {
+    const previousExitCode = process.exitCode;
+    const logs: string[] = [];
+    const originalLog = console.log;
+    const originalFetch = globalThis.fetch;
+    console.log = (message?: unknown) => {
+      logs.push(String(message));
+    };
+    globalThis.fetch = (async () => jsonResponse({ error: 'unavailable' }, 503)) as unknown as typeof globalThis.fetch;
+
+    try {
+      await main([
+        'node',
+        'uvp-executor',
+        'doctor',
+        '--chain-services-url',
+        'http://chain.local/api',
+      ]);
+      const output = JSON.parse(logs[0] ?? '{}') as {
+        ok?: boolean;
+        checks?: Array<{ ok?: boolean; label?: string; detail?: string }>;
+      };
+      expect(output.ok).toBe(false);
+      expect(output.checks?.[0]).toMatchObject({ ok: false, label: 'reachability', detail: expect.stringContaining('503') });
+      // The printed report is unchanged; only the exit signal is added.
+      expect(logs[0]).toContain('"ok":false');
+      expect(process.exitCode).toBe(1);
+    } finally {
+      console.log = originalLog;
+      if (originalFetch) {
+        globalThis.fetch = originalFetch;
+      } else {
+        delete (globalThis as { fetch?: unknown }).fetch;
+      }
+      process.exitCode = previousExitCode;
     }
   });
 });

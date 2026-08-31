@@ -444,6 +444,9 @@ export function buildProgram(): Command {
         ...(options.submissionId ? { submissionId: options.submissionId } : {}),
         ...(options.verbose ? { verbose: true } : {}),
       });
+      if (!report.ok) {
+        process.exitCode = 1;
+      }
       console.log(stringifyForTransport(report));
     });
 
@@ -503,6 +506,9 @@ export function buildProgram(): Command {
         ...(options.reason ? { reason: options.reason } : {}),
       });
       console.log(stringifyForTransport({ retry: result }));
+      if (executionOutcomeFailed(result)) {
+        process.exitCode = 1;
+      }
     });
 
   jobs
@@ -537,6 +543,11 @@ export function buildProgram(): Command {
       const watcher = await buildStateMachineWatcherFromCli(options);
       const poll = await watcher.pollOnce();
       console.log(stringifyForTransport({ watcher: watcher.describe(), poll }));
+      // Honest exit code: submission errors folded into the poll result (or
+      // failed/dead-lettered jobs) must not masquerade as a successful run.
+      if (chainPollExecutionFailed(poll)) {
+        process.exitCode = 1;
+      }
     });
 
   program
@@ -557,9 +568,18 @@ export function buildProgram(): Command {
       const watcher = await buildStateMachineWatcherFromCli(options);
       console.log(stringifyForTransport({ watcher: watcher.describe() }));
       const handle = await watcher.start();
-      await waitForShutdown(async () => {
+      try {
+        // A fatal watch-loop abort (consecutive poll failures) rejects handle.done and
+        // propagates out of this command so the process exits non-zero.
+        await Promise.race([
+          handle.done,
+          waitForShutdown(async () => {
+            await handle.stop();
+          }),
+        ]);
+      } finally {
         await handle.stop();
-      });
+      }
     });
 
   program
@@ -588,7 +608,7 @@ export function buildProgram(): Command {
         ...(options.walletAddress ? { walletAddress: options.walletAddress } : {}),
         privateKeyEnv: options.privateKeyEnv,
         dryRun: options.dryRun ?? false,
-        waitForReceipt: options.waitForReceipt ?? false,
+        ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
       }, {
         orderId: options.orderId,
         source: options.source,
@@ -674,8 +694,8 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions) {
     ...(config.artifact ? { artifact: config.artifact } : {}),
     ...(config.retry ? { retry: config.retry } : {}),
     ...(options.jobsFile ? { jobStore: new FileStateMachineJobStore(options.jobsFile) } : {}),
-    dryRun: options.dryRun ?? config.dryRun ?? false,
-    waitForReceipt: options.waitForReceipt ?? false,
+        dryRun: options.dryRun ?? config.dryRun ?? false,
+        ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
     ...(options.fromBlock ? { fromBlock: options.fromBlock } : {}),
     ...(options.pollIntervalMs ? { pollIntervalMs: parsePositiveInteger(options.pollIntervalMs, 'pollIntervalMs') } : {}),
     onPoll: (poll) => {
@@ -825,6 +845,30 @@ function waitForShutdown(close: () => Promise<void>): Promise<void> {
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
   });
+}
+
+/**
+ * True when one log-processing outcome carries an error or ended in a terminal
+ * failure state. Used to drive honest process exit codes: a chain-once scan or
+ * jobs retry whose callback submission failed must exit non-zero even though
+ * the result object itself was produced without throwing.
+ */
+export function executionOutcomeFailed(result: {
+  readonly error?: unknown;
+  readonly job?: { readonly status?: string };
+}): boolean {
+  return Boolean(result.error)
+    || result.job?.status === 'failed'
+    || result.job?.status === 'dead_letter';
+}
+
+export function chainPollExecutionFailed(poll: {
+  readonly results?: readonly {
+    readonly error?: unknown;
+    readonly job?: { readonly status?: string };
+  }[];
+}): boolean {
+  return (poll.results ?? []).some(executionOutcomeFailed);
 }
 
 export async function main(argv = process.argv): Promise<void> {

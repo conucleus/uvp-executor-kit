@@ -9,10 +9,53 @@ export type ExecutorKitErrorKind =
   | 'handler_failure'
   | 'unknown';
 
+/**
+ * Explicit machine-readable error codes recognized by the classifier.
+ *
+ * Classification never inspects message text: an error is classified only when
+ * it carries one of these codes (typically via `error.code` on a thrown Error,
+ * e.g. `new CodedExecutorKitError('RPC_NETWORK', 'fetch failed')`). Anything
+ * else is conservatively non-retryable and lands in a terminal state for human
+ * review instead of guessing retry semantics from keywords.
+ */
+export type ExecutorKitErrorCode =
+  | 'UNAUTHORIZED'
+  | 'DUPLICATE_SIGNAL'
+  | 'RPC_NETWORK'
+  | 'MISSING_HANDLER'
+  | 'VALIDATION_FAILURE'
+  | 'HANDLER_FAILURE';
+
 export interface ClassifiedExecutorKitError {
   readonly kind: ExecutorKitErrorKind;
   readonly message: string;
   readonly retryable: boolean;
+  /** The explicit code the classification was derived from, when present. */
+  readonly code?: ExecutorKitErrorCode;
+}
+
+const ERROR_CODE_TABLE: Readonly<
+  Record<ExecutorKitErrorCode, { readonly kind: ExecutorKitErrorKind; readonly retryable: boolean }>
+> = {
+  UNAUTHORIZED: { kind: 'unauthorized', retryable: false },
+  DUPLICATE_SIGNAL: { kind: 'duplicate_signal', retryable: false },
+  RPC_NETWORK: { kind: 'rpc_network', retryable: true },
+  MISSING_HANDLER: { kind: 'missing_handler', retryable: false },
+  VALIDATION_FAILURE: { kind: 'validation_failure', retryable: false },
+  HANDLER_FAILURE: { kind: 'handler_failure', retryable: false },
+};
+
+const KNOWN_ERROR_CODES = new Set<string>(Object.keys(ERROR_CODE_TABLE));
+
+/** An Error carrying an explicit executor-kit classification code. */
+export class CodedExecutorKitError extends Error {
+  readonly code: ExecutorKitErrorCode;
+
+  constructor(code: ExecutorKitErrorCode, message?: string) {
+    super(message ?? code);
+    this.name = 'CodedExecutorKitError';
+    this.code = code;
+  }
 }
 
 export function classifyExecutorKitError(
@@ -20,113 +63,43 @@ export function classifyExecutorKitError(
   fallbackKind: ExecutorKitErrorKind = 'unknown',
 ): ClassifiedExecutorKitError {
   const rawMessage = errorToMessage(error);
-  const haystack = collectErrorText(error).toLowerCase();
-  const kind = classifyFromText(error, haystack, fallbackKind);
 
+  const matchedCode = matchExplicitCode(error);
+  if (matchedCode) {
+    const entry = ERROR_CODE_TABLE[matchedCode];
+    return {
+      kind: entry.kind,
+      message: redactSecretLikeHex(rawMessage || matchedCode),
+      retryable: entry.retryable,
+      code: matchedCode,
+    };
+  }
+
+  // No explicit code: never guess from message text. ValidationError stays an
+  // explicit type-based classification; everything else falls back as strictly
+  // non-retryable so unclassifiable failures reach a terminal state for human
+  // review rather than being silently retried.
   return {
-    kind,
-    message: redactSecretLikeHex(rawMessage || kind),
-    retryable: kind === 'rpc_network',
+    kind: error instanceof ValidationError ? 'validation_failure' : fallbackKind,
+    message: redactSecretLikeHex(rawMessage || fallbackKind),
+    retryable: false,
   };
 }
 
-function classifyFromText(
-  error: unknown,
-  haystack: string,
-  fallbackKind: ExecutorKitErrorKind,
-): ExecutorKitErrorKind {
-  if (error instanceof ValidationError) {
-    return 'validation_failure';
-  }
-
-  if (matchesAny(haystack, [
-    'unauthorized',
-    'not authorized',
-    'forbidden',
-    'accesscontrol',
-    'ownableunauthorizedaccount',
-    'permission',
-    'not allowed',
-    'caller is not',
-    'sender is not',
-  ])) {
-    return 'unauthorized';
-  }
-
-  if (matchesAny(haystack, [
-    'duplicate',
-    'already submitted',
-    'already processed',
-    'signal already',
-    'idempotency',
-    'nonce already',
-    'replay',
-  ])) {
-    return 'duplicate_signal';
-  }
-
-  if (matchesAny(haystack, [
-    'missing handler',
-    'handler not found',
-    'handler_not_found',
-    'no runtime executor handler',
-    'no state machine handler',
-  ])) {
-    return 'missing_handler';
-  }
-
-  if (matchesAny(haystack, [
-    'validationerror',
-    'validation failed',
-    'invalid',
-    'must be',
-    'is required',
-    'wrong chain id',
-    'payloadhash',
-    'payload hash',
-  ])) {
-    return 'validation_failure';
-  }
-
-  if (matchesAny(haystack, [
-    'rpc',
-    'fetch failed',
-    'network',
-    'timeout',
-    'timed out',
-    'econn',
-    'enotfound',
-    'etimedout',
-    'eai_again',
-    'socket',
-    'rate limit',
-    'too many requests',
-    '429',
-    '502',
-    '503',
-    '504',
-    'gateway',
-    'connection',
-  ])) {
-    return 'rpc_network';
-  }
-
-  return fallbackKind;
-}
-
-function collectErrorText(error: unknown): string {
-  const parts: string[] = [];
+function matchExplicitCode(error: unknown): ExecutorKitErrorCode | undefined {
   let current: unknown = error;
   for (let depth = 0; depth < 4 && current; depth += 1) {
     if (current instanceof Error) {
-      parts.push(current.name, current.message);
+      const code = (current as { readonly code?: unknown }).code;
+      if (typeof code === 'string' && KNOWN_ERROR_CODES.has(code)) {
+        return code as ExecutorKitErrorCode;
+      }
       current = current.cause;
       continue;
     }
-    parts.push(String(current));
     break;
   }
-  return parts.join(' ');
+  return undefined;
 }
 
 function errorToMessage(error: unknown): string {
@@ -134,10 +107,6 @@ function errorToMessage(error: unknown): string {
     return error.message;
   }
   return String(error);
-}
-
-function matchesAny(value: string, needles: readonly string[]): boolean {
-  return needles.some((needle) => value.includes(needle));
 }
 
 function redactSecretLikeHex(value: string): string {

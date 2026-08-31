@@ -2,10 +2,13 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import type { RuntimeExecutorHandler } from '../src/runtime.js';
 import {
   assertCallbackUrlAllowed,
   createHandlersFromExecutorConfig,
+  DEFAULT_CALLBACK_MAX_ATTEMPTS,
+  DEFAULT_CALLBACK_RETRY_BASE_DELAY_MS,
   loadExecutorConfig,
   parseCallbackHostAllowlist,
   startExecutorServer,
@@ -174,7 +177,9 @@ describe('executor HTTP server', () => {
       }),
       port: 0,
       fetchImpl: async () => new Response('callback rejected', { status: 500 }),
+      callbackRetry: { maxAttempts: DEFAULT_CALLBACK_MAX_ATTEMPTS, baseDelayMs: 0 },
     });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const response = await fetch(`${callbackFailure.url}/v0/dispatches`, {
         method: 'POST',
@@ -188,10 +193,142 @@ describe('executor HTTP server', () => {
       await eventually(async () => {
         const jobs = await getJobs(callbackFailure.url);
         expect(jobs[0]?.status).toBe('callback_failed');
+        // Bounded retries were exhausted before the terminal failure was recorded.
+        expect(jobs[0]?.callbacks?.[0]).toMatchObject({
+          signalIndex: 0,
+          delivered: false,
+          attempts: DEFAULT_CALLBACK_MAX_ATTEMPTS,
+        });
         expect(jobs[0]?.lastError).toContain('callback endpoint failed with 500');
       });
+      // The exhausted delivery is reported through an error log.
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('callback delivery failed for signal 0 after 3 attempt(s)'));
     } finally {
+      errorSpy.mockRestore();
       await callbackFailure.close();
+    }
+  });
+
+  it('retries a failing callback POST with backoff before reporting success', async () => {
+    let attempt = 0;
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+      // Default retry policy: bounded attempts with a real base delay.
+      fetchImpl: async () => {
+        attempt += 1;
+        return attempt < DEFAULT_CALLBACK_MAX_ATTEMPTS
+          ? new Response('flaky endpoint', { status: 503 })
+          : new Response('ok', { status: 200 });
+      },
+    });
+    try {
+      const startedAt = Date.now();
+      const response = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-callback-retry', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' }),
+      });
+      expect(response.status).toBe(202);
+      await eventually(async () => {
+        const jobs = await getJobs(executor.url);
+        expect(jobs[0]?.status).toBe('callback_succeeded');
+        expect(jobs[0]?.callbacks?.[0]).toEqual({
+          signalIndex: 0,
+          delivered: true,
+          attempts: DEFAULT_CALLBACK_MAX_ATTEMPTS,
+        });
+      });
+      expect(attempt).toBe(DEFAULT_CALLBACK_MAX_ATTEMPTS);
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(DEFAULT_CALLBACK_RETRY_BASE_DELAY_MS);
+    } finally {
+      await executor.close();
+    }
+  });
+
+  it('records per-signal delivery truthfully when only some signals are delivered', async () => {
+    const twoSignalHandler: RuntimeExecutorHandler = (dispatchEffect) => ({
+      status: 'succeeded',
+      signals: [
+        {
+          zhixuId: dispatchEffect.zhixuId,
+          orderId: dispatchEffect.orderId,
+          source: 'buyer',
+          stageIdentifier: dispatchEffect.stageIdentifier,
+          signalName: `${dispatchEffect.stageIdentifier}.cmp`,
+          senderId: 'exec-executor',
+        },
+        {
+          zhixuId: dispatchEffect.zhixuId,
+          orderId: dispatchEffect.orderId,
+          source: 'buyer',
+          stageIdentifier: dispatchEffect.stageIdentifier,
+          signalName: `${dispatchEffect.stageIdentifier}.done`,
+          senderId: 'exec-executor',
+        },
+      ],
+    });
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: { 'exec.main#START': twoSignalHandler },
+      port: 0,
+      // The first signal (.cmp) is accepted; every delivery of the second one
+      // (.done) fails so the job must end callback_failed while truthfully
+      // recording that signal 0 was delivered.
+      fetchImpl: async (_input, init) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { signal?: { signalName?: string } };
+        if (body.signal?.signalName === 'exec.main.cmp') {
+          return new Response('ok', { status: 200 });
+        }
+        return new Response('callback rejected', { status: 500 });
+      },
+      callbackRetry: { baseDelayMs: 0 },
+    });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const response = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-partial-callback', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' }),
+      });
+      expect(response.status).toBe(202);
+      await eventually(async () => {
+        const jobs = await getJobs(executor.url);
+        expect(jobs[0]?.status).toBe('callback_failed');
+        expect(jobs[0]?.callbacks).toHaveLength(2);
+      });
+      const jobs = await getJobs(executor.url);
+      const job = jobs[0];
+      // The delivered signal stays recorded as delivered; the failure must not
+      // mask the fact that the first signal went out.
+      expect(job?.callbacks?.[0]).toMatchObject({ signalIndex: 0, delivered: true, attempts: 1 });
+      expect(job?.callbacks?.[1]?.delivered).toBe(false);
+      expect(job?.callbacks?.[1]?.error).toContain('callback endpoint failed with 500');
+      expect(job?.lastError).toContain('1/2 signal(s)');
+      expect(job?.lastError).toContain('were delivered');
+    } finally {
+      errorSpy.mockRestore();
+      await executor.close();
     }
   });
 
@@ -245,6 +382,39 @@ describe('executor HTTP server', () => {
       const jobs = await getJobs(executor.url);
       expect(jobs).toHaveLength(1);
       expect(jobs[0]?.id).toBe('dispatch-conflict');
+    } finally {
+      await executor.close();
+    }
+  });
+
+  it('rejects dispatches without a dispatchId instead of synthesizing a timestamped job id', async () => {
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: {},
+      port: 0,
+    });
+    try {
+      for (const body of [
+        { effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' },
+        { dispatchId: '', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' },
+      ]) {
+        const response = await fetch(`${executor.url}/v0/dispatches`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${executorToken}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(body),
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({
+          error: 'bad_request',
+          message: expect.stringContaining('dispatchId'),
+        });
+      }
+      expect(await getJobs(executor.url)).toHaveLength(0);
     } finally {
       await executor.close();
     }
