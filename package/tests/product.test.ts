@@ -14,8 +14,10 @@ import {
   listSignalContainers,
   parsePreparedSignalContainer,
   prepareSignalContainer,
+  ProductApiError,
   productApiAuthHeadersFromEnv,
   signPreparedSignalContainer,
+  submitPreparedSignalContainer,
   summarizeSignalContainer,
   type PreparedSignalContainer,
   type ProductApiFetch,
@@ -518,6 +520,146 @@ describe('Product API mode', () => {
   });
 });
 
+describe('request id passthrough (ETH-10)', () => {
+  it('attaches the server x-request-id header to task, prepare, submit, and proof results', async () => {
+    const fetch: ProductApiFetch = async (url) => {
+      if (url.includes('/product/tasks?')) {
+        return jsonResponseWithHeaders({
+          tasks: [
+            {
+              taskId: 'task_req',
+              orderId: 'order_req',
+              title: 'Request id task',
+              status: 'open',
+            },
+          ],
+        }, { 'x-request-id': 'req-list-1' });
+      }
+      if (url.includes('/prepare-submit')) {
+        return jsonResponseWithHeaders(preparedSubmission(), { 'X-Request-Id': 'req-prepare-1' });
+      }
+      return jsonResponseWithHeaders({
+        submissionId: 'sub_req',
+        prepareId: 'prep_1',
+        taskId: 'task_1',
+        orderId: 'order_1',
+        status: 'submitted',
+      }, { 'x-request-id': 'req-submit-1' });
+    };
+
+    const tasks = await listSignalContainers({
+      chainServicesUrl: 'http://chain.local',
+      walletAddress: submitter,
+      fetch,
+    });
+    expect(tasks[0]?.requestId).toBe('req-list-1');
+
+    const prepared = await prepareSignalContainer({
+      chainServicesUrl: 'http://chain.local',
+      taskId: 'task_1',
+      walletAddress: submitter,
+      evidenceIds: ['ev_1'],
+      intent: 'confirm_stage',
+      fetch,
+    });
+    expect(prepared.requestId).toBe('req-prepare-1');
+
+    const submitted = await submitPreparedSignalContainer({
+      chainServicesUrl: 'http://chain.local',
+      taskId: 'task_1',
+      prepareId: 'prep_1',
+      signature: `0x${'cd'.repeat(65)}`,
+      walletAddress: submitter,
+      fetch,
+    });
+    expect(submitted.requestId).toBe('req-submit-1');
+  });
+
+  it('reads the request id from fetch-style header objects and the x-uvp-request-id fallback', async () => {
+    const fetch: ProductApiFetch = async () => ({
+      ok: true,
+      status: 200,
+      headers: {
+        get: (name: string) => name === 'x-uvp-request-id' ? '  req-fallback-1\n' : null,
+      },
+      text: async () => JSON.stringify({
+        submissionId: 'sub_hdr',
+        prepareId: 'prep_hdr',
+        taskId: 'task_hdr',
+        orderId: 'order_hdr',
+        status: 'confirmed',
+      }),
+    });
+
+    await expect(getSignalContainerProof({
+      chainServicesUrl: 'http://chain.local',
+      submissionId: 'sub_hdr',
+      fetch,
+    })).resolves.toMatchObject({ submissionId: 'sub_hdr', requestId: 'req-fallback-1' });
+  });
+
+  it('leaves results untouched when the response carries no headers', async () => {
+    const fetch: ProductApiFetch = async () => jsonResponse({
+      submissionId: 'sub_nohdr',
+      prepareId: 'prep_nohdr',
+      taskId: 'task_nohdr',
+      orderId: 'order_nohdr',
+      status: 'confirmed',
+    });
+
+    const submission = await getSignalContainerProof({
+      chainServicesUrl: 'http://chain.local',
+      submissionId: 'sub_nohdr',
+      fetch,
+    });
+    expect(submission.requestId).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(submission, 'requestId')).toBe(false);
+  });
+
+  it('carries the request id on ProductApiError from the response header, falling back to the error body', async () => {
+    const headerFetch: ProductApiFetch = async () => jsonResponseWithHeaders({
+      error: 'forbidden',
+      message: 'not allowed',
+    }, { 'x-request-id': 'req-error-1' }, 403);
+
+    const headerError = await getSignalContainerProof({
+      chainServicesUrl: 'http://chain.local',
+      submissionId: 'sub_err',
+      fetch: headerFetch,
+    }).catch((error: unknown) => error);
+    expect(headerError).toBeInstanceOf(ProductApiError);
+    expect((headerError as ProductApiError).requestId).toBe('req-error-1');
+    expect((headerError as ProductApiError).status).toBe(403);
+
+    const bodyFetch: ProductApiFetch = async () => jsonResponse({
+      error: 'internal_server_error',
+      message: 'boom',
+      requestId: 'req-error-body-1',
+    }, 500);
+
+    const bodyError = await getSignalContainerProof({
+      chainServicesUrl: 'http://chain.local',
+      submissionId: 'sub_err',
+      fetch: bodyFetch,
+    }).catch((error: unknown) => error);
+    expect(bodyError).toBeInstanceOf(ProductApiError);
+    expect((bodyError as ProductApiError).requestId).toBe('req-error-body-1');
+
+    const bareFetch: ProductApiFetch = async () => jsonResponse({
+      error: 'not_found',
+      message: 'missing',
+    }, 404);
+
+    const bareError = await getSignalContainerProof({
+      chainServicesUrl: 'http://chain.local',
+      submissionId: 'sub_err',
+      fetch: bareFetch,
+    }).catch((error: unknown) => error);
+    expect(bareError).toBeInstanceOf(ProductApiError);
+    expect((bareError as ProductApiError).requestId).toBeUndefined();
+  });
+});
+
 describe('frozen typed-data validation', () => {
   it('rejects extra, missing, renamed, and type-drifted fields against the frozen field table', () => {
     const base = () => structuredClone(preparedSubmission()) as PreparedSignalContainer;
@@ -675,6 +817,17 @@ function jsonResponse(body: unknown, status = 200): ProductApiFetchResponse {
     ok: status >= 200 && status < 300,
     status,
     text: async () => JSON.stringify(body),
+  };
+}
+
+function jsonResponseWithHeaders(
+  body: unknown,
+  headers: Readonly<Record<string, string>>,
+  status = 200,
+): ProductApiFetchResponse {
+  return {
+    ...jsonResponse(body, status),
+    headers,
   };
 }
 

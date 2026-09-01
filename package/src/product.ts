@@ -20,16 +20,34 @@ export type ProductSubmitIntent = 'confirm_stage' | 'reject_stage' | 'raise_disp
 
 const ZERO_BYTES32 = `0x${'0'.repeat(64)}` as const;
 
+/**
+ * ETH-10: the chain-services API server stamps every response (success and
+ * error) with this header so executor-side results, errors, and logs can be
+ * correlated end to end with server-side request logs.
+ */
+export const PRODUCT_API_REQUEST_ID_HEADER = 'x-request-id';
+/** Legacy/alternate inbound alias the server also accepts; checked as a fallback. */
+export const PRODUCT_API_REQUEST_ID_HEADER_FALLBACK = 'x-uvp-request-id';
+
 export interface ProductApiFetchInit {
   readonly method?: string;
   readonly headers?: Readonly<Record<string, string>>;
   readonly body?: string;
 }
 
+/**
+ * Response headers as a plain record (lowercase or any casing) or a fetch-like
+ * object exposing `get(name)`, so both test stubs and real `Response` objects fit.
+ */
+export type ProductApiResponseHeaders =
+  | Readonly<Record<string, string | readonly string[] | undefined>>
+  | { readonly get: (name: string) => string | null | undefined };
+
 export interface ProductApiFetchResponse {
   readonly ok: boolean;
   readonly status: number;
   readonly statusText?: string;
+  readonly headers?: ProductApiResponseHeaders;
   text?(): Promise<string>;
   json?(): Promise<unknown>;
 }
@@ -110,6 +128,8 @@ export interface ProductSignalContainer extends Record<string, unknown> {
   readonly orderId: string;
   readonly title: string;
   readonly status: string;
+  /** ETH-10: x-request-id echoed by the server response that produced this object. */
+  readonly requestId?: string;
 }
 
 export interface ProductSubmitHumanSummary extends Record<string, unknown> {
@@ -133,6 +153,8 @@ export interface PreparedSignalContainer extends Record<string, unknown> {
   readonly humanSummary: ProductSubmitHumanSummary;
   readonly typedData: ProductSubmitTypedData;
   readonly evidence: readonly Record<string, unknown>[];
+  /** ETH-10: x-request-id echoed by the server response that produced this object. */
+  readonly requestId?: string;
 }
 
 export interface SubmittedSignalContainer extends Record<string, unknown> {
@@ -141,6 +163,8 @@ export interface SubmittedSignalContainer extends Record<string, unknown> {
   readonly taskId: string;
   readonly orderId: string;
   readonly status: string;
+  /** ETH-10: x-request-id echoed by the server response that produced this object. */
+  readonly requestId?: string;
 }
 
 export interface ProductTaskSummary {
@@ -218,8 +242,14 @@ export class ProductApiError extends ExecutorKitError {
   readonly status: number;
   readonly code?: string;
   readonly details?: unknown;
+  /**
+   * ETH-10: request id of the failed call, taken from the x-request-id response
+   * header (falling back to the id the server embeds in error bodies) so the
+   * failure can be matched against server-side logs.
+   */
+  readonly requestId?: string;
 
-  constructor(status: number, code: string | undefined, message: string, details?: unknown) {
+  constructor(status: number, code: string | undefined, message: string, details?: unknown, requestId?: string) {
     super(message);
     this.name = 'ProductApiError';
     this.status = status;
@@ -229,12 +259,15 @@ export class ProductApiError extends ExecutorKitError {
     if (details !== undefined) {
       this.details = details;
     }
+    if (requestId !== undefined) {
+      this.requestId = requestId;
+    }
   }
 }
 
 export async function listSignalContainers(input: ListSignalContainersInput): Promise<readonly ProductSignalContainer[]> {
   const walletAddress = normalizeAddress(input.walletAddress, 'walletAddress');
-  const body = await requestProductApiJson(input, 'GET', '/product/tasks', undefined, {
+  const { body, requestId } = await requestProductApiJson(input, 'GET', '/product/tasks', undefined, {
     assignee: walletAddress,
     ...(input.orderId ? { orderId: input.orderId } : {}),
     ...(input.status ? { status: input.status } : {}),
@@ -244,16 +277,18 @@ export async function listSignalContainers(input: ListSignalContainersInput): Pr
   if (!Array.isArray(tasks)) {
     throw new ValidationError('Product tasks response must contain a tasks array');
   }
-  return tasks.map((task, index) => parseSignalContainer(task, `tasks[${index}]`));
+  // The transport returns a bare array, so every task carries the response's
+  // request id (ETH-10) to keep "which request produced this row" answerable.
+  return tasks.map((task, index) => attachResponseRequestId(parseSignalContainer(task, `tasks[${index}]`), requestId));
 }
 
 export async function getSignalContainer(input: GetSignalContainerInput): Promise<ProductSignalContainer> {
   if (input.walletAddress) {
     normalizeAddress(input.walletAddress, 'walletAddress');
   }
-  const body = await requestProductApiJson(input, 'GET', `/product/tasks/${encodeURIComponent(requiredText(input.taskId, 'taskId'))}`);
+  const { body, requestId } = await requestProductApiJson(input, 'GET', `/product/tasks/${encodeURIComponent(requiredText(input.taskId, 'taskId'))}`);
   const record = requireRecord(body, 'Product task response');
-  return parseSignalContainer(record.task, 'task');
+  return attachResponseRequestId(parseSignalContainer(record.task, 'task'), requestId);
 }
 
 export async function hashContainerEvidence(input: HashContainerEvidenceInput): Promise<EvidenceHashResult> {
@@ -262,7 +297,7 @@ export async function hashContainerEvidence(input: HashContainerEvidenceInput): 
 
 export async function prepareSignalContainer(input: PrepareSignalContainerInput): Promise<PreparedSignalContainer> {
   const walletAddress = normalizeAddress(input.walletAddress, 'walletAddress');
-  const body = await requestProductApiJson(
+  const { body, requestId } = await requestProductApiJson(
     input,
     'POST',
     `/product/tasks/${encodeURIComponent(requiredText(input.taskId, 'taskId'))}/prepare-submit`,
@@ -272,7 +307,7 @@ export async function prepareSignalContainer(input: PrepareSignalContainerInput)
       intent: normalizeIntent(input.intent),
     },
   );
-  return parsePreparedSignalContainer(body, 'prepared submission');
+  return attachResponseRequestId(parsePreparedSignalContainer(body, 'prepared submission'), requestId);
 }
 
 export async function signPreparedSignalContainer(
@@ -315,7 +350,7 @@ export async function submitPreparedSignalContainer(
 ): Promise<SubmittedSignalContainer> {
   const signature = normalizeSignature(input.signature);
   const walletAddress = normalizeAddress(input.walletAddress, 'walletAddress');
-  const body = await requestProductApiJson(
+  const { body, requestId } = await requestProductApiJson(
     input,
     'POST',
     `/product/tasks/${encodeURIComponent(requiredText(input.taskId, 'taskId'))}/submit`,
@@ -325,18 +360,18 @@ export async function submitPreparedSignalContainer(
       walletAddress,
     },
   );
-  return parseSubmittedSignalContainer(body, 'submission');
+  return attachResponseRequestId(parseSubmittedSignalContainer(body, 'submission'), requestId);
 }
 
 export async function getSignalContainerProof(
   input: GetSignalContainerProofInput,
 ): Promise<SubmittedSignalContainer> {
-  const body = await requestProductApiJson(
+  const { body, requestId } = await requestProductApiJson(
     input,
     'GET',
     `/product/submissions/${encodeURIComponent(requiredText(input.submissionId, 'submissionId'))}`,
   );
-  return parseSubmittedSignalContainer(body, 'submission');
+  return attachResponseRequestId(parseSubmittedSignalContainer(body, 'submission'), requestId);
 }
 
 export function summarizeSignalContainer(task: ProductSignalContainer | Record<string, unknown>): ProductTaskSummary {
@@ -645,13 +680,22 @@ function requireExactKeys(
   }
 }
 
+/**
+ * Internal transport result: the parsed JSON body plus the server's request id
+ * (ETH-10) read from the response headers when present.
+ */
+interface ProductApiJsonResult {
+  readonly body: unknown;
+  readonly requestId?: string | undefined;
+}
+
 async function requestProductApiJson(
   input: ProductApiClientOptions,
   method: 'GET' | 'POST',
   path: string,
   body?: Record<string, unknown>,
   query?: Readonly<Record<string, string | undefined>>,
-): Promise<unknown> {
+): Promise<ProductApiJsonResult> {
   const fetchFn = resolveProductApiFetch(input.fetch);
   const url = productApiUrl(input.chainServicesUrl, path, query);
   const headers: Record<string, string> = {
@@ -674,7 +718,10 @@ async function requestProductApiJson(
   if (!response.ok) {
     throw productApiErrorFromResponse(response, payload);
   }
-  return payload;
+  return {
+    body: payload,
+    requestId: productApiResponseRequestId(response),
+  };
 }
 
 export function resolveProductApiFetch(fetchFn?: ProductApiFetch): ProductApiFetch {
@@ -734,7 +781,59 @@ function productApiErrorFromResponse(response: ProductApiFetchResponse, payload:
   const message = typeof record.message === 'string' && record.message.trim().length > 0
     ? record.message
     : `Product API request failed with HTTP ${response.status}`;
-  return new ProductApiError(response.status, code, message, record.details);
+  // ETH-10: the x-request-id response header is authoritative; the id the
+  // server embeds in error bodies is the fallback when headers are unavailable.
+  const requestId = productApiResponseRequestId(response)
+    ?? (typeof record.requestId === 'string' && record.requestId.trim().length > 0 ? record.requestId.trim() : undefined);
+  return new ProductApiError(response.status, code, message, record.details, requestId);
+}
+
+/**
+ * ETH-10: read the server's request id from the response headers. Supports both
+ * fetch-like header objects (`headers.get(name)`, as returned by real fetch
+ * implementations) and plain records with any key casing.
+ */
+export function productApiResponseRequestId(response: ProductApiFetchResponse): string | undefined {
+  return readResponseHeader(response, PRODUCT_API_REQUEST_ID_HEADER)
+    ?? readResponseHeader(response, PRODUCT_API_REQUEST_ID_HEADER_FALLBACK);
+}
+
+function readResponseHeader(response: ProductApiFetchResponse, name: string): string | undefined {
+  const headers = response.headers;
+  if (!headers) {
+    return undefined;
+  }
+  const get = (headers as { get?: unknown }).get;
+  if (typeof get === 'function') {
+    const value = (get as (headerName: string) => string | null | undefined).call(headers, name);
+    const text = typeof value === 'string' ? value.trim() : undefined;
+    return text ? text : undefined;
+  }
+  if (typeof headers !== 'object') {
+    return undefined;
+  }
+  for (const [key, value] of Object.entries(headers as Readonly<Record<string, string | readonly string[] | undefined>>)) {
+    if (key.toLowerCase() !== name) {
+      continue;
+    }
+    const raw = Array.isArray(value) ? value[0] : value;
+    const text = typeof raw === 'string' ? raw.trim() : undefined;
+    if (text) {
+      return text;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * ETH-10: attach the response's request id to a parsed result object without
+ * disturbing shapes when the header was absent (backward compatible).
+ */
+function attachResponseRequestId<T extends Record<string, unknown>>(value: T, requestId: string | undefined): T {
+  if (requestId === undefined) {
+    return value;
+  }
+  return { ...value, requestId };
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {

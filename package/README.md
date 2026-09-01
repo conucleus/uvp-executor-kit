@@ -148,6 +148,10 @@ the explicit `--private-key-env` name and verifies the prepared
 For authenticated Product APIs, pass `--auth-token-env <ENV_NAME>`; the CLI reads
 the bearer token only from that named env var and normal output reports only
 redacted auth status where applicable.
+Every task, prepare, submit, and proof result (and every `ProductApiError`)
+carries the server's `x-request-id` response header as `requestId` when present,
+so executor-side calls, errors, and logs can be correlated end to end with
+chain-services request logs.
 Funding and guarantee placeholder tasks use the same commands; the task summary
 keeps capability-plugin metadata, required inputs, settlement placeholder copy, proof
 rows, and funding impact language without treating UVP as a custodian,
