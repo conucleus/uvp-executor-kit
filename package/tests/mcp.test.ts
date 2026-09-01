@@ -184,6 +184,7 @@ function submittedSubmission(): Record<string, unknown> {
 }
 
 function preparedSubmission(options: { readonly taskId?: string; readonly submitter?: Address } = {}): PreparedSignalContainer {
+  const planId = bytes32('06');
   const orderId = bytes32('01');
   const sourceId = bytes32('02');
   const signalId = bytes32('03');
@@ -227,6 +228,7 @@ function preparedSubmission(options: { readonly taskId?: string; readonly submit
     typedData: buildProductSubmitTypedData({
       chainId: 31337,
       verifyingContract,
+      planId,
       orderId,
       sourceId,
       signalId,

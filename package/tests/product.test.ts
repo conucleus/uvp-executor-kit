@@ -526,26 +526,26 @@ describe('frozen typed-data validation', () => {
     (extraField.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[]) =
       [...extraField.typedData.types.UVPStateMachineSignal, { name: 'payloadRef', type: 'string' }];
     expect(() => parsePreparedSignalContainer(extraField))
-      .toThrow('typedData.types.UVPStateMachineSignal must contain exactly 7 fields for UVPStateMachineSignal, got 8');
+      .toThrow('typedData.types.UVPStateMachineSignal must contain exactly 8 fields for UVPStateMachineSignal, got 9');
 
     const missingField = base();
     (missingField.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[]) =
       missingField.typedData.types.UVPStateMachineSignal.filter((field) => field.name !== 'submitter');
     expect(() => parsePreparedSignalContainer(missingField))
-      .toThrow('must contain exactly 7 fields');
+      .toThrow('must contain exactly 8 fields');
 
     const renamedField = base();
     (renamedField.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[])[0] = { name: 'orderHash', type: 'bytes32' };
     expect(() => parsePreparedSignalContainer(renamedField))
-      .toThrow('typedData.types.UVPStateMachineSignal[0] must be { name: orderId, type: bytes32 } but got { name: orderHash, type: bytes32 }');
+      .toThrow('typedData.types.UVPStateMachineSignal[0] must be { name: planId, type: bytes32 } but got { name: orderHash, type: bytes32 }');
 
     const typeDrift = base();
-    (typeDrift.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[])[5] = { name: 'submitter', type: 'bytes32' };
+    (typeDrift.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[])[6] = { name: 'submitter', type: 'bytes32' };
     expect(() => parsePreparedSignalContainer(typeDrift))
-      .toThrow('typedData.types.UVPStateMachineSignal[5] must be { name: submitter, type: address } but got { name: submitter, type: bytes32 }');
+      .toThrow('typedData.types.UVPStateMachineSignal[6] must be { name: submitter, type: address } but got { name: submitter, type: bytes32 }');
 
     const extraFieldKey = base();
-    (extraFieldKey.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[])[0] = { name: 'orderId', type: 'bytes32', indexed: false };
+    (extraFieldKey.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[])[0] = { name: 'planId', type: 'bytes32', indexed: false };
     expect(() => parsePreparedSignalContainer(extraFieldKey))
       .toThrow('typedData.types.UVPStateMachineSignal[0] has unexpected field indexed');
 
@@ -558,6 +558,31 @@ describe('frozen typed-data validation', () => {
     delete (missingMessageField.typedData.message as Record<string, unknown>).payloadHash;
     expect(() => parsePreparedSignalContainer(missingMessageField))
       .toThrow('typedData.message is missing field payloadHash');
+  });
+
+  it('rejects a prepared submission whose signature message is missing or zeroing the plan id', () => {
+    // Audit #10: the signature commits to (planId, orderId). A prepared
+    // submission without the plan field, or with the builder's zero placeholder,
+    // could only produce a signature the chain rejects — fail at parse/sign time.
+    const base = () => structuredClone(preparedSubmission()) as PreparedSignalContainer;
+
+    const missingPlanId = base();
+    delete (missingPlanId.typedData.message as Record<string, unknown>).planId;
+    expect(() => parsePreparedSignalContainer(missingPlanId))
+      .toThrow('typedData.message is missing field planId');
+
+    const zeroPlanId = base();
+    (zeroPlanId.typedData.message as Record<string, unknown>).planId = `0x${'0'.repeat(64)}`;
+    expect(() => parsePreparedSignalContainer(zeroPlanId))
+      .toThrow('typedData.message.planId must be a non-zero bytes32 plan id');
+  });
+
+  it('keeps the parsed plan id in the signature message instead of dropping it', () => {
+    // Regression guard: a parser that validates the frozen table but rebuilds
+    // the message without planId would silently strip the plan binding between
+    // parse and sign, changing what the wallet signs.
+    const parsed = parsePreparedSignalContainer(preparedSubmission());
+    expect(parsed.typedData.message.planId).toBe(bytes32('06'));
   });
 
   it('rejects malformed or expired deadlines in the signature message', () => {
@@ -579,6 +604,7 @@ describe('frozen typed-data validation', () => {
 
 function preparedSubmission(options: { readonly submitter?: Address } = {}): PreparedSignalContainer {
   const preparedSubmitter = options.submitter ?? submitter;
+  const planId = bytes32('06');
   const orderId = bytes32('01');
   const sourceId = bytes32('02');
   const signalId = bytes32('03');
@@ -621,6 +647,7 @@ function preparedSubmission(options: { readonly submitter?: Address } = {}): Pre
     typedData: buildProductSubmitTypedData({
       chainId: 31337,
       verifyingContract,
+      planId,
       orderId,
       sourceId,
       signalId,

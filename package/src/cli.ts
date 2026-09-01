@@ -77,6 +77,7 @@ interface ChainSignalOptions {
   privateKeyEnv: string;
   walletAddress?: string;
   orderId: string;
+  planId: string;
   source: string;
   stage: string;
   signalName: string;
@@ -590,6 +591,7 @@ export function buildProgram(): Command {
     .requiredOption('--chain-id <id>', 'expected chain id')
     .option('--wallet-address <address>', 'executor wallet address shown as submitSignal sender in dry-run')
     .requiredOption('--order-id <bytes32>', 'order id')
+    .requiredOption('--plan-id <bytes32>', 'plan id the order belongs to (plan-scoped submitSignal ABI; zero placeholder is rejected)')
     .requiredOption('--source <source>', 'signal source')
     .requiredOption('--stage <stageIdentifier>', 'stage identifier')
     .requiredOption('--signal-name <signalName>', 'signal name')
@@ -607,7 +609,7 @@ export function buildProgram(): Command {
         // a "submitted" success that never carried the reference. Fail loudly;
         // only the 32-byte payloadHash goes on chain.
         throw new ValidationError(
-          '--payload-ref is not supported by chain-signal: submitSignal(orderId, sourceId, signalId, payloadHash, idempotencyKey) has no reference field, so the flag would be silently dropped. Keep only the 32-byte --payload-hash on chain and record the off-chain payload reference in your own job/evidence store next to it.',
+          '--payload-ref is not supported by chain-signal: submitSignal(planId, orderId, sourceId, signalId, payloadHash, idempotencyKey) has no reference field, so the flag would be silently dropped. Keep only the 32-byte --payload-hash on chain and record the off-chain payload reference in your own job/evidence store next to it.',
         );
       }
       const result = await submitStateMachineSignal({
@@ -619,6 +621,7 @@ export function buildProgram(): Command {
         dryRun: options.dryRun ?? false,
         ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
       }, {
+        planId: options.planId,
         orderId: options.orderId,
         source: options.source,
         stageIdentifier: options.stage,

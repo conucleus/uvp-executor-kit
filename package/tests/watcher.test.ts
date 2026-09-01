@@ -7,6 +7,7 @@ import { encodeAbiParameters, keccak256, stringToBytes, stringToHex, type Hex } 
 import { describe, expect, it } from 'vitest';
 import { classifyExecutorKitError, CodedExecutorKitError } from '../src/errors.js';
 import {
+  buildSubmitStateMachineSignalCall,
   createStateMachineWatcher,
   deadLetterStateMachineJob,
   decodeHookReadyLog,
@@ -28,6 +29,7 @@ const STATE_MACHINE = '0x0000000000000000000000000000000000000001';
 const STATE_MACHINE_V2 = '0x0000000000000000000000000000000000000009';
 const WALLET_ADDRESS = '0x0000000000000000000000000000000000000002';
 const ORDER_ID = `0x${'11'.repeat(32)}` as Hex;
+const PLAN_ID = `0x${'77'.repeat(32)}` as Hex;
 const HOOK_ID = `0x${'22'.repeat(32)}` as Hex;
 const STAGE_ID = `0x${'55'.repeat(32)}` as Hex;
 const HOOK_NAME_ID = `0x${'66'.repeat(32)}` as Hex;
@@ -110,6 +112,7 @@ describe('state machine chain watcher', () => {
         'exec.main#START': (event, context) => {
           matchedKeys.push(context.matchedKey);
           return {
+            planId: PLAN_ID,
             orderId: event.orderId,
             source: 'buyer',
             signalName: 'exec.main.cmp',
@@ -134,11 +137,14 @@ describe('state machine chain watcher', () => {
     expect(result.job?.matchedKey).toBe('exec.main#START');
     expect(matchedKeys).toEqual(['exec.main#START']);
     expect(submission.request.functionName).toBe('submitSignal');
-    expect(submission.request.args.slice(0, 4)).toEqual([
+    // Audit #10: planId is the first submitSignal argument.
+    expect(submission.request.args).toEqual([
+      PLAN_ID,
       ORDER_ID,
       BUYER_SOURCE_ID,
       EXEC_MAIN_CMP_ID,
       PAYLOAD_HASH,
+      expect.any(String),
     ]);
   });
 
@@ -154,6 +160,7 @@ describe('state machine chain watcher', () => {
       artifact: artifactIndex(),
       handlers: {
         '*': (event) => ({
+          planId: PLAN_ID,
           orderId: event.orderId,
           source: 'buyer',
           signalName: 'exec.main.cmp',
@@ -206,6 +213,7 @@ describe('state machine chain watcher', () => {
       artifact: artifactIndex(),
       handlers: {
         '*': (event) => ({
+          planId: PLAN_ID,
           orderId: event.orderId,
           source: 'buyer',
           signalName: 'exec.main.cmp',
@@ -251,6 +259,7 @@ describe('state machine chain watcher', () => {
       artifact: artifactIndex(),
       handlers: {
         '*': (event) => ({
+          planId: PLAN_ID,
           orderId: event.orderId,
           source: 'buyer',
           signalName: 'exec.main.cmp',
@@ -685,6 +694,7 @@ describe('state machine chain watcher', () => {
       artifact: artifactIndex(),
       handlers: {
         '*': (event) => ({
+          planId: PLAN_ID,
           orderId: event.orderId,
           source: 'buyer',
           signalName: 'exec.main.cmp',
@@ -804,6 +814,7 @@ describe('state machine chain watcher', () => {
       artifact: artifactIndex(),
       handlers: {
         '*': (event) => ({
+          planId: PLAN_ID,
           orderId: event.orderId,
           source: 'buyer',
           signalName: 'exec.main.cmp',
@@ -839,6 +850,7 @@ describe('state machine chain watcher', () => {
       retry: { maxAttempts: 12 },
       handlers: {
         '*': (event) => ({
+          planId: PLAN_ID,
           orderId: event.orderId,
           source: 'buyer',
           signalName: 'exec.main.cmp',
@@ -882,6 +894,7 @@ describe('state machine callback tx helper', () => {
       privateKeyEnv: 'UVP_TEST_PRIVATE_KEY',
       dryRun: true,
     }, {
+      planId: PLAN_ID,
       orderId: ORDER_ID,
       source: 'seller',
       signalName: 'ship.pickup.done',
@@ -899,7 +912,9 @@ describe('state machine callback tx helper', () => {
     expect(result.request.chainId).toBe(31_337);
     expect(result.request.functionName).toBe('submitSignal');
     expect(result.request.data.slice(0, 10)).toBe(STATE_MACHINE_FIXTURE.functions.submitSignal.selector);
-    expect(result.request.args.slice(0, 4)).toEqual([
+    // Audit #10: planId leads the ABI arguments.
+    expect(result.request.args.slice(0, 5)).toEqual([
+      PLAN_ID,
       ORDER_ID,
       keccak256(stringToBytes('seller')),
       keccak256(stringToBytes('ship.pickup.done')),
@@ -928,6 +943,7 @@ describe('state machine callback tx helper', () => {
         },
       },
     }, {
+      planId: PLAN_ID,
       orderId: ORDER_ID,
       source: 'seller',
       signalName: 'ship.pickup.done',
@@ -935,6 +951,68 @@ describe('state machine callback tx helper', () => {
     });
 
     expect(result.dryRun).toBe(true);
+  });
+
+  it('refuses to build a submitSignal tx when the signal has no plan id', async () => {
+    // Audit #10 negative: submitSignal(planId, ...) is plan-scoped. A missing
+    // planId (or the builder's zero placeholder) must fail loudly instead of
+    // producing a tx that can only revert on the on-chain (planId, orderId)
+    // existence check.
+    for (const broken of [
+      {},
+      { planId: `0x${'00'.repeat(32)}` as Hex },
+    ]) {
+      await expect(submitStateMachineSignal({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE,
+        chainId: '31337',
+        walletAddress: WALLET_ADDRESS,
+        privateKeyEnv: 'UVP_TEST_PRIVATE_KEY',
+        dryRun: true,
+      }, {
+        orderId: ORDER_ID,
+        source: 'seller',
+        signalName: 'ship.pickup.done',
+        payloadHash: PAYLOAD_HASH,
+        ...broken,
+      })).rejects.toThrow(/planId/);
+    }
+    expect(() => buildSubmitStateMachineSignalCall({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+    }, {
+      orderId: ORDER_ID,
+      source: 'seller',
+      signalName: 'ship.pickup.done',
+    })).toThrow(/planId is required/);
+  });
+
+  it('fails the job instead of submitting when neither handler nor job carries a plan id', async () => {
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      dryRun: true,
+      artifact: artifactIndex(),
+      handlers: {
+        '*': (event) => ({
+          orderId: event.orderId,
+          source: 'buyer',
+          signalName: 'exec.main.cmp',
+          payloadHash: PAYLOAD_HASH,
+        }),
+      },
+    });
+
+    const result = await watcher.handleLog(hookReadyLog());
+
+    // No planId anywhere: nothing may be broadcast, and the job records the
+    // structural reason so the operator can fix the handler config.
+    expect(result.submissions).toHaveLength(0);
+    expect(result.job?.status).toBe('dead_letter');
+    expect(result.error?.message).toContain('planId is required');
   });
 });
 
@@ -1115,6 +1193,7 @@ describe('submitSignal receipt visibility', () => {
   const KEY_ENV = 'UVP_RECEIPT_TEST_PRIVATE_KEY';
   const TEST_PRIVATE_KEY = `0x${'ab'.repeat(32)}`;
   const SIGNAL = {
+    planId: PLAN_ID,
     orderId: ORDER_ID,
     source: 'buyer',
     signalName: 'exec.main.cmp',
@@ -1168,6 +1247,7 @@ describe('submitSignal receipt visibility', () => {
         retry: { maxAttempts: 3 },
         handlers: {
           '*': (event) => ({
+            planId: PLAN_ID,
             orderId: event.orderId,
             source: 'buyer',
             signalName: 'exec.main.cmp',

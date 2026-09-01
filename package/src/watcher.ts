@@ -66,6 +66,13 @@ export interface StateMachineHookReady {
 
 export interface StateMachineSignal {
   readonly orderId: Hex | string;
+  /**
+   * Audit #10: the state machine ABI is plan-scoped, so every signal carries the
+   * owning order's planId as the first submitSignal argument. The zero
+   * placeholder is rejected before signing/broadcasting: it can never pass the
+   * on-chain (planId, orderId) existence check.
+   */
+  readonly planId?: Hex | string;
   readonly source?: string;
   readonly stageIdentifier?: string;
   readonly signalName?: string;
@@ -79,6 +86,7 @@ export interface StateMachineSignal {
 }
 
 export interface StateMachineSignalCallArgs {
+  readonly planId: Hex;
   readonly orderId: Hex;
   readonly sourceId: Hex;
   readonly signalId: Hex;
@@ -90,7 +98,7 @@ export interface SubmitStateMachineSignalCall {
   readonly address: Address;
   readonly abi: typeof STATE_MACHINE_ABI;
   readonly functionName: 'submitSignal';
-  readonly args: readonly [Hex, Hex, Hex, Hex, Hex];
+  readonly args: readonly [Hex, Hex, Hex, Hex, Hex, Hex];
   readonly data: Hex;
   readonly chainId: number;
   readonly from?: Address;
@@ -371,6 +379,8 @@ export interface StateMachineJobPatch {
   readonly updatedAt: string;
   readonly attempts?: number;
   readonly matchedKey?: string;
+  /** Audit #10: records the order planId once it is known so retries can resubmit. */
+  readonly planId?: Hex;
   readonly submissions?: readonly StateMachineJobSubmission[];
   readonly lastError?: ClassifiedExecutorKitError;
   readonly clearLastError?: boolean;
@@ -425,6 +435,7 @@ export class InMemoryStateMachineJobStore implements StateMachineJobStore {
       updatedAt: patch.updatedAt,
       ...(patch.attempts !== undefined ? { attempts: patch.attempts } : {}),
       ...(patch.matchedKey !== undefined ? { matchedKey: patch.matchedKey } : {}),
+      ...(patch.planId !== undefined ? { planId: patch.planId } : {}),
       ...(patch.submissions ? { submissions: patch.submissions } : {}),
       ...(patch.clearLastError ? {} : currentLastError ? { lastError: currentLastError } : {}),
       ...(patch.lastError ? { lastError: patch.lastError } : {}),
@@ -505,6 +516,7 @@ export class FileStateMachineJobStore implements StateMachineJobStore {
       updatedAt: patch.updatedAt,
       ...(patch.attempts !== undefined ? { attempts: patch.attempts } : {}),
       ...(patch.matchedKey !== undefined ? { matchedKey: patch.matchedKey } : {}),
+      ...(patch.planId !== undefined ? { planId: patch.planId } : {}),
       ...(patch.submissions ? { submissions: patch.submissions } : {}),
       ...(patch.clearLastError ? {} : currentLastError ? { lastError: currentLastError } : {}),
       ...(patch.lastError ? { lastError: patch.lastError } : {}),
@@ -631,7 +643,7 @@ export class StateMachineWatcher {
     }
 
     const detectedAt = this.config.now();
-    const job = await this.config.jobStore.upsertDetected(event, {
+    let job = await this.config.jobStore.upsertDetected(event, {
       now: detectedAt,
       maxAttempts: this.config.retry.maxAttempts,
       ...(this.config.supplierId ? { supplierId: this.config.supplierId } : {}),
@@ -766,10 +778,25 @@ export class StateMachineWatcher {
 
     const submissions = [];
     const signals = normalizeHandlerResult(handlerResult);
+    // Audit #10: the plan-scoped submitSignal ABI requires the order planId.
+    // Handlers that know it may set it per signal; otherwise fall back to the
+    // planId recorded on the job (from a previous run or a chain-services sync)
+    // and persist a handler-derived planId so manual retries can resubmit.
+    const jobPlanId = signals.map((signal) => signal.planId).find((value) => value !== undefined) ?? job.planId;
+    if (jobPlanId !== undefined && job.planId === undefined) {
+      const withPlanId = await this.updateJob(job.id, {
+        updatedAt: this.config.now(),
+        planId: normalizeBytes32(jobPlanId, 'job.planId'),
+      });
+      if (withPlanId) {
+        job = withPlanId;
+      }
+    }
     for (const [index, signal] of signals.entries()) {
       try {
         submissions.push(await submitSignalWithJobRetry({
           ...signal,
+          ...(signal.planId === undefined && job.planId !== undefined ? { planId: job.planId } : {}),
           readyEventId: signal.readyEventId ?? event.eventId,
         }, index));
       } catch (error) {
@@ -1229,11 +1256,11 @@ export function buildSubmitStateMachineSignalCall(
     address: normalizedConfig.stateMachineAddress,
     abi: STATE_MACHINE_ABI,
     functionName: 'submitSignal',
-    args: [args.orderId, args.sourceId, args.signalId, args.payloadHash, args.idempotencyKey],
+    args: [args.planId, args.orderId, args.sourceId, args.signalId, args.payloadHash, args.idempotencyKey],
     data: encodeFunctionData({
       abi: STATE_MACHINE_ABI,
       functionName: 'submitSignal',
-      args: [args.orderId, args.sourceId, args.signalId, args.payloadHash, args.idempotencyKey],
+      args: [args.planId, args.orderId, args.sourceId, args.signalId, args.payloadHash, args.idempotencyKey],
     }),
     chainId: normalizedConfig.chainId,
     ...(from ? { from } : {}),
@@ -1473,6 +1500,21 @@ function normalizeRetryConfig(config: StateMachineRetryConfig | Record<string, u
 }
 
 function normalizeStateMachineSignal(signal: StateMachineSignal): StateMachineSignalCallArgs {
+  // Audit #10: submitSignal is plan-scoped. Unlike the payloadHash zero
+  // sentinel below, a zero planId is NOT a legitimate encoding: the contract
+  // verifies that (planId, orderId) exists, so the zero placeholder can only
+  // produce a transaction that reverts. Refuse to build it instead of letting
+  // the executor broadcast a doomed tx.
+  const rawPlanId = signal.planId ?? undefined;
+  if (rawPlanId === undefined || (typeof rawPlanId === 'string' && rawPlanId.trim().length === 0)) {
+    throw new ValidationError(
+      'planId is required to submit a state machine signal: the plan-scoped submitSignal(orderId, ...) ABI now takes the order planId as its first argument and rejects the zero placeholder on chain',
+    );
+  }
+  const planId = normalizeBytes32(rawPlanId, 'planId');
+  if (planId === ZERO_BYTES32) {
+    throw new ValidationError('planId must be a non-zero bytes32: the zero placeholder cannot satisfy the on-chain (planId, orderId) existence check');
+  }
   const orderId = normalizeBytes32(signal.orderId, 'orderId');
   // Protocol-defined sentinel, not a fallback: per the UVPStateMachine submitSignal
   // ABI, bytes32(0) is the legitimate encoding of "no payload" (see EXEC-3 ruling).
@@ -1489,6 +1531,7 @@ function normalizeStateMachineSignal(signal: StateMachineSignal): StateMachineSi
     : hashText(asNonEmptyString(signalName, 'signalName'), 'signalName');
 
   return {
+    planId,
     orderId,
     sourceId,
     signalId,

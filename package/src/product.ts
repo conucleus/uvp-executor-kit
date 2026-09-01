@@ -18,6 +18,8 @@ import {
 
 export type ProductSubmitIntent = 'confirm_stage' | 'reject_stage' | 'raise_dispute' | 'resolve_dispute';
 
+const ZERO_BYTES32 = `0x${'0'.repeat(64)}` as const;
+
 export interface ProductApiFetchInit {
   readonly method?: string;
   readonly headers?: Readonly<Record<string, string>>;
@@ -535,6 +537,15 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
   }
   const fields = parseTypedDataFields(types.UVPStateMachineSignal, `${label}.types.UVPStateMachineSignal`);
   requireExactKeys(message, PRODUCT_SUBMIT_TYPED_DATA_FIELDS.map((field) => field.name), `${label}.message`);
+  const planId = normalizeBytes32(requiredString(message, 'planId', `${label}.message`), `${label}.message.planId`);
+  if (planId === ZERO_BYTES32) {
+    // Audit #10: the signature commits to (planId, orderId) and the contract
+    // verifies plan existence, so a zero-planId prepared submission could only
+    // produce a signature that can never land. The protocol-bindings builder's
+    // optional-planId zero default exists solely for shape-checking gates; a
+    // signer must never accept it.
+    throw new ValidationError(`${label}.message.planId must be a non-zero bytes32 plan id: the zero placeholder cannot satisfy the on-chain (planId, orderId) existence check`);
+  }
   return {
     domain: {
       name: domainName,
@@ -550,6 +561,7 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
     },
     primaryType,
     message: {
+      planId,
       orderId: normalizeBytes32(requiredString(message, 'orderId', `${label}.message`), `${label}.message.orderId`),
       sourceId: normalizeBytes32(requiredString(message, 'sourceId', `${label}.message`), `${label}.message.sourceId`),
       signalId: normalizeBytes32(requiredString(message, 'signalId', `${label}.message`), `${label}.message.signalId`),

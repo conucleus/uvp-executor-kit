@@ -8,6 +8,7 @@ import { chainPollExecutionFailed, executionOutcomeFailed, main } from '../src/c
 const RETRY_STATE_MACHINE = '0x0000000000000000000000000000000000000001';
 const RETRY_WALLET = '0x0000000000000000000000000000000000000002';
 const RETRY_ORDER_ID = `0x${'11'.repeat(32)}` as Hex;
+const RETRY_PLAN_ID = `0x${'77'.repeat(32)}` as Hex;
 const RETRY_HOOK_ID = `0x${'22'.repeat(32)}` as Hex;
 const RETRY_STAGE_ID = `0x${'55'.repeat(32)}` as Hex;
 const RETRY_HOOK_NAME_ID = `0x${'66'.repeat(32)}` as Hex;
@@ -229,6 +230,8 @@ describe('executor CLI', () => {
       '31337',
       '--order-id',
       RETRY_ORDER_ID,
+      '--plan-id',
+      RETRY_PLAN_ID,
       '--source',
       'buyer',
       '--stage',
@@ -280,6 +283,7 @@ describe('honest execution exit codes', () => {
           id: RETRY_JOB_ID,
           eventId: RETRY_EVENT_ID,
           orderId: RETRY_ORDER_ID,
+          planId: RETRY_PLAN_ID,
           hookId: RETRY_HOOK_ID,
           stageId: RETRY_STAGE_ID,
           stageIdentifier: 'exec.main',
@@ -351,6 +355,7 @@ describe('honest execution exit codes', () => {
           id: RETRY_JOB_ID,
           eventId: RETRY_EVENT_ID,
           orderId: RETRY_ORDER_ID,
+          planId: RETRY_PLAN_ID,
           hookId: RETRY_HOOK_ID,
           stageId: RETRY_STAGE_ID,
           stageIdentifier: 'exec.main',
