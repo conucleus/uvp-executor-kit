@@ -72,6 +72,7 @@ export interface StateMachineSignal {
   readonly sourceId?: Hex | string;
   readonly signalId?: Hex | string;
   readonly payloadHash?: Hex | string;
+  /** Off-chain metadata only: the frozen submitSignal ABI cannot carry it on chain. */
   readonly payloadRef?: string;
   readonly readyEventId?: Hex | string;
   readonly idempotencyKey?: string;
@@ -186,6 +187,12 @@ export interface StateMachineLogProcessResult {
   readonly submissions: readonly SubmitStateMachineSignalResult[];
   readonly job?: StateMachineWatcherJob;
   readonly error?: ClassifiedExecutorKitError;
+  /**
+   * True when the log matched the HookReady topic but could not be decoded
+   * (e.g. a mixed-ABI deployment). Such logs are skipped and recorded, never
+   * fatal: the scan advances past them instead of rescanning them forever.
+   */
+  readonly decodeFailure?: boolean;
 }
 
 export interface StateMachinePollResult {
@@ -193,6 +200,8 @@ export interface StateMachinePollResult {
   readonly toBlock: bigint;
   readonly scannedLogs: number;
   readonly results: readonly StateMachineLogProcessResult[];
+  /** How many scanned logs in this round were skipped as decode failures. */
+  readonly decodeFailures: number;
 }
 
 export interface StateMachineStaticHandlerDefinition {
@@ -523,6 +532,7 @@ export class FileStateMachineJobStore implements StateMachineJobStore {
 export class StateMachineWatcher {
   readonly config: NormalizedStateMachineWatcherConfig;
   private nextBlock: bigint | undefined;
+  private decodeFailuresTotal = 0;
 
   constructor(config: StateMachineWatcherConfig) {
     this.config = normalizeStateMachineWatcherConfig(config);
@@ -544,6 +554,7 @@ export class StateMachineWatcher {
       handlerKeys: Object.keys(this.config.handlers),
       dryRun: this.config.dryRun,
       retry: this.config.retry,
+      decodeFailures: this.decodeFailuresTotal,
     };
   }
 
@@ -559,6 +570,7 @@ export class StateMachineWatcher {
         toBlock,
         scannedLogs: 0,
         results: [],
+        decodeFailures: 0,
       };
     }
 
@@ -574,18 +586,22 @@ export class StateMachineWatcher {
     );
     const logs = logBatches.flat().sort(compareRawLogs);
     const results: StateMachineLogProcessResult[] = [];
-    // Fail fast: a log-processing error aborts the round before the cursor advances,
-    // so the failing block range is rescanned on the next successful poll.
+    // Fail fast on unexpected log-processing errors: the round aborts before the
+    // cursor advances, so the failing block range is rescanned on the next
+    // successful poll. Decode failures are handled inside handleLog (skip and
+    // record) precisely so an undecodable log cannot trap the cursor here.
     for (const log of logs) {
       results.push(await this.handleLog(log));
     }
     this.nextBlock = toBlock + 1n;
 
+    const decodeFailures = results.filter((result) => result.decodeFailure).length;
     return {
       fromBlock,
       toBlock,
       scannedLogs: logs.length,
       results,
+      decodeFailures,
     };
   }
 
@@ -597,11 +613,21 @@ export class StateMachineWatcher {
       };
     }
 
-    const event = decodeHookReadyLog(log, this.config.artifact);
-    if (!event) {
-      // Unreachable: decodeHookReadyLog returns undefined only for logs without the
-      // HookReady topic and throws when a topic-matching log fails to decode.
-      throw new ValidationError('HookReady log matched the topic but did not decode into an event');
+    let event: StateMachineHookReady;
+    try {
+      const decoded = decodeHookReadyLog(log, this.config.artifact);
+      if (!decoded) {
+        // Unreachable: decodeHookReadyLog returns undefined only for logs without
+        // the HookReady topic and throws when a topic-matching log fails to decode.
+        throw new ValidationError('HookReady log matched the topic but did not decode into an event');
+      }
+      event = decoded;
+    } catch (error) {
+      // A topic-matching log that cannot be decoded (e.g. a mixed-ABI deployment
+      // or corrupted data) must never abort the scan: rescan would hit the same
+      // deterministic failure every round until the watch loop gave up. Skip it,
+      // record the decision, and let the cursor advance past it.
+      return this.isolateUndecodableLog(log, error);
     }
 
     const detectedAt = this.config.now();
@@ -842,6 +868,71 @@ export class StateMachineWatcher {
       throw new ValidationError(`job ${jobId} not found`);
     }
     return updated;
+  }
+
+  /**
+   * Record-and-skip path for HookReady-topic logs that fail to decode.
+   *
+   * The decision is persisted in the job store (as a terminal `ignored` job with
+   * sentinel ids and the raw log preserved for inspection) whenever the log has
+   * enough identity to derive an event id, reported through `onError`, and
+   * counted in poll results and `describe()`. It never throws: mixed-version
+   * deployments degrade to "these logs are skipped", not a crashed watcher.
+   */
+  private async isolateUndecodableLog(log: StateMachineRawLog, error: unknown): Promise<StateMachineLogProcessResult> {
+    const classified = classifyExecutorKitError(error, 'validation_failure');
+    this.decodeFailuresTotal += 1;
+    // onError is the kit's log/metric channel for degraded conditions; the CLI
+    // wires it to stderr so operators see every skipped log.
+    this.config.onError?.(error instanceof Error ? error : new Error(classified.message));
+
+    const eventId = tryHookReadyEventId(log);
+    if (!eventId) {
+      // The log cannot be identified (missing or invalid transactionHash/logIndex),
+      // so there is nothing to persist; skipping it still lets the round advance.
+      return {
+        status: 'ignored',
+        submissions: [],
+        error: classified,
+        decodeFailure: true,
+      };
+    }
+
+    const now = this.config.now();
+    const stateMachineAddress = tryNormalizeStateMachineAddress(log.address);
+    const event: StateMachineHookReady = {
+      type: 'HookReady',
+      eventId,
+      ...(stateMachineAddress ? { stateMachineAddress } : {}),
+      // Sentinel ids: the real ids are unrecoverable from the undecodable log.
+      // The event id (derived from transactionHash+logIndex) keeps job ids unique
+      // per log, so distinct undecodable logs never collapse into one job.
+      orderId: ZERO_BYTES32,
+      hookId: ZERO_BYTES32,
+      stageId: ZERO_BYTES32,
+      hookNameId: ZERO_BYTES32,
+      ...(log.blockNumber !== undefined && log.blockNumber !== null ? { blockNumber: BigInt(log.blockNumber) } : {}),
+      ...(log.transactionHash ? { transactionHash: log.transactionHash } : {}),
+      ...(log.logIndex !== undefined && log.logIndex !== null ? { logIndex: BigInt(log.logIndex) } : {}),
+      raw: log,
+    };
+    const job = await this.config.jobStore.upsertDetected(event, {
+      now,
+      maxAttempts: this.config.retry.maxAttempts,
+      ...(this.config.supplierId ? { supplierId: this.config.supplierId } : {}),
+    });
+    const isolated = await this.updateJob(job.id, {
+      status: 'ignored',
+      updatedAt: now,
+      lastError: classified,
+    });
+    return {
+      status: 'ignored',
+      submissions: [],
+      job: isolated,
+      error: classified,
+      decodeFailure: true,
+    };
   }
 }
 
@@ -1632,7 +1723,11 @@ function jobStatusForError(error: ClassifiedExecutorKitError): StateMachineJobSt
   if (error.kind === 'missing_handler' || error.kind === 'duplicate_signal') {
     return 'ignored';
   }
-  return error.retryable ? 'dead_letter' : 'failed';
+  // Transient failures keep the retry channel open: after the in-run retries are
+  // exhausted the job lands in `failed`, which `jobs retry` accepts. Deterministic
+  // non-retryable failures dead-letter for human triage instead of parking in the
+  // retryable lane where automatic or manual retries would pointlessly re-run them.
+  return error.retryable ? 'failed' : 'dead_letter';
 }
 
 function isTerminalJobStatus(status: StateMachineJobStatus): boolean {
@@ -1825,6 +1920,29 @@ function normalizeLogIndex(value: number | bigint | null | undefined): bigint | 
     throw new ValidationError('logIndex must be a non-negative safe integer');
   }
   return BigInt(value);
+}
+
+/**
+ * Best-effort event id for logs that failed to decode: returns undefined instead
+ * of throwing when the log lacks a usable (transactionHash, logIndex) identity.
+ */
+function tryHookReadyEventId(log: StateMachineRawLog): Hex | undefined {
+  try {
+    return hookReadyEventId(log);
+  } catch {
+    return undefined;
+  }
+}
+
+function tryNormalizeStateMachineAddress(address: Address | string | undefined): Address | undefined {
+  if (address === undefined) {
+    return undefined;
+  }
+  try {
+    return normalizeAddress(address, 'log.address');
+  } catch {
+    return undefined;
+  }
 }
 
 function parseNonNegativeSafeInteger(value: number | string, fieldName: string): number {

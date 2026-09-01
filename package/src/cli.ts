@@ -594,13 +594,22 @@ export function buildProgram(): Command {
     .requiredOption('--stage <stageIdentifier>', 'stage identifier')
     .requiredOption('--signal-name <signalName>', 'signal name')
     .option('--payload-hash <bytes32>', 'off-chain payload hash')
-    .option('--payload-ref <uri>', 'optional off-chain payload reference')
+    .option('--payload-ref <uri>', 'unsupported: rejected because submitSignal cannot carry an off-chain payload reference')
     .option('--ready-event-id <bytes32>', 'HookReady event id')
     .option('--idempotency-key <key>', 'idempotency key')
     .option('--private-key-env <name>', 'environment variable containing the callback tx private key', DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV)
     .option('--dry-run', 'build the submitSignal tx request without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainSignalOptions) => {
+      if (options.payloadRef) {
+        // The frozen UVPStateMachine v0.8 ABI has no payloadRef input, so this
+        // flag would be silently dropped and the operator would walk away with
+        // a "submitted" success that never carried the reference. Fail loudly;
+        // only the 32-byte payloadHash goes on chain.
+        throw new ValidationError(
+          '--payload-ref is not supported by chain-signal: submitSignal(orderId, sourceId, signalId, payloadHash, idempotencyKey) has no reference field, so the flag would be silently dropped. Keep only the 32-byte --payload-hash on chain and record the off-chain payload reference in your own job/evidence store next to it.',
+        );
+      }
       const result = await submitStateMachineSignal({
         rpcUrl: options.rpcUrl,
         stateMachineAddress: options.stateMachine,
@@ -615,7 +624,6 @@ export function buildProgram(): Command {
         stageIdentifier: options.stage,
         signalName: options.signalName,
         ...(options.payloadHash ? { payloadHash: options.payloadHash } : {}),
-        ...(options.payloadRef ? { payloadRef: options.payloadRef } : {}),
         ...(options.readyEventId ? { readyEventId: options.readyEventId } : {}),
         ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
       });

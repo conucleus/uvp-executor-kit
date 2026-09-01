@@ -2,13 +2,17 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { buildProductSubmitTypedData } from '@uvp-eth/protocol-bindings';
+import {
+  buildProductSubmitTypedData,
+  type ProductSubmitTypedDataField,
+} from '@uvp-eth/protocol-bindings';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { Address } from 'viem';
 import { main } from '../src/cli.js';
 import {
   getSignalContainerProof,
   listSignalContainers,
+  parsePreparedSignalContainer,
   prepareSignalContainer,
   productApiAuthHeadersFromEnv,
   signPreparedSignalContainer,
@@ -514,6 +518,65 @@ describe('Product API mode', () => {
   });
 });
 
+describe('frozen typed-data validation', () => {
+  it('rejects extra, missing, renamed, and type-drifted fields against the frozen field table', () => {
+    const base = () => structuredClone(preparedSubmission()) as PreparedSignalContainer;
+
+    const extraField = base();
+    (extraField.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[]) =
+      [...extraField.typedData.types.UVPStateMachineSignal, { name: 'payloadRef', type: 'string' }];
+    expect(() => parsePreparedSignalContainer(extraField))
+      .toThrow('typedData.types.UVPStateMachineSignal must contain exactly 7 fields for UVPStateMachineSignal, got 8');
+
+    const missingField = base();
+    (missingField.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[]) =
+      missingField.typedData.types.UVPStateMachineSignal.filter((field) => field.name !== 'submitter');
+    expect(() => parsePreparedSignalContainer(missingField))
+      .toThrow('must contain exactly 7 fields');
+
+    const renamedField = base();
+    (renamedField.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[])[0] = { name: 'orderHash', type: 'bytes32' };
+    expect(() => parsePreparedSignalContainer(renamedField))
+      .toThrow('typedData.types.UVPStateMachineSignal[0] must be { name: orderId, type: bytes32 } but got { name: orderHash, type: bytes32 }');
+
+    const typeDrift = base();
+    (typeDrift.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[])[5] = { name: 'submitter', type: 'bytes32' };
+    expect(() => parsePreparedSignalContainer(typeDrift))
+      .toThrow('typedData.types.UVPStateMachineSignal[5] must be { name: submitter, type: address } but got { name: submitter, type: bytes32 }');
+
+    const extraFieldKey = base();
+    (extraFieldKey.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[])[0] = { name: 'orderId', type: 'bytes32', indexed: false };
+    expect(() => parsePreparedSignalContainer(extraFieldKey))
+      .toThrow('typedData.types.UVPStateMachineSignal[0] has unexpected field indexed');
+
+    const extraMessageField = base();
+    (extraMessageField.typedData.message as Record<string, unknown>).payloadRef = 'ipfs://payload';
+    expect(() => parsePreparedSignalContainer(extraMessageField))
+      .toThrow('typedData.message has unexpected field payloadRef');
+
+    const missingMessageField = base();
+    delete (missingMessageField.typedData.message as Record<string, unknown>).payloadHash;
+    expect(() => parsePreparedSignalContainer(missingMessageField))
+      .toThrow('typedData.message is missing field payloadHash');
+  });
+
+  it('rejects malformed or expired deadlines in the signature message', () => {
+    const base = () => structuredClone(preparedSubmission()) as PreparedSignalContainer;
+
+    for (const bad of ['abc', '1.5', '12e9', '-5', '0x10']) {
+      const malformed = base();
+      (malformed.typedData.message as Record<string, unknown>).deadline = bad;
+      expect(() => parsePreparedSignalContainer(malformed))
+        .toThrow('typedData.message.deadline must be a base-10 unix-seconds uint string');
+    }
+
+    const expired = base();
+    (expired.typedData.message as Record<string, unknown>).deadline = '1000000000';
+    expect(() => parsePreparedSignalContainer(expired))
+      .toThrow('typedData.message.deadline must be a unix timestamp in the future');
+  });
+});
+
 function preparedSubmission(options: { readonly submitter?: Address } = {}): PreparedSignalContainer {
   const preparedSubmitter = options.submitter ?? submitter;
   const orderId = bytes32('01');
@@ -521,7 +584,9 @@ function preparedSubmission(options: { readonly submitter?: Address } = {}): Pre
   const signalId = bytes32('03');
   const payloadHash = bytes32('04');
   const idempotencyKey = bytes32('05');
-  const deadline = '1777777777';
+  // Deadlines are validated to be a decimal uint in the future, so the fixture
+  // computes one instead of pinning a date that ages into the past.
+  const deadline = String(Math.floor(Date.now() / 1000) + 3600);
   return {
     prepareId: 'prep_1',
     taskId: 'task_1',

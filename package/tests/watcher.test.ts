@@ -239,7 +239,8 @@ describe('state machine chain watcher', () => {
     expect(requests.map((request) => request?.address)).toEqual([STATE_MACHINE, STATE_MACHINE_V2]);
   });
 
-  it('aborts the poll round and freezes the cursor when one HookReady log cannot be normalized', async () => {
+  it('skips and counts a log that cannot be normalized instead of aborting the round', async () => {
+    const errors: unknown[] = [];
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',
       stateMachineAddress: STATE_MACHINE,
@@ -255,6 +256,9 @@ describe('state machine chain watcher', () => {
           signalName: 'exec.main.cmp',
           payloadHash: PAYLOAD_HASH,
         }),
+      },
+      onError: (error) => {
+        errors.push(error);
       },
       publicClient: {
         async getChainId() {
@@ -272,10 +276,107 @@ describe('state machine chain watcher', () => {
       },
     });
 
-    await expect(watcher.pollOnce()).rejects.toThrow('logIndex must be a non-negative safe integer');
+    const poll = await watcher.pollOnce();
 
-    expect(watcher.describe().nextBlock).toBe('10');
-    expect(await watcher.config.jobStore.list()).toHaveLength(0);
+    // The malformed log is skipped (it has no usable identity, so it cannot be
+    // persisted), the healthy log is still handled, and the cursor advances so
+    // the malformed log is not rescanned forever.
+    expect(poll.decodeFailures).toBe(1);
+    expect(poll.results[0]?.status).toBe('ignored');
+    expect(poll.results[0]?.decodeFailure).toBe(true);
+    expect(poll.results[0]?.error?.kind).toBe('validation_failure');
+    expect(poll.results[0]?.job).toBeUndefined();
+    expect(poll.results[1]?.status).toBe('handled');
+    expect(errors).toHaveLength(1);
+    expect(watcher.describe().nextBlock).toBe('13');
+    expect(watcher.describe().decodeFailures).toBe(1);
+  });
+
+  it('isolates an undecodable HookReady log as a persisted ignored job with the raw log preserved', async () => {
+    const broken = { ...hookReadyLog(), data: '0xdeadbeef' as Hex };
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      dryRun: true,
+      artifact: artifactIndex(),
+      handlers: {
+        '*': () => {
+          throw new Error('isolated log must not reach a handler');
+        },
+      },
+    });
+
+    const first = await watcher.handleLog(broken);
+    const second = await watcher.handleLog(broken);
+
+    expect(first.status).toBe('ignored');
+    expect(first.decodeFailure).toBe(true);
+    expect(first.error?.kind).toBe('validation_failure');
+    expect(first.error?.message).toContain('failed to decode HookReady log data');
+    expect(first.job?.status).toBe('ignored');
+    expect(first.job?.orderId).toBe(`0x${'00'.repeat(32)}`);
+    expect(first.job?.raw).toEqual(broken);
+    // Rescanning the same log is idempotent: same job, still terminal ignored.
+    expect(second.job?.id).toBe(first.job?.id);
+    expect(second.job?.status).toBe('ignored');
+    expect(await watcher.config.jobStore.list()).toHaveLength(1);
+  });
+
+  it('keeps watching when every round re-scans the same undecodable log', async () => {
+    let polls = 0;
+    let aborted = false;
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      fromBlock: 10,
+      dryRun: true,
+      handlers: {
+        '*': () => undefined,
+      },
+      pollIntervalMs: 1,
+      publicClient: {
+        async getChainId() {
+          return 31_337;
+        },
+        async getBlockNumber() {
+          // A new block every round so each poll rescans a range that still
+          // contains the undecodable log (restart/rescan semantics).
+          return 12n + BigInt(polls);
+        },
+        async getLogs() {
+          polls += 1;
+          return [{ ...hookReadyLog(), data: '0xdeadbeef' as Hex }];
+        },
+      },
+    });
+
+    const handle = await watcher.start();
+    void handle.done.catch(() => {
+      aborted = true;
+    });
+
+    // Far more consecutive rounds than MAX_CONSECUTIVE_POLL_FAILURES: decode
+    // failures must never count as failed polls or abort the loop.
+    const deadline = Date.now() + 500;
+    while (polls < 12 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(polls).toBeGreaterThanOrEqual(12);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(aborted).toBe(false);
+
+    // The isolated decision persists: exactly one ignored job for the log.
+    const jobs = await watcher.config.jobStore.list();
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.status).toBe('ignored');
+    const described = watcher.describe() as { decodeFailures?: number };
+    expect(described.decodeFailures).toBeGreaterThanOrEqual(12);
+
+    await handle.stop();
   });
 
   it('keeps the first-round fail-fast behavior when the initial poll fails', async () => {
@@ -452,7 +553,7 @@ describe('state machine chain watcher', () => {
     expect(result.error?.message).toContain('unknown.stage#START');
   });
 
-  it('marks coded unauthorized jobs as failed without automatic retry', async () => {
+  it('dead-letters coded unauthorized jobs without automatic retry', async () => {
     let attempts = 0;
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',
@@ -472,14 +573,17 @@ describe('state machine chain watcher', () => {
 
     const result = await watcher.handleLog(hookReadyLog());
 
+    // Deterministic non-retryable failures dead-letter for human triage instead
+    // of parking in the retryable `failed` lane.
     expect(attempts).toBe(1);
-    expect(result.job?.status).toBe('failed');
+    expect(result.job?.status).toBe('dead_letter');
+    expect(stateMachineJobToExecutorJobDTO(result.job!).status).toBe('dead_letter');
     expect(result.error?.kind).toBe('unauthorized');
     expect(result.error?.retryable).toBe(false);
     expect(result.error?.code).toBe('UNAUTHORIZED');
   });
 
-  it('keeps uncoded failures non-retryable and failed for human review instead of guessing from text', async () => {
+  it('classifies real revert texts thrown by handlers and dead-letters them without retry', async () => {
     let attempts = 0;
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',
@@ -492,25 +596,57 @@ describe('state machine chain watcher', () => {
       handlers: {
         '*': () => {
           attempts += 1;
-          throw new Error('AccessControlUnauthorizedAccount submitter');
+          // Native viem revert text without an explicit executor-kit code.
+          throw new Error('Call revert exception: execution reverted: SignalAlreadyExists()');
         },
       },
     });
 
     const result = await watcher.handleLog(hookReadyLog());
 
-    // A single attempt, a loud terminal failure, and no keyword-derived kind:
-    // without an explicit code the failure is conservatively non-retryable.
+    // duplicate_signal is a dedupe fact, not a failure: the job lands in the
+    // terminal ignored state even though the handler itself ran.
+    expect(attempts).toBe(1);
+    expect(result.status).toBe('handled');
+    expect(result.job?.status).toBe('ignored');
+    expect(result.error?.kind).toBe('duplicate_signal');
+    expect(result.error?.retryable).toBe(false);
+    expect(result.error?.code).toBeUndefined();
+  });
+
+  it('keeps unclassifiable handler failures conservatively non-retryable in dead_letter', async () => {
+    let attempts = 0;
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      dryRun: true,
+      artifact: artifactIndex(),
+      retry: { maxAttempts: 3 },
+      handlers: {
+        '*': () => {
+          attempts += 1;
+          throw new Error('handler exploded in a way no pattern matches');
+        },
+      },
+    });
+
+    const result = await watcher.handleLog(hookReadyLog());
+
+    // A single attempt, no auto retry, and no keyword-derived kind: without an
+    // explicit code or a recognized error text the failure is conservatively
+    // non-retryable and dead-letters for human review.
     // 'handler_failure' is the explicit structural fallback for thrown handlers,
     // not a message-text guess.
     expect(attempts).toBe(1);
-    expect(result.job?.status).toBe('failed');
+    expect(result.job?.status).toBe('dead_letter');
     expect(result.error?.kind).toBe('handler_failure');
     expect(result.error?.retryable).toBe(false);
     expect(result.error?.code).toBeUndefined();
   });
 
-  it('retries coded rpc_network handler failures before dead-lettering the job', async () => {
+  it('retries coded rpc_network handler failures and leaves the job in the retryable failed lane', async () => {
     let attempts = 0;
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',
@@ -530,11 +666,57 @@ describe('state machine chain watcher', () => {
 
     const result = await watcher.handleLog(hookReadyLog());
 
+    // Transient failures exhaust their in-run retries into `failed`, the one
+    // failure state that `jobs retry` still accepts.
     expect(attempts).toBe(2);
-    expect(result.job?.status).toBe('dead_letter');
+    expect(result.job?.status).toBe('failed');
     expect(result.error?.kind).toBe('rpc_network');
     expect(result.error?.retryable).toBe(true);
     expect(result.error?.code).toBe('RPC_NETWORK');
+  });
+
+  it('re-opens a failed job through the manual retry channel', async () => {
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      dryRun: true,
+      artifact: artifactIndex(),
+      handlers: {
+        '*': (event) => ({
+          orderId: event.orderId,
+          source: 'buyer',
+          signalName: 'exec.main.cmp',
+          payloadHash: PAYLOAD_HASH,
+        }),
+      },
+    });
+    const initial = await watcher.handleLog(hookReadyLog());
+    const jobId = initial.job?.id;
+    if (!jobId) {
+      throw new Error('expected job id');
+    }
+    // Simulate an earlier transient failure: the job sits in `failed` with a
+    // retry budget remaining.
+    await watcher.config.jobStore.update(jobId, {
+      status: 'failed',
+      attempts: 1,
+      updatedAt: '2026-04-28T00:00:01.000Z',
+      lastError: {
+        kind: 'rpc_network',
+        message: 'fetch failed ECONNRESET',
+        retryable: true,
+      },
+    });
+
+    const retried = await retryStateMachineJob(watcher, jobId, {
+      operator: 'ops@example.com',
+      reason: 'rpc recovered',
+    });
+    expect(retried.status).toBe('handled');
+    expect(retried.job?.status).toBe('matched');
+    expect(retried.job?.lastError).toBeUndefined();
   });
 
   it('persists jobs, maps DTO status, and supports manual retry/dead-letter audit actions', async () => {
@@ -550,12 +732,12 @@ describe('state machine chain watcher', () => {
         walletAddress: WALLET_ADDRESS,
         dryRun: true,
         artifact: artifactIndex(),
-        retry: { maxAttempts: 3 },
+        retry: { maxAttempts: 2 },
         jobStore: store,
         now: () => '2026-04-28T00:00:00.000Z',
         handlers: {
           '*': () => {
-            throw new Error('AccessControlUnauthorizedAccount submitter');
+            throw new CodedExecutorKitError('RPC_NETWORK', 'fetch failed ECONNRESET');
           },
         },
       });
@@ -565,53 +747,36 @@ describe('state machine chain watcher', () => {
         throw new Error('expected failed job id');
       }
 
+      // Transient failures exhaust into `failed`, the retriable lane.
       expect(failed.job?.status).toBe('failed');
       expect(stateMachineJobToExecutorJobDTO(failed.job).status).toBe('failed');
+      const persistedAfterFailure = await store.get(jobId);
+      expect(persistedAfterFailure?.status).toBe('failed');
+      expect(persistedAfterFailure?.attempts).toBe(2);
 
-      const retryWatcher = createStateMachineWatcher({
-        rpcUrl: 'http://127.0.0.1:8545',
-        stateMachineAddress: STATE_MACHINE,
-        chainId: 31_337,
-        supplierId: 'logistics-provider-a',
-        walletAddress: WALLET_ADDRESS,
-        dryRun: true,
-        artifact: artifactIndex(),
-        retry: { maxAttempts: 3 },
-        jobStore: store,
-        now: () => '2026-04-28T00:01:00.000Z',
-        handlers: {
-          '*': (event) => ({
-            orderId: event.orderId,
-            source: 'buyer',
-            signalName: 'exec.main.cmp',
-            payloadHash: PAYLOAD_HASH,
-          }),
-        },
-      });
-
-      const retried = await retryStateMachineJob(retryWatcher, jobId, {
+      // A manual retry past the recorded attempt budget dead-letters with the
+      // operator action preserved, instead of silently re-running.
+      const overLimit = await retryStateMachineJob(failedWatcher, jobId, {
         operator: 'ops@example.com',
-        reason: 'authorization granted',
+        reason: 'pushing past the attempt budget',
         now: () => '2026-04-28T00:00:30.000Z',
       });
-
-      expect(retried.job?.status).toBe('matched');
-      expect(stateMachineJobToExecutorJobDTO(retried.job!).status).toBe('callback_pending');
-      const persistedAfterRetry = await store.get(jobId);
-      expect(persistedAfterRetry?.lastError).toBeUndefined();
-      expect(persistedAfterRetry?.manualActions).toEqual([
+      expect(overLimit.job?.status).toBe('dead_letter');
+      expect(overLimit.error?.message).toContain('retry limit reached');
+      const persistedAfterOverLimit = await store.get(jobId);
+      expect(persistedAfterOverLimit?.manualActions).toEqual([
         {
           action: 'retry',
           operator: 'ops@example.com',
           at: '2026-04-28T00:00:30.000Z',
-          reason: 'authorization granted',
+          reason: 'pushing past the attempt budget',
         },
       ]);
-      expect(summarizeSupplierOps({ supplierId: 'logistics-provider-a', walletAddress: WALLET_ADDRESS }, [persistedAfterRetry!]))
+      expect(summarizeSupplierOps({ supplierId: 'logistics-provider-a', walletAddress: WALLET_ADDRESS }, [persistedAfterOverLimit!]))
         .toMatchObject({
           supplierId: 'logistics-provider-a',
-          activeJobs: 1,
-          failedJobs: 0,
+          activeJobs: 0,
+          failedJobs: 1,
           confirmedSignals: 0,
         });
 
@@ -882,7 +1047,7 @@ describe('state machine executor config', () => {
 });
 
 describe('executor error classification', () => {
-  it('classifies only from explicit error codes, never from message text', () => {
+  it('honors explicit error codes before any text matching', () => {
     expect(classifyExecutorKitError(new CodedExecutorKitError('UNAUTHORIZED', 'AccessControlUnauthorizedAccount submitter')))
       .toMatchObject({ kind: 'unauthorized', retryable: false, code: 'UNAUTHORIZED' });
     expect(classifyExecutorKitError(new CodedExecutorKitError('DUPLICATE_SIGNAL', 'SignalAlreadySubmitted')))
@@ -897,19 +1062,46 @@ describe('executor error classification', () => {
     expect(classifyExecutorKitError(wrapped)).toMatchObject({ kind: 'rpc_network', retryable: true, code: 'RPC_NETWORK' });
   });
 
-  it('treats errors without a recognized code as non-retryable for human review', () => {
-    // Plain errors keep their message but get no keyword-derived classification.
-    expect(classifyExecutorKitError(new Error('AccessControlUnauthorizedAccount submitter'))).toEqual({
-      kind: 'unknown',
-      message: 'AccessControlUnauthorizedAccount submitter',
-      retryable: false,
-    });
+  it('classifies real viem and ethereum error texts without explicit codes', () => {
+    // Contract revert: decoded custom-error name for an already-known signal.
+    expect(classifyExecutorKitError(new Error('Call revert exception: execution reverted: SignalAlreadyExists()')))
+      .toMatchObject({ kind: 'duplicate_signal', retryable: false });
+    // Raw revert data carrying the SignalAlreadyExists() selector 0xa2e92828.
+    expect(classifyExecutorKitError(new Error('execution reverted: 0xa2e92828')))
+      .toMatchObject({ kind: 'duplicate_signal', retryable: false });
+    // OpenZeppelin authorization revert names surface verbatim in viem messages.
+    expect(classifyExecutorKitError(new Error('AccessControlUnauthorizedAccount submitter')))
+      .toMatchObject({ kind: 'unauthorized', retryable: false });
+    // Gas shortfall: recoverable by funding, so it stays in the retry lane.
+    expect(classifyExecutorKitError(new Error('insufficient funds for gas * price + value')))
+      .toMatchObject({ kind: 'insufficient_funds', retryable: true });
+    // Tx-pool and nonce races: transient broadcast conditions.
+    expect(classifyExecutorKitError(new Error('nonce too low')))
+      .toMatchObject({ kind: 'nonce_conflict', retryable: true });
+    expect(classifyExecutorKitError(new Error('nonce has already been used')))
+      .toMatchObject({ kind: 'nonce_conflict', retryable: true });
+    // Transport and rate-limit conditions.
+    expect(classifyExecutorKitError(new Error('connect ECONNREFUSED 127.0.0.1:8545')))
+      .toMatchObject({ kind: 'rpc_network', retryable: true });
+    expect(classifyExecutorKitError(new Error('HTTP request failed with status 429: Too Many Requests')))
+      .toMatchObject({ kind: 'rpc_network', retryable: true });
+    expect(classifyExecutorKitError(new Error('Request timed out.')))
+      .toMatchObject({ kind: 'rpc_network', retryable: true });
+    expect(classifyExecutorKitError(new Error('fetch failed')))
+      .toMatchObject({ kind: 'rpc_network', retryable: true });
+    expect(classifyExecutorKitError(Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:8545'), { code: 'ECONNREFUSED' })))
+      .toMatchObject({ kind: 'rpc_network', retryable: true });
+    // The text is recognized across a wrapped cause chain (viem nests causes).
+    const wrapped = new Error('submission failed', { cause: new Error('fetch failed: socket hang up') });
+    expect(classifyExecutorKitError(wrapped)).toMatchObject({ kind: 'rpc_network', retryable: true });
+  });
 
-    // Native errno codes are not executor-kit codes: no network-keyword guessing.
-    const errnoLike = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:8545'), { code: 'ECONNREFUSED' });
-    expect(classifyExecutorKitError(errnoLike)).toEqual({
+  it('keeps unrecognized failures conservatively non-retryable for human review', () => {
+    // Plain errors with no recognized shape keep their message but get no
+    // keyword-derived classification.
+    expect(classifyExecutorKitError(new Error('handler exploded in a way no pattern matches'))).toEqual({
       kind: 'unknown',
-      message: 'connect ECONNREFUSED 127.0.0.1:8545',
+      message: 'handler exploded in a way no pattern matches',
       retryable: false,
     });
 
@@ -953,6 +1145,46 @@ describe('submitSignal receipt visibility', () => {
         publicClient: fakeReceiptClient(31_337, { status: 'reverted' }),
       }, SIGNAL)).rejects.toThrow(/submitSignal transaction receipt status reverted/);
       expect(stub.methods).toContain('eth_sendRawTransaction');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('routes a real SignalAlreadyExists revert on replay into an ignored job instead of failed', async () => {
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    // Restart replay of an already-committed signal: the chain rejects the
+    // resubmission with the real contract revert text.
+    const stub = await startJsonRpcStub({
+      estimateGasError: { code: 3, message: 'execution reverted: SignalAlreadyExists()' },
+    });
+    try {
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        artifact: artifactIndex(),
+        retry: { maxAttempts: 3 },
+        handlers: {
+          '*': (event) => ({
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          }),
+        },
+      });
+
+      const result = await watcher.handleLog(hookReadyLog());
+
+      // The duplicate is a dedupe fact, not a failure: recognized from the real
+      // revert text without any explicit code, and the job is ignored.
+      expect(result.status).toBe('ignored');
+      expect(result.job?.status).toBe('ignored');
+      expect(result.error?.kind).toBe('duplicate_signal');
+      expect(result.error?.retryable).toBe(false);
+      expect(result.error?.message).toContain('SignalAlreadyExists');
     } finally {
       await stub.close();
       delete process.env[KEY_ENV];
@@ -1053,7 +1285,9 @@ type JsonRpcRequest = { readonly id?: unknown; readonly method?: string };
  * without a real chain; only the broadcast path is exercised this way — receipt
  * waiting comes from an injected StateMachinePublicClient.
  */
-async function startJsonRpcStub(): Promise<{
+async function startJsonRpcStub(options: {
+  readonly estimateGasError?: { readonly code: number; readonly message: string };
+} = {}): Promise<{
   readonly url: string;
   readonly methods: string[];
   close(): Promise<void>;
@@ -1099,6 +1333,13 @@ async function startJsonRpcStub(): Promise<{
       const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as JsonRpcRequest | readonly JsonRpcRequest[];
       const respondOne = (body: JsonRpcRequest, id: unknown) => {
         methods.push(body.method ?? '');
+        if (body.method === 'eth_estimateGas' && options.estimateGasError) {
+          return {
+            jsonrpc: '2.0',
+            id: body.id ?? id ?? 1,
+            error: options.estimateGasError,
+          };
+        }
         return {
           jsonrpc: '2.0',
           id: body.id ?? id ?? 1,

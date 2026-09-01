@@ -2,6 +2,7 @@ import { isHex, type Address, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import {
   PRODUCT_SUBMIT_DOMAIN_VERSION,
+  PRODUCT_SUBMIT_TYPED_DATA_FIELDS,
   type ProductSubmitTypedData,
   type ProductSubmitTypedDataField,
 } from '@uvp-eth/protocol-bindings';
@@ -514,6 +515,12 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
   if (primaryType !== 'UVPStateMachineSignal') {
     throw new ValidationError(`${label}.primaryType must be UVPStateMachineSignal`);
   }
+  // The typed data is exactly what the participant wallet signs, so any drift
+  // from the frozen canonical shape (extra/missing/renamed fields, type drift)
+  // changes what is signed or how it verifies. Reject all of it instead of
+  // silently dropping unknown keys.
+  requireExactKeys(domain, ['name', 'version', 'chainId', 'verifyingContract'], `${label}.domain`);
+  requireExactKeys(types, ['UVPStateMachineSignal'], `${label}.types`);
   const domainName = requiredString(domain, 'name', `${label}.domain`);
   if (domainName !== 'UVPStateMachine') {
     throw new ValidationError(`${label}.domain.name must be UVPStateMachine`);
@@ -526,6 +533,8 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
   if (typeof chainId !== 'number' || !Number.isSafeInteger(chainId) || chainId <= 0) {
     throw new ValidationError(`${label}.domain.chainId must be a positive safe integer`);
   }
+  const fields = parseTypedDataFields(types.UVPStateMachineSignal, `${label}.types.UVPStateMachineSignal`);
+  requireExactKeys(message, PRODUCT_SUBMIT_TYPED_DATA_FIELDS.map((field) => field.name), `${label}.message`);
   return {
     domain: {
       name: domainName,
@@ -537,7 +546,7 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
       ),
     },
     types: {
-      UVPStateMachineSignal: parseTypedDataFields(types.UVPStateMachineSignal, `${label}.types.UVPStateMachineSignal`),
+      UVPStateMachineSignal: fields,
     },
     primaryType,
     message: {
@@ -550,22 +559,78 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
         `${label}.message.idempotencyKey`,
       ),
       submitter: normalizeAddress(requiredString(message, 'submitter', `${label}.message`), `${label}.message.submitter`),
-      deadline: requiredString(message, 'deadline', `${label}.message`),
+      deadline: validateFutureDeadline(requiredString(message, 'deadline', `${label}.message`), `${label}.message.deadline`),
     },
   };
 }
 
+/**
+ * Compare the parsed typed-data field table against the frozen canonical
+ * `PRODUCT_SUBMIT_TYPED_DATA_FIELDS`: same length, same order, same names and
+ * types, and no extra keys per field. Any drift between the prepare response and
+ * the protocol the wallet would sign for is rejected loudly.
+ */
 function parseTypedDataFields(value: unknown, label: string): readonly ProductSubmitTypedDataField[] {
   if (!Array.isArray(value)) {
     throw new ValidationError(`${label} must be an array`);
   }
-  return value.map((field, index) => {
+  const fields = value.map((field, index) => {
     const record = requireRecord(field, `${label}[${index}]`);
+    requireExactKeys(record, ['name', 'type'], `${label}[${index}]`);
     return {
       name: requiredString(record, 'name', `${label}[${index}]`),
       type: requiredString(record, 'type', `${label}[${index}]`),
     };
   });
+  const canonical = PRODUCT_SUBMIT_TYPED_DATA_FIELDS;
+  if (fields.length !== canonical.length) {
+    throw new ValidationError(
+      `${label} must contain exactly ${canonical.length} fields for UVPStateMachineSignal, got ${fields.length}`,
+    );
+  }
+  for (const [index, expected] of canonical.entries()) {
+    const actual = fields[index];
+    if (!actual || actual.name !== expected.name || actual.type !== expected.type) {
+      throw new ValidationError(
+        `${label}[${index}] must be { name: ${expected.name}, type: ${expected.type} } but got { name: ${actual?.name ?? 'missing'}, type: ${actual?.type ?? 'missing'} }`,
+      );
+    }
+  }
+  return fields;
+}
+
+/**
+ * `deadline` is a uint256 unix-seconds timestamp in the signature message.
+ * Reject non-decimal formats and already-expired deadlines so an expired
+ * prepared submission fails at parse/sign time instead of at the chain.
+ */
+function validateFutureDeadline(value: string, label: string): string {
+  if (!/^(0|[1-9][0-9]*)$/u.test(value)) {
+    throw new ValidationError(`${label} must be a base-10 unix-seconds uint string`);
+  }
+  const nowSeconds = BigInt(Math.floor(Date.now() / 1000));
+  if (BigInt(value) <= nowSeconds) {
+    throw new ValidationError(`${label} must be a unix timestamp in the future`);
+  }
+  return value;
+}
+
+function requireExactKeys(
+  record: Record<string, unknown>,
+  expectedKeys: readonly string[],
+  label: string,
+): void {
+  const expected = new Set(expectedKeys);
+  for (const key of Object.keys(record)) {
+    if (!expected.has(key)) {
+      throw new ValidationError(`${label} has unexpected field ${key}`);
+    }
+  }
+  for (const key of expectedKeys) {
+    if (!(key in record)) {
+      throw new ValidationError(`${label} is missing field ${key}`);
+    }
+  }
 }
 
 async function requestProductApiJson(

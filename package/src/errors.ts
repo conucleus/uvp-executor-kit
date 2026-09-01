@@ -4,6 +4,8 @@ export type ExecutorKitErrorKind =
   | 'unauthorized'
   | 'duplicate_signal'
   | 'rpc_network'
+  | 'insufficient_funds'
+  | 'nonce_conflict'
   | 'missing_handler'
   | 'validation_failure'
   | 'handler_failure'
@@ -12,11 +14,14 @@ export type ExecutorKitErrorKind =
 /**
  * Explicit machine-readable error codes recognized by the classifier.
  *
- * Classification never inspects message text: an error is classified only when
- * it carries one of these codes (typically via `error.code` on a thrown Error,
- * e.g. `new CodedExecutorKitError('RPC_NETWORK', 'fetch failed')`). Anything
- * else is conservatively non-retryable and lands in a terminal state for human
- * review instead of guessing retry semantics from keywords.
+ * Codes are honored first (typically via `error.code` on a thrown Error, e.g.
+ * `new CodedExecutorKitError('RPC_NETWORK', 'fetch failed')`), but production
+ * failures are mostly native viem errors and contract reverts that carry no
+ * code at all. After the code lookup, the classifier therefore also matches
+ * well-known real-world error texts and revert data (see MESSAGE_PATTERNS):
+ * without that, transient network faults would terminally fail jobs and
+ * `SignalAlreadyExists()` reverts would land as `unknown` instead of
+ * `duplicate_signal`.
  */
 export type ExecutorKitErrorCode =
   | 'UNAUTHORIZED'
@@ -47,6 +52,62 @@ const ERROR_CODE_TABLE: Readonly<
 
 const KNOWN_ERROR_CODES = new Set<string>(Object.keys(ERROR_CODE_TABLE));
 
+interface ErrorMessagePattern {
+  readonly pattern: RegExp;
+  readonly kind: ExecutorKitErrorKind;
+  readonly retryable: boolean;
+}
+
+/**
+ * Message-text patterns for failures that reach the kit without an explicit
+ * code: native viem errors, JSON-RPC provider errors, and contract reverts.
+ *
+ * The list is ordered by priority; for each entry every message along the
+ * error's cause chain is tested before the next entry runs. Only well-known
+ * real-world error shapes are recognized — anything unrecognized still falls
+ * through to the conservative non-retryable fallback instead of guessing.
+ */
+const MESSAGE_PATTERNS: readonly ErrorMessagePattern[] = [
+  // Contract reverts that mean the exact same signal fact already exists.
+  // Covers the decoded custom-error name (viem keeps `SignalAlreadyExists()`
+  // in the message), the plain sentence form, and the raw 4-byte selector
+  // `SignalAlreadyExists()` = 0xa2e92828 when the revert data is not decoded.
+  {
+    pattern: /SignalAlreadyExists|signal already exists|0xa2e92828/i,
+    kind: 'duplicate_signal',
+    retryable: false,
+  },
+  // On-chain authorization reverts (OpenZeppelin custom error names surface
+  // verbatim in viem revert messages) and generic auth rejection text.
+  {
+    pattern: /AccessControlUnauthorizedAccount|OwnableUnauthorizedAccount|\bunauthorized\b/i,
+    kind: 'unauthorized',
+    retryable: false,
+  },
+  // Gas shortfalls are deterministic at broadcast time for the current wallet
+  // state but recoverable by funding, so the failure stays in the retry lane
+  // instead of being archived as deterministic.
+  {
+    pattern: /insufficient funds|insufficient balance/i,
+    kind: 'insufficient_funds',
+    retryable: true,
+  },
+  // Tx-pool and nonce races: a fresh attempt with a recomputed nonce (and the
+  // protocol's own SignalAlreadyExists dedupe) makes these safe to retry.
+  {
+    pattern: /nonce too low|nonce has already been used|replacement transaction underpriced|already known|same hash was already imported/i,
+    kind: 'nonce_conflict',
+    retryable: true,
+  },
+  // Transport, RPC, and rate-limit conditions: timeouts, socket errors,
+  // HTTP 429/502/503/504, gateway failures, and undici "fetch failed".
+  {
+    pattern: /\b429\b|too many requests|rate limit|timeout|timed out|\b502\b|\b503\b|\b504\b|bad gateway|service unavailable|gateway timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ECONNABORTED|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|EPIPE|socket hang up|fetch failed|network error|HTTP request failed/i,
+    kind: 'rpc_network',
+    retryable: true,
+  },
+];
+
 /** An Error carrying an explicit executor-kit classification code. */
 export class CodedExecutorKitError extends Error {
   readonly code: ExecutorKitErrorCode;
@@ -75,31 +136,63 @@ export function classifyExecutorKitError(
     };
   }
 
-  // No explicit code: never guess from message text. ValidationError stays an
-  // explicit type-based classification; everything else falls back as strictly
-  // non-retryable so unclassifiable failures reach a terminal state for human
-  // review rather than being silently retried.
+  // ValidationError stays an explicit type-based classification: local input
+  // validation must not be re-guessed from its message text.
+  if (error instanceof ValidationError) {
+    return {
+      kind: 'validation_failure',
+      message: redactSecretLikeHex(rawMessage || 'validation_failure'),
+      retryable: false,
+    };
+  }
+
+  const matchedPattern = matchMessagePattern(error);
+  if (matchedPattern) {
+    return {
+      kind: matchedPattern.kind,
+      message: redactSecretLikeHex(rawMessage || matchedPattern.kind),
+      retryable: matchedPattern.retryable,
+    };
+  }
+
+  // No explicit code and no recognized error text: conservatively non-retryable
+  // so unclassifiable failures reach a terminal state for human review rather
+  // than being silently retried.
   return {
-    kind: error instanceof ValidationError ? 'validation_failure' : fallbackKind,
+    kind: fallbackKind,
     message: redactSecretLikeHex(rawMessage || fallbackKind),
     retryable: false,
   };
 }
 
 function matchExplicitCode(error: unknown): ExecutorKitErrorCode | undefined {
-  let current: unknown = error;
-  for (let depth = 0; depth < 4 && current; depth += 1) {
-    if (current instanceof Error) {
-      const code = (current as { readonly code?: unknown }).code;
-      if (typeof code === 'string' && KNOWN_ERROR_CODES.has(code)) {
-        return code as ExecutorKitErrorCode;
-      }
-      current = current.cause;
-      continue;
+  for (const current of walkErrorChain(error)) {
+    const code = (current as { readonly code?: unknown }).code;
+    if (typeof code === 'string' && KNOWN_ERROR_CODES.has(code)) {
+      return code as ExecutorKitErrorCode;
     }
-    break;
   }
   return undefined;
+}
+
+function matchMessagePattern(error: unknown): ErrorMessagePattern | undefined {
+  const messages = [...walkErrorChain(error)]
+    .map((current) => (current instanceof Error ? current.message : undefined))
+    .filter((message): message is string => typeof message === 'string' && message.length > 0);
+  for (const entry of MESSAGE_PATTERNS) {
+    if (messages.some((message) => entry.pattern.test(message))) {
+      return entry;
+    }
+  }
+  return undefined;
+}
+
+function* walkErrorChain(error: unknown): Generator<Error> {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current instanceof Error; depth += 1) {
+    yield current;
+    current = current.cause;
+  }
 }
 
 function errorToMessage(error: unknown): string {

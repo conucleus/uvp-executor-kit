@@ -287,10 +287,21 @@ Watcher job semantics:
   receipted stays in the non-terminal `submitted` state, so later scans or
   manual retries can observe the real on-chain outcome instead of trusting
   the broadcast.
-- Failures are classified by explicit machine-readable error codes only. An
-  error without a known code is never auto-retried: the job falls to a terminal
-  `failed` state and waits for human review via `jobs retry` or
-  `jobs dead-letter`.
+- Failures are classified from explicit machine-readable error codes first,
+  then from well-known real-world error texts and contract revert data
+  (for example `SignalAlreadyExists()`, `AccessControlUnauthorizedAccount`,
+  `insufficient funds`, nonce conflicts, timeouts, `ECONNRESET`, and HTTP
+  429). Transient (retryable) failures retry inside the run and land in
+  `failed` when exhausted, which `jobs retry` still accepts; deterministic
+  non-retryable failures and unrecognized errors dead-letter for human
+  triage via `jobs dead-letter`. A duplicate-signal fact (`SignalAlreadyExists`,
+  e.g. on restart replay of an already-committed signal) is not a failure:
+  the job is ignored.
+- HookReady-topic logs that fail to decode (e.g. from a mixed-version
+  deployment) never crash the watcher: the scan skips them, records an
+  `ignored` job with the raw log preserved, counts them in poll results and
+  `describe()`, and reports them through `onError`. The cursor advances so
+  the same log is not rescanned forever.
 - Process exit codes are honest: when a scan result carries an error, or any
   job ends in `failed`/`dead_letter`, the process exits with status 1 even
   though result objects were produced without throwing.
@@ -350,6 +361,12 @@ ABI recorded in
 
 - `HookReady(bytes32 orderId, bytes32 hookId, bytes32 stageId, bytes32 hookName)`;
 - `submitSignal(bytes32 orderId, bytes32 sourceId, bytes32 signalId, bytes32 payloadHash, bytes32 idempotencyKey)`.
+
+There is no payload-reference input in this ABI, and the contract is frozen:
+`chain-signal --payload-ref` is rejected up front instead of silently dropping
+the reference. Only the 32-byte `payloadHash` goes on chain; record any
+off-chain payload reference in your own job/evidence store (the runtime
+callback envelope's `payloadRef` field is the off-chain channel for it).
 
 The contract also exposes `submitSignalFor(...)` and
 EIP-712 typed-data builders for gas-relay adapters. This package does not

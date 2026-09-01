@@ -214,6 +214,36 @@ describe('executor CLI', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+  it('rejects chain-signal --payload-ref instead of silently dropping it', async () => {
+    // The frozen submitSignal ABI has no payloadRef field; before this guard the
+    // flag was parsed, discarded, and the command reported success anyway.
+    await expect(main([
+      'node',
+      'uvp-executor',
+      'chain-signal',
+      '--rpc-url',
+      'http://127.0.0.1:8545',
+      '--state-machine',
+      RETRY_STATE_MACHINE,
+      '--chain-id',
+      '31337',
+      '--order-id',
+      RETRY_ORDER_ID,
+      '--source',
+      'buyer',
+      '--stage',
+      'exec.main',
+      '--signal-name',
+      'cmp',
+      '--payload-hash',
+      `0x${'44'.repeat(32)}`,
+      '--payload-ref',
+      'ipfs://payload',
+      '--wallet-address',
+      RETRY_WALLET,
+      '--dry-run',
+    ])).rejects.toThrow(/--payload-ref is not supported by chain-signal/);
+  });
 });
 
 describe('honest execution exit codes', () => {

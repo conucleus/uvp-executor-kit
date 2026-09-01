@@ -189,7 +189,9 @@ function preparedSubmission(options: { readonly taskId?: string; readonly submit
   const signalId = bytes32('03');
   const payloadHash = bytes32('04');
   const idempotencyKey = bytes32('05');
-  const deadline = '1777777777';
+  // Deadlines are validated to be a decimal uint in the future, so the fixture
+  // computes one instead of pinning a date that ages into the past.
+  const deadline = String(Math.floor(Date.now() / 1000) + 3600);
   const preparedSubmitter = options.submitter ?? submitter;
   return {
     prepareId: 'prep_1',
