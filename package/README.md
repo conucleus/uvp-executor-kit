@@ -66,9 +66,20 @@ uvp-executor chain-watch \
   --state-machine 0x0000000000000000000000000000000000000001 \
   --chain-id 31337 \
   --config uvp-executor-kit/package/fixtures/state-machine-executor.config.json \
-  --jobs-file .uvp-executor-jobs.json \
   --dry-run
 ```
+
+By default the chain commands persist watcher state to files so a restart
+resumes where the previous process stopped instead of rescanning from
+`--from-block`: jobs land in `<state-dir>/jobs.json` and the scan cursor (the
+next block to scan) in `<state-dir>/cursor.json`. The state directory defaults
+to `./uvp-watcher-state`, overridden by `--state-dir` or the
+`UVP_WATCHER_STATE_DIR` env var; `--jobs-file <path>` places the jobs file
+exactly at that path with the cursor beside it. The startup log reports the
+resolved storage mode and paths. Pass `--job-store memory` to keep jobs and the
+cursor in process memory (the pre-ETH-07 behavior); a persisted cursor whose
+chain id or state-machine set no longer matches the configuration is ignored
+and rewritten on the next successful round.
 
 Build or submit one state-machine signal:
 
@@ -320,6 +331,9 @@ Watcher job semantics:
 - `decodeHookReadyLog` and `hookReadyEventId`: normalize state-machine logs.
 - `InMemoryStateMachineJobStore` and `FileStateMachineJobStore`: record watcher
   job state for retries, dead-lettering, and Product/Ops projection.
+- `FileStateMachineCursorStore`: persists the watcher scan cursor (pass it as
+  `cursorStore` to `createStateMachineWatcher`) so a restarted watcher resumes
+  instead of rescanning from `fromBlock`; without it the cursor stays in memory.
 - `stateMachineHandlerConfigToExecutorConfigDTO`,
   `stateMachineJobToExecutorJobDTO`, and `summarizeSupplierOps`: product-facing
   DTO helpers.

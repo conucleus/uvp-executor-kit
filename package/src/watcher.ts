@@ -164,6 +164,13 @@ export interface StateMachineWatcherConfig extends SubmitStateMachineSignalConfi
   readonly pollIntervalMs?: number | string;
   readonly retry?: StateMachineRetryConfig;
   readonly jobStore?: StateMachineJobStore;
+  /**
+   * ETH-07: optional durable store for the scan cursor (the next block to scan).
+   * When configured, the watcher persists the cursor after every successful
+   * round and restores it before the first poll, so a restart resumes instead
+   * of rescanning from fromBlock. Without it the cursor stays in process memory.
+   */
+  readonly cursorStore?: StateMachineCursorStore;
   readonly now?: () => string;
   readonly onPoll?: (result: StateMachinePollResult) => void;
   readonly onError?: (error: unknown) => void;
@@ -364,6 +371,8 @@ export interface StateMachineJobManualAction {
 }
 
 export interface StateMachineJobStore {
+  /** Storage-mode label for diagnostics (`memory`, `file`, ...); optional so custom stores stay compatible. */
+  readonly kind?: string;
   upsertDetected(event: StateMachineHookReady, options: {
     readonly now: string;
     readonly maxAttempts: number;
@@ -388,6 +397,7 @@ export interface StateMachineJobPatch {
 }
 
 export class InMemoryStateMachineJobStore implements StateMachineJobStore {
+  readonly kind = 'memory';
   private readonly jobs = new Map<Hex, StateMachineWatcherJob>();
 
   async upsertDetected(event: StateMachineHookReady, options: {
@@ -458,6 +468,7 @@ export class InMemoryStateMachineJobStore implements StateMachineJobStore {
 }
 
 export class FileStateMachineJobStore implements StateMachineJobStore {
+  readonly kind = 'file';
   readonly filePath: string;
 
   constructor(filePath: string) {
@@ -541,10 +552,101 @@ export class FileStateMachineJobStore implements StateMachineJobStore {
   }
 }
 
+/**
+ * Identity of the scan position a cursor belongs to. A persisted cursor is only
+ * restored when the watcher's chain id and state-machine set match, so
+ * reconfiguring the watcher can never resume from a foreign scan position.
+ */
+export interface StateMachineCursorContext {
+  readonly chainId: number;
+  /** Lowercase state-machine addresses, sorted; the watcher derives this from its config. */
+  readonly stateMachines: readonly string[];
+}
+
+/**
+ * ETH-07: durable store for the watcher scan cursor (the next block to scan).
+ * The job-store abstraction does not fit: jobs are keyed by bytes32 ids with
+ * required event fields, while the cursor is a single block number bound to the
+ * watcher identity above.
+ */
+export interface StateMachineCursorStore {
+  /** Storage-mode label for diagnostics (`file`, ...); optional so custom stores stay compatible. */
+  readonly kind?: string;
+  /**
+   * Return the persisted next-block cursor for this context, or undefined when
+   * nothing usable is stored (absent file, foreign context). Structurally
+   * invalid state throws instead of being silently ignored.
+   */
+  load(context: StateMachineCursorContext): Promise<bigint | undefined>;
+  /** Persist the cursor after a successful scan round advanced past its toBlock. */
+  save(cursor: bigint, context: StateMachineCursorContext): Promise<void>;
+}
+
+export class FileStateMachineCursorStore implements StateMachineCursorStore {
+  readonly kind = 'file';
+  readonly filePath: string;
+
+  constructor(filePath: string) {
+    if (!filePath || filePath.trim().length === 0) {
+      throw new ValidationError('cursor file path is required');
+    }
+    this.filePath = filePath;
+  }
+
+  async load(context: StateMachineCursorContext): Promise<bigint | undefined> {
+    let raw: string;
+    try {
+      raw = await readFile(this.filePath, 'utf8');
+    } catch (error) {
+      if (isNodeError(error) && error.code === 'ENOENT') {
+        return undefined;
+      }
+      throw error;
+    }
+    if (raw.trim().length === 0) {
+      return undefined;
+    }
+
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) {
+      throw new ValidationError('cursor file must contain a JSON object');
+    }
+    // A cursor from a different chain or state-machine set belongs to another
+    // watcher identity: ignoring it (and overwriting on the next save) is the
+    // safe reconfiguration behavior, not data corruption.
+    if (!cursorContextMatches(parsed, context)) {
+      return undefined;
+    }
+    if (parsed.cursor === undefined || parsed.cursor === null) {
+      return undefined;
+    }
+    return parseStoredCursor(parsed.cursor);
+  }
+
+  async save(cursor: bigint, context: StateMachineCursorContext): Promise<void> {
+    if (typeof cursor !== 'bigint' || cursor < 0n) {
+      throw new ValidationError('cursor must be a non-negative bigint block number');
+    }
+    await mkdir(dirname(this.filePath), { recursive: true });
+    await writeFile(
+      this.filePath,
+      `${JSON.stringify({
+        version: 1,
+        cursor: cursor.toString(),
+        chainId: context.chainId,
+        stateMachines: [...context.stateMachines],
+        updatedAt: new Date().toISOString(),
+      }, null, 2)}\n`,
+      'utf8',
+    );
+  }
+}
+
 export class StateMachineWatcher {
   readonly config: NormalizedStateMachineWatcherConfig;
   private nextBlock: bigint | undefined;
   private decodeFailuresTotal = 0;
+  private cursorRestored = false;
 
   constructor(config: StateMachineWatcherConfig) {
     this.config = normalizeStateMachineWatcherConfig(config);
@@ -567,12 +669,38 @@ export class StateMachineWatcher {
       dryRun: this.config.dryRun,
       retry: this.config.retry,
       decodeFailures: this.decodeFailuresTotal,
+      jobStore: this.config.jobStore.kind ?? 'custom',
+      cursorStore: this.config.cursorStore?.kind ?? 'memory',
     };
+  }
+
+  /**
+   * ETH-07: load the persisted scan cursor once per watcher instance before the
+   * first poll. A restored cursor replaces the initial fromBlock so a restarted
+   * watcher resumes where the previous process stopped instead of rescanning
+   * the already-processed range (job idempotency absorbs that today, but the
+   * rescan wastes RPC calls and loses the audit position). Idempotent no-op
+   * when no cursor store is configured.
+   */
+  async restoreCursor(): Promise<void> {
+    if (this.cursorRestored) {
+      return;
+    }
+    this.cursorRestored = true;
+    const store = this.config.cursorStore;
+    if (!store) {
+      return;
+    }
+    const stored = await store.load(this.cursorContext());
+    if (stored !== undefined) {
+      this.nextBlock = stored;
+    }
   }
 
   async pollOnce(): Promise<StateMachinePollResult> {
     const client = getPublicClient(this.config);
     await ensureChainId(client, this.config.chainId);
+    await this.restoreCursor();
 
     const toBlock = await client.getBlockNumber();
     const fromBlock = this.nextBlock ?? this.config.fromBlock ?? toBlock;
@@ -606,6 +734,12 @@ export class StateMachineWatcher {
       results.push(await this.handleLog(log));
     }
     this.nextBlock = toBlock + 1n;
+    // Cursor persistence is part of the round's durability: if the save fails
+    // the round reports failure and the next poll rescans the same range, which
+    // the job store absorbs idempotently.
+    if (this.config.cursorStore) {
+      await this.config.cursorStore.save(this.nextBlock, this.cursorContext());
+    }
 
     const decodeFailures = results.filter((result) => result.decodeFailure).length;
     return {
@@ -895,6 +1029,15 @@ export class StateMachineWatcher {
       throw new ValidationError(`job ${jobId} not found`);
     }
     return updated;
+  }
+
+  private cursorContext(): StateMachineCursorContext {
+    return {
+      chainId: this.config.chainId,
+      stateMachines: this.config.stateMachines
+        .map((deployment) => deployment.stateMachineAddress.toLowerCase())
+        .sort(),
+    };
   }
 
   /**
@@ -1375,6 +1518,7 @@ interface NormalizedStateMachineWatcherConfig extends NormalizedSubmitConfig {
   readonly pollIntervalMs: number;
   readonly retry: NormalizedStateMachineRetryConfig;
   readonly jobStore: StateMachineJobStore;
+  readonly cursorStore?: StateMachineCursorStore;
   readonly now: () => string;
   readonly onPoll?: (result: StateMachinePollResult) => void;
   readonly onError?: (error: unknown) => void;
@@ -1413,6 +1557,7 @@ function normalizeStateMachineWatcherConfig(config: StateMachineWatcherConfig): 
       : DEFAULT_STATE_MACHINE_POLL_INTERVAL_MS,
     retry: normalizeRetryConfig(config.retry),
     jobStore: config.jobStore ?? new InMemoryStateMachineJobStore(),
+    ...(config.cursorStore ? { cursorStore: config.cursorStore } : {}),
     now: config.now ?? (() => new Date().toISOString()),
     ...(config.onPoll ? { onPoll: config.onPoll } : {}),
     ...(config.onError ? { onError: config.onError } : {}),
@@ -1917,6 +2062,33 @@ function reviveStoredRawLog(value: Record<string, unknown>): StateMachineRawLog 
 
 function stateMachineJobJsonReplacer(_key: string, value: unknown): unknown {
   return typeof value === 'bigint' ? value.toString() : value;
+}
+
+function cursorContextMatches(stored: Record<string, unknown>, context: StateMachineCursorContext): boolean {
+  if (stored.chainId !== context.chainId) {
+    return false;
+  }
+  const storedMachines = Array.isArray(stored.stateMachines) ? stored.stateMachines : [];
+  if (storedMachines.length !== context.stateMachines.length) {
+    return false;
+  }
+  const expected = [...context.stateMachines].sort();
+  const actual = storedMachines
+    .map((address) => typeof address === 'string' ? address.toLowerCase() : '')
+    .sort();
+  return expected.every((address, index) => actual[index] === address);
+}
+
+function parseStoredCursor(value: unknown): bigint {
+  const text = typeof value === 'string'
+    ? value
+    : typeof value === 'number'
+      ? String(value)
+      : undefined;
+  if (text === undefined || !/^(0|[1-9][0-9]*)$/.test(text)) {
+    throw new ValidationError('stored cursor must be a non-negative integer block number');
+  }
+  return BigInt(text);
 }
 
 function normalizeCallbackMode(value: string): ExecutorCallbackMode {

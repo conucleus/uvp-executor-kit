@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,7 @@ import {
   createStateMachineWatcher,
   deadLetterStateMachineJob,
   decodeHookReadyLog,
+  FileStateMachineCursorStore,
   FileStateMachineJobStore,
   hookReadyEventId,
   loadStateMachineHandlerConfig,
@@ -245,6 +246,249 @@ describe('state machine chain watcher', () => {
     expect(poll.results.map((result) => result.event?.stateMachineAddress)).toEqual([STATE_MACHINE, STATE_MACHINE_V2]);
     expect(poll.results[0]?.job?.id).not.toBe(poll.results[1]?.job?.id);
     expect(requests.map((request) => request?.address)).toEqual([STATE_MACHINE, STATE_MACHINE_V2]);
+  });
+
+  it('persists the scan cursor and resumes from it after a restart instead of rescanning', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-cursor-'));
+    const stateDir = join(dir, 'state');
+    try {
+      const getLogsCalls: unknown[] = [];
+      let headBlock = 12n;
+      const buildWatcher = () => createStateMachineWatcher({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        walletAddress: WALLET_ADDRESS,
+        fromBlock: 10,
+        dryRun: true,
+        artifact: artifactIndex(),
+        handlers: {
+          '*': (event) => ({
+            planId: PLAN_ID,
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          }),
+        },
+        jobStore: new FileStateMachineJobStore(join(stateDir, 'jobs.json')),
+        cursorStore: new FileStateMachineCursorStore(join(stateDir, 'cursor.json')),
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return headBlock;
+          },
+          async getLogs(args) {
+            getLogsCalls.push(args);
+            // The HookReady event exists at block 12 only.
+            return args.fromBlock <= 12n ? [hookReadyLog()] : [];
+          },
+        },
+      });
+
+      // First process: scans 10..12, handles the event, persists cursor 13.
+      const first = buildWatcher();
+      const firstPoll = await first.pollOnce();
+      expect(firstPoll.fromBlock).toBe(10n);
+      expect(firstPoll.scannedLogs).toBe(1);
+      expect(first.describe().nextBlock).toBe('13');
+      expect(first.describe().cursorStore).toBe('file');
+      expect(first.describe().jobStore).toBe('file');
+      const storedCursor = JSON.parse(
+        await readFile(join(stateDir, 'cursor.json'), 'utf8'),
+      ) as { version?: number; cursor?: string; chainId?: number; stateMachines?: string[] };
+      expect(storedCursor).toMatchObject({
+        version: 1,
+        cursor: '13',
+        chainId: 31_337,
+        stateMachines: [STATE_MACHINE.toLowerCase()],
+      });
+
+      // Restart: a fresh watcher instance with the same state files resumes at
+      // the persisted cursor; the confirmed 10..12 range is never rescanned.
+      headBlock = 15n;
+      const restarted = buildWatcher();
+      const secondPoll = await restarted.pollOnce();
+      expect(secondPoll.fromBlock).toBe(13n);
+      expect(secondPoll.toBlock).toBe(15n);
+      expect(secondPoll.scannedLogs).toBe(0);
+      expect(getLogsCalls).toEqual([
+        { address: STATE_MACHINE, fromBlock: 10n, toBlock: 12n },
+        { address: STATE_MACHINE, fromBlock: 13n, toBlock: 15n },
+      ]);
+      // The job store also survived the restart (no duplicate detection).
+      const jobs = await restarted.config.jobStore.list();
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]?.status).toBe('matched');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores a persisted cursor bound to a different chain or state-machine set', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-cursor-ctx-'));
+    try {
+      const cursorFile = join(dir, 'cursor.json');
+      const store = new FileStateMachineCursorStore(cursorFile);
+      await store.save(40n, { chainId: 31_337, stateMachines: [STATE_MACHINE.toLowerCase()] });
+      const noLogsClient = (chainId: number): StateMachinePublicClient => ({
+        async getChainId() {
+          return chainId;
+        },
+        async getBlockNumber() {
+          return 12n;
+        },
+        async getLogs() {
+          return [];
+        },
+      });
+
+      const differentChain = createStateMachineWatcher({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 1,
+        walletAddress: WALLET_ADDRESS,
+        fromBlock: 10,
+        dryRun: true,
+        handlers: { '*': () => undefined },
+        cursorStore: new FileStateMachineCursorStore(cursorFile),
+        publicClient: noLogsClient(1),
+      });
+      expect((await differentChain.pollOnce()).fromBlock).toBe(10n);
+
+      const differentMachine = createStateMachineWatcher({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE_V2,
+        chainId: 31_337,
+        walletAddress: WALLET_ADDRESS,
+        fromBlock: 10,
+        dryRun: true,
+        handlers: { '*': () => undefined },
+        cursorStore: new FileStateMachineCursorStore(cursorFile),
+        publicClient: noLogsClient(31_337),
+      });
+      expect((await differentMachine.pollOnce()).fromBlock).toBe(10n);
+
+      // The foreign cursor was not adopted, and the next successful round
+      // overwrote the file with this watcher's identity, so a later restart
+      // resumes from it.
+      const resumed = createStateMachineWatcher({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE_V2,
+        chainId: 31_337,
+        walletAddress: WALLET_ADDRESS,
+        fromBlock: 10,
+        dryRun: true,
+        handlers: { '*': () => undefined },
+        cursorStore: new FileStateMachineCursorStore(cursorFile),
+        publicClient: noLogsClient(31_337),
+      });
+      expect((await resumed.pollOnce()).fromBlock).toBe(13n);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the scan cursor in process memory when no cursor store is configured', async () => {
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      fromBlock: 10,
+      dryRun: true,
+      handlers: { '*': () => undefined },
+      publicClient: {
+        async getChainId() {
+          return 31_337;
+        },
+        async getBlockNumber() {
+          return 12n;
+        },
+        async getLogs() {
+          return [];
+        },
+      },
+    });
+
+    expect(watcher.describe().cursorStore).toBe('memory');
+    expect(watcher.describe().jobStore).toBe('memory');
+    await watcher.pollOnce();
+    expect(watcher.describe().nextBlock).toBe('13');
+  });
+
+  it('reports a failed cursor save as a failed round instead of pretending it was persisted', async () => {
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      fromBlock: 10,
+      dryRun: true,
+      handlers: { '*': () => undefined },
+      cursorStore: {
+        kind: 'failing',
+        async load() {
+          return undefined;
+        },
+        async save() {
+          throw new Error('disk full');
+        },
+      },
+      publicClient: {
+        async getChainId() {
+          return 31_337;
+        },
+        async getBlockNumber() {
+          return 12n;
+        },
+        async getLogs() {
+          return [];
+        },
+      },
+    });
+
+    // A round whose cursor could not be persisted must not report success: the
+    // next poll (or a restart) would silently rescan already-processed blocks.
+    await expect(watcher.pollOnce()).rejects.toThrow('disk full');
+  });
+
+  it('round-trips cursor state through the file cursor store and rejects corrupt state', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-cursor-store-'));
+    const cursorFile = join(dir, 'nested', 'cursor.json');
+    try {
+      const store = new FileStateMachineCursorStore(cursorFile);
+      expect(await store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] })).toBeUndefined();
+
+      await store.save(4_194_304n, { chainId: 31_337, stateMachines: [STATE_MACHINE.toLowerCase()] });
+      expect(await store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] })).toBe(4_194_304n);
+
+      await expect(store.load({ chainId: 1, stateMachines: [STATE_MACHINE] })).resolves.toBeUndefined();
+      await expect(store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE_V2] })).resolves.toBeUndefined();
+
+      await writeFile(cursorFile, '{not json', 'utf8');
+      // Corrupt state must fail loudly (like the jobs file reader), never be
+      // silently treated as "no cursor".
+      await expect(store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] }))
+        .rejects.toThrow();
+
+      await writeFile(cursorFile, JSON.stringify({
+        version: 1,
+        cursor: '-3',
+        chainId: 31_337,
+        stateMachines: [STATE_MACHINE.toLowerCase()],
+      }), 'utf8');
+      await expect(store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] }))
+        .rejects.toThrow(/non-negative integer/);
+
+      await expect(store.save(-1n, { chainId: 31_337, stateMachines: [STATE_MACHINE] }))
+        .rejects.toThrow(ValidationError);
+      expect(() => new FileStateMachineCursorStore(' ')).toThrow(ValidationError);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('skips and counts a log that cannot be normalized instead of aborting the round', async () => {

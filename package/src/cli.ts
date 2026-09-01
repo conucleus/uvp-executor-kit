@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFile, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Command } from 'commander';
 import type { PreparedSignalContainer, ProductSubmitIntent } from './product.js';
@@ -37,6 +38,7 @@ import {
 } from './validation.js';
 import {
   DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV,
+  FileStateMachineCursorStore,
   FileStateMachineJobStore,
   createStateMachineHandlersFromConfig,
   createStateMachineWatcher,
@@ -47,6 +49,8 @@ import {
   stateMachineJobToExecutorJobDTO,
   summarizeSupplierOps,
   submitStateMachineSignal,
+  type StateMachineCursorStore,
+  type StateMachineJobStore,
 } from './watcher.js';
 import {
   addressFromPrivateKey,
@@ -66,6 +70,9 @@ interface ChainWatchOptions {
   fromBlock?: string;
   pollIntervalMs?: string;
   jobsFile?: string;
+  /** ETH-07: file (default) persists jobs and the scan cursor under --state-dir; memory keeps the old in-process behavior. */
+  jobStore?: string;
+  stateDir?: string;
   dryRun?: boolean;
   waitForReceipt?: boolean;
 }
@@ -501,7 +508,7 @@ export function buildProgram(): Command {
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (jobId: string, options: JobsRetryOptions) => {
-      const watcher = await buildStateMachineWatcherFromCli(options);
+      const { watcher } = await buildStateMachineWatcherFromCli(options);
       const result = await retryStateMachineJob(watcher, jobId, {
         operator: options.operator,
         ...(options.reason ? { reason: options.reason } : {}),
@@ -536,14 +543,16 @@ export function buildProgram(): Command {
     .requiredOption('--config <path>', 'state machine handler config JSON path')
     .option('--wallet-address <address>', 'executor wallet address shown as submitSignal sender in dry-run')
     .option('--private-key-env <name>', 'environment variable containing the callback tx private key', DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV)
-    .option('--from-block <uint>', 'first block to scan')
-    .option('--jobs-file <path>', 'persist watcher jobs to a local JSON file')
+    .option('--from-block <uint>', 'first block to scan; on restart a persisted scan cursor takes precedence')
+    .option('--jobs-file <path>', 'watcher jobs JSON file (default: <state-dir>/jobs.json)')
+    .option('--state-dir <path>', `watcher state directory holding jobs.json and cursor.json (default: $${WATCHER_STATE_DIR_ENV} or ${DEFAULT_WATCHER_STATE_DIR})`)
+    .option('--job-store <file|memory>', 'watcher job store: file persists jobs and scan cursor across restarts, memory keeps them in-process', 'file')
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainWatchOptions) => {
-      const watcher = await buildStateMachineWatcherFromCli(options);
+      const { watcher, storage } = await buildStateMachineWatcherFromCli(options);
       const poll = await watcher.pollOnce();
-      console.log(stringifyForTransport({ watcher: watcher.describe(), poll }));
+      console.log(stringifyForTransport({ watcher: watcher.describe(), storage, poll }));
       // Honest exit code: submission errors folded into the poll result (or
       // failed/dead-lettered jobs) must not masquerade as a successful run.
       if (chainPollExecutionFailed(poll)) {
@@ -560,14 +569,16 @@ export function buildProgram(): Command {
     .requiredOption('--config <path>', 'state machine handler config JSON path')
     .option('--wallet-address <address>', 'executor wallet address shown as submitSignal sender in dry-run')
     .option('--private-key-env <name>', 'environment variable containing the callback tx private key', DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV)
-    .option('--from-block <uint>', 'first block to scan')
+    .option('--from-block <uint>', 'first block to scan; on restart a persisted scan cursor takes precedence')
     .option('--poll-interval-ms <ms>', 'polling interval in milliseconds')
-    .option('--jobs-file <path>', 'persist watcher jobs to a local JSON file')
+    .option('--jobs-file <path>', 'watcher jobs JSON file (default: <state-dir>/jobs.json)')
+    .option('--state-dir <path>', `watcher state directory holding jobs.json and cursor.json (default: $${WATCHER_STATE_DIR_ENV} or ${DEFAULT_WATCHER_STATE_DIR})`)
+    .option('--job-store <file|memory>', 'watcher job store: file persists jobs and scan cursor across restarts, memory keeps them in-process', 'file')
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainWatchOptions) => {
-      const watcher = await buildStateMachineWatcherFromCli(options);
-      console.log(stringifyForTransport({ watcher: watcher.describe() }));
+      const { watcher, storage } = await buildStateMachineWatcherFromCli(options);
+      console.log(stringifyForTransport({ watcher: watcher.describe(), storage }));
       const handle = await watcher.start();
       try {
         // A fatal watch-loop abort (consecutive poll failures) rejects handle.done and
@@ -682,7 +693,73 @@ async function readPreparedSignalContainerFile(path: string): Promise<PreparedSi
   return parsePreparedSignalContainer(parsed, 'prepared file');
 }
 
-async function buildStateMachineWatcherFromCli(options: ChainWatchOptions) {
+/** Default watcher state directory relative to the process working directory. */
+export const DEFAULT_WATCHER_STATE_DIR = './uvp-watcher-state';
+/** Env var overriding the default watcher state directory (the --state-dir flag wins over it). */
+export const WATCHER_STATE_DIR_ENV = 'UVP_WATCHER_STATE_DIR';
+
+/**
+ * ETH-07: what the CLI builds for watcher state. `file` (default) persists both
+ * the job store and the scan cursor so a restart resumes instead of rescanning;
+ * `memory` is the explicit escape hatch preserving the old in-process behavior.
+ */
+export type WatcherStorageSummary =
+  | { readonly mode: 'memory' }
+  | {
+    readonly mode: 'file';
+    readonly stateDir: string;
+    readonly jobsFile: string;
+    readonly cursorFile: string;
+  };
+
+export interface WatcherStorageResolution {
+  readonly summary: WatcherStorageSummary;
+  readonly jobStore?: StateMachineJobStore;
+  readonly cursorStore?: StateMachineCursorStore;
+}
+
+/**
+ * Resolve where the CLI keeps watcher state.
+ *
+ * - `--job-store memory` opts out of persistence entirely.
+ * - `--jobs-file <path>` keeps the legacy exact jobs path; the cursor lives
+ *   beside it as `<dir>/cursor.json` so one directory is one watcher state.
+ * - Otherwise jobs and cursor live in `--state-dir` (flag), then
+ *   UVP_WATCHER_STATE_DIR (env), then `./uvp-watcher-state`.
+ */
+export function resolveWatcherStorage(
+  options: Pick<ChainWatchOptions, 'jobStore' | 'stateDir' | 'jobsFile'>,
+  env: NodeJS.ProcessEnv = process.env,
+): WatcherStorageResolution {
+  const mode = options.jobStore ?? 'file';
+  if (mode !== 'file' && mode !== 'memory') {
+    throw new ValidationError(`--job-store must be "file" or "memory", got ${mode}`);
+  }
+  if (mode === 'memory') {
+    return { summary: { mode: 'memory' } };
+  }
+
+  const stateDir = options.jobsFile
+    ? dirname(resolve(options.jobsFile))
+    : resolve(options.stateDir ?? env[WATCHER_STATE_DIR_ENV] ?? DEFAULT_WATCHER_STATE_DIR);
+  const jobsFile = options.jobsFile ? resolve(options.jobsFile) : join(stateDir, 'jobs.json');
+  const cursorFile = join(stateDir, 'cursor.json');
+  return {
+    summary: {
+      mode: 'file',
+      stateDir,
+      jobsFile,
+      cursorFile,
+    },
+    jobStore: new FileStateMachineJobStore(jobsFile),
+    cursorStore: new FileStateMachineCursorStore(cursorFile),
+  };
+}
+
+async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Promise<{
+  watcher: ReturnType<typeof createStateMachineWatcher>;
+  storage: WatcherStorageSummary;
+}> {
   const config = await loadStateMachineHandlerConfig(options.config);
   const configuredStateMachines = config.stateMachines ?? [];
   const stateMachineAddress = options.stateMachine
@@ -691,7 +768,8 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions) {
   if (!stateMachineAddress) {
     throw new ValidationError('missing state machine address: pass --state-machine or set stateMachines[] in config');
   }
-  return createStateMachineWatcher({
+  const storage = resolveWatcherStorage(options);
+  const watcher = createStateMachineWatcher({
     rpcUrl: options.rpcUrl,
     stateMachineAddress,
     stateMachines: configuredStateMachines.length > 0
@@ -704,9 +782,10 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions) {
     handlers: createStateMachineHandlersFromConfig(config),
     ...(config.artifact ? { artifact: config.artifact } : {}),
     ...(config.retry ? { retry: config.retry } : {}),
-    ...(options.jobsFile ? { jobStore: new FileStateMachineJobStore(options.jobsFile) } : {}),
-        dryRun: options.dryRun ?? config.dryRun ?? false,
-        ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
+    ...(storage.jobStore ? { jobStore: storage.jobStore } : {}),
+    ...(storage.cursorStore ? { cursorStore: storage.cursorStore } : {}),
+    dryRun: options.dryRun ?? config.dryRun ?? false,
+    ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
     ...(options.fromBlock ? { fromBlock: options.fromBlock } : {}),
     ...(options.pollIntervalMs ? { pollIntervalMs: parsePositiveInteger(options.pollIntervalMs, 'pollIntervalMs') } : {}),
     onPoll: (poll) => {
@@ -716,6 +795,7 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions) {
       console.error(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
     },
   });
+  return { watcher, storage: storage.summary };
 }
 
 async function validateConfigFromCli(options: ConfigValidateOptions): Promise<Record<string, unknown>> {
