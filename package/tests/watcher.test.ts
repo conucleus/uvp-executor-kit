@@ -40,7 +40,7 @@ const PAYLOAD_HASH = `0x${'44'.repeat(32)}` as Hex;
 const BUYER_SOURCE_ID = keccak256(stringToBytes('buyer'));
 const EXEC_MAIN_CMP_ID = keccak256(stringToBytes('exec.main.cmp'));
 const STATE_MACHINE_FIXTURE = JSON.parse(
-  readFileSync(new URL('../../../uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.8.json', import.meta.url), 'utf8'),
+  readFileSync(new URL('../../../uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.9.json', import.meta.url), 'utf8'),
 ) as {
   readonly hashes: {
     readonly artifactHash: Hex;
@@ -64,7 +64,7 @@ describe('state machine chain watcher', () => {
     const event = decodeHookReadyLog(log, artifactIndex());
 
     expect(STATE_MACHINE_FIXTURE.hashes.artifactHash).toMatch(/^0x[0-9a-f]{64}$/);
-    expect(STATE_MACHINE_FIXTURE.events.HookReady.signature).toBe('HookReady(bytes32,bytes32,bytes32,bytes32)');
+    expect(STATE_MACHINE_FIXTURE.events.HookReady.signature).toBe('HookReady(bytes32,bytes32,bytes32,bytes32,bytes32)');
     expect(event).toMatchObject({
       type: 'HookReady',
       stateMachineAddress: STATE_MACHINE,
@@ -1726,14 +1726,15 @@ function hookReadyLog(address = STATE_MACHINE): StateMachineRawLog {
     data: encodeAbiParameters(
       [
         { type: 'bytes32' },
+        { type: 'bytes32' },
       ],
-      [HOOK_NAME_ID],
+      [STAGE_ID, HOOK_NAME_ID],
     ),
     topics: [
       keccak256(stringToHex(STATE_MACHINE_FIXTURE.events.HookReady.signature)),
+      PLAN_ID,
       ORDER_ID,
       HOOK_ID,
-      STAGE_ID,
     ],
     blockNumber: 12n,
     transactionHash: TX_HASH,

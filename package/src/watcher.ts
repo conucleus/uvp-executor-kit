@@ -37,7 +37,7 @@ export const DEFAULT_STATE_MACHINE_POLL_INTERVAL_MS = 4_000;
 export const MAX_CONSECUTIVE_POLL_FAILURES = 3;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as const;
 
-export const HOOK_READY_TOPIC = keccak256(stringToBytes('HookReady(bytes32,bytes32,bytes32,bytes32)'));
+export const HOOK_READY_TOPIC = keccak256(stringToBytes('HookReady(bytes32,bytes32,bytes32,bytes32,bytes32)'));
 
 export interface StateMachineRawLog {
   readonly data: Hex;
@@ -52,6 +52,8 @@ export interface StateMachineHookReady {
   readonly type: 'HookReady';
   readonly eventId: Hex;
   readonly stateMachineAddress?: Address;
+  /** PRD95 §10.1：订单级事件全部 plan-scoped。 */
+  readonly planId: Hex;
   readonly orderId: Hex;
   readonly hookId: Hex;
   readonly stageId: Hex;
@@ -1082,6 +1084,7 @@ export class StateMachineWatcher {
       // Sentinel ids: the real ids are unrecoverable from the undecodable log.
       // The event id (derived from transactionHash+logIndex) keeps job ids unique
       // per log, so distinct undecodable logs never collapse into one job.
+      planId: ZERO_BYTES32,
       orderId: ZERO_BYTES32,
       hookId: ZERO_BYTES32,
       stageId: ZERO_BYTES32,
@@ -1319,6 +1322,7 @@ export function decodeHookReadyLog(
   }
 
   const args = (decoded as { readonly args?: unknown }).args as {
+    readonly planId?: unknown;
     readonly orderId?: unknown;
     readonly hookId?: unknown;
     readonly stageId?: unknown;
@@ -1335,6 +1339,7 @@ export function decodeHookReadyLog(
     type: 'HookReady',
     eventId: hookReadyEventId(log),
     ...(stateMachineAddress ? { stateMachineAddress } : {}),
+    planId: normalizeBytes32(asString(args.planId, 'planId'), 'planId'),
     orderId: normalizeBytes32(asString(args.orderId, 'orderId'), 'orderId'),
     hookId,
     stageId: normalizeBytes32(asString(args.stageId, 'stageId'), 'stageId'),

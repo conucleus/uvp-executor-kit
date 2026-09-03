@@ -23,11 +23,11 @@ const RETRY_HOOK_ID = `0x${'22'.repeat(32)}` as Hex;
 const RETRY_STAGE_ID = `0x${'55'.repeat(32)}` as Hex;
 const RETRY_HOOK_NAME_ID = `0x${'66'.repeat(32)}` as Hex;
 const RETRY_TX_HASH = `0x${'33'.repeat(32)}` as Hex;
-const HOOK_READY_TOPIC = keccak256(stringToBytes('HookReady(bytes32,bytes32,bytes32,bytes32)'));
+const HOOK_READY_TOPIC = keccak256(stringToBytes('HookReady(bytes32,bytes32,bytes32,bytes32,bytes32)'));
 const RETRY_RAW_LOG = {
   address: RETRY_STATE_MACHINE,
-  data: encodeAbiParameters([{ type: 'bytes32' }], [RETRY_HOOK_NAME_ID]),
-  topics: [HOOK_READY_TOPIC, RETRY_ORDER_ID, RETRY_HOOK_ID, RETRY_STAGE_ID],
+  data: encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32' }], [RETRY_STAGE_ID, RETRY_HOOK_NAME_ID]),
+  topics: [HOOK_READY_TOPIC, RETRY_PLAN_ID, RETRY_ORDER_ID, RETRY_HOOK_ID],
   blockNumber: '12',
   transactionHash: RETRY_TX_HASH,
   logIndex: '7',
@@ -716,8 +716,8 @@ async function startChainStub(): Promise<{
 function hookReadyRpcLog() {
   return {
     address: RETRY_STATE_MACHINE,
-    topics: [HOOK_READY_TOPIC, RETRY_ORDER_ID, RETRY_HOOK_ID, RETRY_STAGE_ID],
-    data: encodeAbiParameters([{ type: 'bytes32' }], [RETRY_HOOK_NAME_ID]),
+    topics: [HOOK_READY_TOPIC, RETRY_PLAN_ID, RETRY_ORDER_ID, RETRY_HOOK_ID],
+    data: encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32' }], [RETRY_STAGE_ID, RETRY_HOOK_NAME_ID]),
     blockNumber: '0xc',
     blockHash: `0x${'ee'.repeat(32)}`,
     transactionHash: RETRY_TX_HASH,
