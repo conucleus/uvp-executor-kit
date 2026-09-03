@@ -88,6 +88,7 @@ uvp-executor chain-signal \
   --rpc-url http://127.0.0.1:8545 \
   --state-machine 0x0000000000000000000000000000000000000001 \
   --chain-id 31337 \
+  --plan-id 0x2222222222222222222222222222222222222222222222222222222222222222 \
   --order-id 0x1111111111111111111111111111111111111111111111111111111111111111 \
   --source logistics-provider-a \
   --stage export.customs \
@@ -381,7 +382,7 @@ ABI recorded in
 `uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.8.json`:
 
 - `HookReady(bytes32 orderId, bytes32 hookId, bytes32 stageId, bytes32 hookName)`;
-- `submitSignal(bytes32 orderId, bytes32 sourceId, bytes32 signalId, bytes32 payloadHash, bytes32 idempotencyKey)`.
+- `submitSignal(bytes32 planId, bytes32 orderId, bytes32 sourceId, bytes32 signalId, bytes32 payloadHash, bytes32 idempotencyKey)`.
 
 There is no payload-reference input in this ABI, and the contract is frozen:
 `chain-signal --payload-ref` is rejected up front instead of silently dropping
