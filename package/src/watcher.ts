@@ -840,9 +840,14 @@ export class StateMachineWatcher {
         } catch (error) {
           const classified = classifyExecutorKitError(error);
           lastError = classified;
+          // Fail-closed audit trail: a tx that was broadcast before the failure
+          // (receipt reverted or receipt wait threw) must stay visible on the
+          // job, mirroring how chain-services failedResult carries txHash.
+          const broadcastTxHash = broadcastTxHashFromError(error);
           jobSubmissions.push({
             signalIndex,
             attempt: attempts,
+            ...(broadcastTxHash ? { txHash: broadcastTxHash } : {}),
             error: classified,
           });
           currentJob = await this.updateJob(job.id, {
@@ -1411,6 +1416,23 @@ export function buildSubmitStateMachineSignalCall(
   return request;
 }
 
+/**
+ * Thrown after a submitSignal transaction was already broadcast but its receipt
+ * could not be confirmed: either the receipt came back non-success (reverted)
+ * or waiting for the receipt itself failed (timeout, RPC fault). The broadcast
+ * txHash rides on the error so callers can keep the already-broadcast
+ * transaction in the job audit trail instead of losing it to a retry.
+ */
+export class SubmitSignalReceiptError extends Error {
+  readonly txHash: Hex;
+
+  constructor(txHash: Hex, message: string, options?: { readonly cause?: unknown }) {
+    super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
+    this.name = 'SubmitSignalReceiptError';
+    this.txHash = txHash;
+  }
+}
+
 export async function submitStateMachineSignal(
   config: SubmitStateMachineSignalConfig,
   signal: StateMachineSignal,
@@ -1457,9 +1479,17 @@ export async function submitStateMachineSignal(
   });
   let confirmed: boolean | undefined;
   if (normalizedConfig.waitForReceipt && client.waitForTransactionReceipt) {
-    const receipt = await client.waitForTransactionReceipt({ hash: txHash });
+    let receipt: { readonly status?: 'success' | 'reverted' | string };
+    try {
+      receipt = await client.waitForTransactionReceipt({ hash: txHash });
+    } catch (error) {
+      // The tx is already on chain; never let a receipt-wait fault drop the
+      // hash of what was broadcast.
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new SubmitSignalReceiptError(txHash, `submitSignal transaction receipt wait failed for ${txHash}: ${detail}`, { cause: error });
+    }
     if (receipt.status && receipt.status !== 'success') {
-      throw new Error(`submitSignal transaction receipt status ${receipt.status}`);
+      throw new SubmitSignalReceiptError(txHash, `submitSignal transaction receipt status ${receipt.status}`);
     }
     confirmed = receipt.status === 'success';
   }
@@ -1881,6 +1911,30 @@ function toJobSubmission(
     request: result.request,
     ...(!result.dryRun ? { txHash: result.txHash } : {}),
   };
+}
+
+/**
+ * Recovers the hash of an already-broadcast transaction from a submission
+ * failure. Mirrors the classified-code walk in errors.ts: any Error along the
+ * cause chain may carry a `txHash` hex property (e.g. SubmitSignalReceiptError
+ * thrown after a successful broadcast whose receipt never confirmed).
+ */
+function broadcastTxHashFromError(error: unknown): Hex | undefined {
+  for (const current of walkSubmissionErrorChain(error)) {
+    const txHash = (current as { readonly txHash?: unknown }).txHash;
+    if (typeof txHash === 'string' && /^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+      return txHash as Hex;
+    }
+  }
+  return undefined;
+}
+
+function* walkSubmissionErrorChain(error: unknown): Generator<Error> {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current instanceof Error; depth += 1) {
+    yield current;
+    current = current.cause;
+  }
 }
 
 function statusForSuccessfulSubmissions(

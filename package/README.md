@@ -301,7 +301,10 @@ Watcher job semantics:
   defaults to `true`). A job whose transaction was broadcast but not yet
   receipted stays in the non-terminal `submitted` state, so later scans or
   manual retries can observe the real on-chain outcome instead of trusting
-  the broadcast.
+  the broadcast. When the receipt step itself fails after a successful
+  broadcast (reverted receipt, or waiting for the receipt throws), the error
+  carries the broadcast `txHash` and the job's `submissions` record keeps it,
+  so "already broadcast" transactions are never dropped from the audit trail.
 - Failures are classified from explicit machine-readable error codes first,
   then from well-known real-world error texts and contract revert data
   (for example `SignalAlreadyExists()`, `AccessControlUnauthorizedAccount`,

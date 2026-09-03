@@ -18,6 +18,7 @@ import {
   MAX_CONSECUTIVE_POLL_FAILURES,
   retryStateMachineJob,
   submitStateMachineSignal,
+  SubmitSignalReceiptError,
   stateMachineHandlerConfigToExecutorConfigDTO,
   stateMachineJobToExecutorJobDTO,
   summarizeSupplierOps,
@@ -1468,6 +1469,155 @@ describe('submitSignal receipt visibility', () => {
         publicClient: fakeReceiptClient(31_337, { status: 'reverted' }),
       }, SIGNAL)).rejects.toThrow(/submitSignal transaction receipt status reverted/);
       expect(stub.methods).toContain('eth_sendRawTransaction');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('carries the broadcast txHash on the error when the receipt reverts', async () => {
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const error = await submitStateMachineSignal({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: fakeReceiptClient(31_337, { status: 'reverted' }),
+      }, SIGNAL).catch((caught: unknown) => caught);
+
+      // The tx was broadcast (eth_sendRawTransaction returned TX_HASH); the
+      // receipt failure must not lose the hash of what already went on chain.
+      expect(error).toBeInstanceOf(SubmitSignalReceiptError);
+      expect((error as SubmitSignalReceiptError).txHash).toBe(TX_HASH);
+      expect((error as Error).message).toContain('submitSignal transaction receipt status reverted');
+      expect(stub.methods).toContain('eth_sendRawTransaction');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('carries the broadcast txHash when waiting for the receipt itself fails', async () => {
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const error = await submitStateMachineSignal({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async waitForTransactionReceipt() {
+            throw new Error('Request timed out.');
+          },
+        },
+      }, SIGNAL).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(SubmitSignalReceiptError);
+      expect((error as SubmitSignalReceiptError).txHash).toBe(TX_HASH);
+      // The wrapped transport fault stays classifiable as retryable network noise.
+      expect(classifyExecutorKitError(error)).toMatchObject({ kind: 'rpc_network', retryable: true });
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('keeps a broadcast-but-reverted tx in the job audit trail instead of dropping it', async () => {
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: fakeReceiptClient(31_337, { status: 'reverted' }),
+        artifact: artifactIndex(),
+        handlers: {
+          '*': (event) => ({
+            planId: PLAN_ID,
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          }),
+        },
+      });
+
+      const result = await watcher.handleLog(hookReadyLog());
+
+      // Non-retryable receipt revert dead-letters for human triage...
+      expect(result.job?.status).toBe('dead_letter');
+      // ...but the broadcast tx stays in the job's audit trail with the failure attached.
+      const submission = result.job?.submissions[0];
+      expect(submission?.txHash).toBe(TX_HASH);
+      expect(submission?.error?.message).toContain('receipt status reverted');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('records every retried broadcast txHash when receipt waits keep timing out', async () => {
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async waitForTransactionReceipt() {
+            throw new Error('Request timed out.');
+          },
+        },
+        artifact: artifactIndex(),
+        retry: { maxAttempts: 2, baseDelayMs: 0 },
+        handlers: {
+          '*': (event) => ({
+            planId: PLAN_ID,
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          }),
+        },
+      });
+
+      const result = await watcher.handleLog(hookReadyLog());
+
+      // Receipt-wait timeouts are retryable transport faults: exhausted retries
+      // land in `failed` so `jobs retry` stays available.
+      expect(result.job?.status).toBe('failed');
+      expect(result.job?.submissions).toHaveLength(2);
+      // Each attempt broadcast a tx, and each attempt's txHash stays visible in
+      // the audit trail instead of only the last successful bookkeeping entry.
+      for (const submission of result.job?.submissions ?? []) {
+        expect(submission.txHash).toBe(TX_HASH);
+        expect(submission.error?.kind).toBe('rpc_network');
+      }
     } finally {
       await stub.close();
       delete process.env[KEY_ENV];
