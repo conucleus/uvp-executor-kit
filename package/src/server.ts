@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -12,10 +12,12 @@ import { ValidationError } from './validation.js';
 
 export const DEFAULT_EXECUTOR_TOKEN_ENV = 'UVP_EXECUTOR_TOKEN';
 export const DEFAULT_CALLBACK_TOKEN_ENV = 'UVP_CALLBACK_TOKEN';
+export const DEFAULT_CALLBACK_HMAC_SECRET_ENV = 'UVP_CALLBACK_HMAC_SECRET';
 export const DEFAULT_CALLBACK_HOST_ALLOWLIST_ENV = 'UVP_EXECUTOR_CALLBACK_HOST_ALLOWLIST';
 /** Bounded in-process callback delivery retries before a job lands in callback_failed. */
 export const DEFAULT_CALLBACK_MAX_ATTEMPTS = 3;
 export const DEFAULT_CALLBACK_RETRY_BASE_DELAY_MS = 250;
+export const WEBHOOK_SIGNATURE_HEADER = 'x-uvp-webhook-signature';
 
 const LOOPBACK_CALLBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 
@@ -82,6 +84,8 @@ export interface ExecutorServerOptions {
   readonly handlers: Readonly<Record<string, RuntimeExecutorHandler>>;
   readonly executorToken: string;
   readonly callbackToken: string;
+  /** Optional shared secret for signing outbound callback bodies. */
+  readonly callbackHmacSecret?: string;
   readonly host?: string;
   readonly port?: number;
   readonly fetchImpl?: typeof fetch;
@@ -108,6 +112,7 @@ interface ExecutorRequestContext {
   readonly executorId: string;
   readonly executorToken: string;
   readonly callbackToken: string;
+  readonly callbackHmacSecret?: string;
   readonly callbackHostAllowlist: readonly string[];
   readonly handlers: Readonly<Record<string, RuntimeExecutorHandler>>;
   readonly fetchImpl: typeof fetch;
@@ -187,6 +192,7 @@ export async function startExecutorServer(options: ExecutorServerOptions): Promi
   const port = options.port ?? 0;
   const executorToken = requireNonEmpty(options.executorToken, 'executorToken');
   const callbackToken = requireNonEmpty(options.callbackToken, 'callbackToken');
+  const callbackHmacSecret = options.callbackHmacSecret?.trim() || undefined;
   const callbackHostAllowlist = options.callbackHostAllowlist ?? parseCallbackHostAllowlist(process.env[DEFAULT_CALLBACK_HOST_ALLOWLIST_ENV]);
   const now = options.now ?? (() => new Date().toISOString());
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -199,6 +205,7 @@ export async function startExecutorServer(options: ExecutorServerOptions): Promi
         executorId: options.executorId,
         executorToken,
         callbackToken,
+        ...(callbackHmacSecret ? { callbackHmacSecret } : {}),
         callbackHostAllowlist,
         handlers: options.handlers,
         fetchImpl,
@@ -305,7 +312,7 @@ async function routeExecutorRequest(
 }
 
 async function processDispatch(
-  context: Pick<ExecutorRequestContext, 'fetchImpl' | 'now' | 'jobStore' | 'callbackToken' | 'callbackHostAllowlist' | 'callbackMaxAttempts' | 'callbackRetryBaseDelayMs'>,
+  context: Pick<ExecutorRequestContext, 'fetchImpl' | 'now' | 'jobStore' | 'callbackToken' | 'callbackHmacSecret' | 'callbackHostAllowlist' | 'callbackMaxAttempts' | 'callbackRetryBaseDelayMs'>,
   job: ExecutorJob,
   dispatch: ExecutorDispatchRequest,
   handler: RuntimeExecutorHandler,
@@ -359,7 +366,7 @@ async function processDispatch(
  * reported (with an error log) back to the caller.
  */
 async function deliverSignalCallback(
-  context: Pick<ExecutorRequestContext, 'fetchImpl' | 'callbackToken' | 'callbackHostAllowlist' | 'callbackMaxAttempts' | 'callbackRetryBaseDelayMs'>,
+  context: Pick<ExecutorRequestContext, 'fetchImpl' | 'callbackToken' | 'callbackHmacSecret' | 'callbackHostAllowlist' | 'callbackMaxAttempts' | 'callbackRetryBaseDelayMs'>,
   callbackUrl: string,
   signal: RuntimeSignalEnvelope,
   signalIndex: number,
@@ -367,7 +374,7 @@ async function deliverSignalCallback(
   let lastError: unknown;
   for (let attempt = 1; attempt <= context.callbackMaxAttempts; attempt += 1) {
     try {
-      await postSignalCallback(context.fetchImpl, callbackUrl, context.callbackToken, signal, context.callbackHostAllowlist);
+      await postSignalCallback(context.fetchImpl, callbackUrl, context.callbackToken, context.callbackHmacSecret, signal, context.callbackHostAllowlist);
       return { signalIndex, delivered: true, attempts: attempt };
     } catch (error) {
       lastError = error;
@@ -385,21 +392,42 @@ async function postSignalCallback(
   fetchImpl: typeof fetch,
   callbackUrl: string,
   callbackToken: string,
+  callbackHmacSecret: string | undefined,
   signal: RuntimeSignalEnvelope,
   callbackHostAllowlist: readonly string[],
 ): Promise<void> {
   assertCallbackUrlAllowed(callbackUrl, callbackHostAllowlist);
+  const body = JSON.stringify({ signal });
   const response = await fetchImpl(callbackUrl, {
     method: 'POST',
     headers: {
       'authorization': `Bearer ${callbackToken}`,
       'content-type': 'application/json',
+      ...(callbackHmacSecret ? { [WEBHOOK_SIGNATURE_HEADER]: `sha256=${createHmac('sha256', callbackHmacSecret).update(body).digest('hex')}` } : {}),
     },
-    body: JSON.stringify({ signal }),
+    body,
   });
   if (!response.ok) {
     throw new Error(`callback endpoint failed with ${response.status}: ${await response.text()}`);
   }
+}
+
+/**
+ * Verify the `x-uvp-webhook-signature` value over the exact raw request body.
+ * Receivers should call this before parsing JSON and reject false, malformed,
+ * or missing signatures.  Constant-time comparison prevents timing leaks.
+ */
+export function verifyWebhookSignature(
+  body: string | Uint8Array,
+  signature: string | undefined,
+  secret: string,
+): boolean {
+  if (!signature || !secret) return false;
+  const match = /^sha256=([0-9a-f]{64})$/i.exec(signature.trim());
+  if (!match) return false;
+  const expected = createHmac('sha256', secret).update(body).digest();
+  const supplied = Buffer.from(match[1]!, 'hex');
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 
 function normalizeExecutorConfig(value: unknown): ExecutorConfig {

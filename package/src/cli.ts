@@ -24,6 +24,7 @@ import { runProductDoctor } from './doctor.js';
 import { stringifyForTransport } from './transport.js';
 import {
   createHandlersFromExecutorConfig,
+  DEFAULT_CALLBACK_HMAC_SECRET_ENV,
   DEFAULT_CALLBACK_TOKEN_ENV,
   DEFAULT_EXECUTOR_TOKEN_ENV,
   loadExecutorConfig,
@@ -157,6 +158,8 @@ interface ServeOptions {
   executorTokenEnv: string;
   callbackToken?: string;
   callbackTokenEnv: string;
+  callbackHmacSecret?: string;
+  callbackHmacSecretEnv: string;
   readyJson?: boolean;
 }
 
@@ -400,14 +403,18 @@ export function buildProgram(): Command {
     .option('--executor-token-env <name>', 'env var containing executor dispatch bearer token', DEFAULT_EXECUTOR_TOKEN_ENV)
     .option('--callback-token <token>', 'bearer token for executor callback endpoint')
     .option('--callback-token-env <name>', 'env var containing executor callback bearer token', DEFAULT_CALLBACK_TOKEN_ENV)
+    .option('--callback-hmac-secret <secret>', 'optional shared secret for signing callback bodies')
+    .option('--callback-hmac-secret-env <name>', 'env var containing callback HMAC secret', DEFAULT_CALLBACK_HMAC_SECRET_ENV)
     .option('--ready-json', 'print a ready JSON line after the server starts')
     .action(async (options: ServeOptions) => {
       const config = await loadExecutorConfig(options.config);
+      const callbackHmacSecret = options.callbackHmacSecret ?? process.env[options.callbackHmacSecretEnv];
       const handle = await startExecutorServer({
         executorId: config.executorId,
         handlers: createHandlersFromExecutorConfig(config),
         executorToken: readSecret(options.executorToken, options.executorTokenEnv, 'executor token'),
         callbackToken: readSecret(options.callbackToken, options.callbackTokenEnv, 'callback token'),
+        ...(callbackHmacSecret ? { callbackHmacSecret } : {}),
         host: options.host,
         port: parsePort(options.port),
       });

@@ -1,4 +1,5 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createHmac } from 'node:crypto';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -12,6 +13,7 @@ import {
   loadExecutorConfig,
   parseCallbackHostAllowlist,
   startExecutorServer,
+  verifyWebhookSignature,
   type ExecutorJob,
 } from '../src/server.js';
 
@@ -28,6 +30,15 @@ const effect = {
 } as const;
 
 describe('executor HTTP server', () => {
+  it('provides fail-closed constant-time webhook HMAC verification for receivers', () => {
+    const body = '{"signal":{"orderId":"order-1"}}';
+    const signature = `sha256=${createHmac('sha256', callbackToken).update(body).digest('hex')}`;
+    expect(verifyWebhookSignature(body, signature, callbackToken)).toBe(true);
+    expect(verifyWebhookSignature(body, signature.replace(/.$/, '0'), callbackToken)).toBe(false);
+    expect(verifyWebhookSignature(body, undefined, callbackToken)).toBe(false);
+    expect(verifyWebhookSignature(`${body} `, signature, callbackToken)).toBe(false);
+  });
+
   it('accepts dispatches and posts callback signals to a webhook endpoint', async () => {
     const callbackBodies: unknown[] = [];
     const callbackEndpoint = createServer((request, response) => {

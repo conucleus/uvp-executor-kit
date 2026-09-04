@@ -1155,7 +1155,11 @@ export async function retryStateMachineJob(
     ...(options.reason ? { reason: options.reason } : {}),
   });
 
-  if (job.attempts >= job.maxAttempts) {
+  // `maxAttempts` limits one automatic processing run.  A manual retry is an
+  // explicit new run, so an exhausted retryable failure must get a fresh
+  // budget; otherwise every failed job is immediately dead-lettered and the
+  // documented `jobs retry` escape hatch is a dead channel.
+  if (job.attempts >= job.maxAttempts && job.status !== 'failed') {
     const error = classifyExecutorKitError(
       new Error(`retry limit reached for job ${normalizedJobId}: ${job.attempts}/${job.maxAttempts}`),
     );
@@ -1179,6 +1183,7 @@ export async function retryStateMachineJob(
   await watcher.config.jobStore.update(normalizedJobId, {
     status: 'detected',
     updatedAt: at,
+    ...(job.status === 'failed' ? { attempts: 0 } : {}),
     manualActions,
     clearLastError: true,
   });

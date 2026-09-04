@@ -266,7 +266,11 @@ async function checkTaskReadiness(
     let nextAction: TaskReadinessResult['nextAction'] = 'blocked';
     let nextActionLabel = 'This task is not ready for action.';
 
-    if (summary.status === 'confirmed' || summary.status === 'completed') {
+    // Product's frozen TaskStatus completion enum is `done`.  Keep the
+    // legacy aliases for compatibility with older Product API deployments,
+    // but never omit the canonical completion state or proof guidance becomes
+    // unreachable for completed tasks.
+    if (summary.status === 'done' || summary.status === 'confirmed' || summary.status === 'completed') {
       nextAction = 'proof';
       nextActionLabel = 'Task is complete. Run product proof to verify on-chain confirmation.';
     } else if (canSubmit) {
@@ -288,7 +292,7 @@ async function checkTaskReadiness(
 
     return {
       check: {
-        ok: canSubmit || summary.status === 'confirmed' || summary.status === 'completed',
+        ok: canSubmit || summary.status === 'done' || summary.status === 'confirmed' || summary.status === 'completed',
         label: 'task-readiness',
         detail: nextActionLabel,
         latencyMs,

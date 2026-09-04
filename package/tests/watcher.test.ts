@@ -1009,15 +1009,15 @@ describe('state machine chain watcher', () => {
       expect(persistedAfterFailure?.status).toBe('failed');
       expect(persistedAfterFailure?.attempts).toBe(2);
 
-      // A manual retry past the recorded attempt budget dead-letters with the
-      // operator action preserved, instead of silently re-running.
+      // A manual retry starts a fresh bounded run even after automatic
+      // attempts are exhausted; it must not be a dead channel.
       const overLimit = await retryStateMachineJob(failedWatcher, jobId, {
         operator: 'ops@example.com',
         reason: 'pushing past the attempt budget',
         now: () => '2026-04-28T00:00:30.000Z',
       });
-      expect(overLimit.job?.status).toBe('dead_letter');
-      expect(overLimit.error?.message).toContain('retry limit reached');
+      expect(overLimit.job?.status).toBe('failed');
+      expect(overLimit.error?.kind).toBe('rpc_network');
       const persistedAfterOverLimit = await store.get(jobId);
       expect(persistedAfterOverLimit?.manualActions).toEqual([
         {
@@ -1032,9 +1032,10 @@ describe('state machine chain watcher', () => {
           supplierId: 'logistics-provider-a',
           activeJobs: 0,
           failedJobs: 1,
-          confirmedSignals: 0,
-        });
+        confirmedSignals: 0,
+      });
 
+      // Operators can still explicitly dead-letter the reattempted job.
       const deadLetter = await deadLetterStateMachineJob(store, jobId, {
         operator: 'ops@example.com',
         reason: 'manual review required',
