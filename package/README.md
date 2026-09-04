@@ -377,12 +377,16 @@ order-level authorization, participant wallet signatures, and contract checks.
 
 ## ABI Boundary
 
-`createStateMachineWatcher` uses the fixed `UVPStateMachine v0.8` compact-hook
+`createStateMachineWatcher` uses the fixed `UVPStateMachine v0.9` compact-hook
 ABI recorded in
-`uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.8.json`:
+`uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.9.json`:
 
-- `HookReady(bytes32 orderId, bytes32 hookId, bytes32 stageId, bytes32 hookName)`;
+- `HookReady(bytes32 planId, bytes32 orderId, bytes32 hookId, bytes32 stageId, bytes32 hookName)`;
 - `submitSignal(bytes32 planId, bytes32 orderId, bytes32 sourceId, bytes32 signalId, bytes32 payloadHash, bytes32 idempotencyKey)`.
+
+`planId` is part of the event and submit boundary. It must be retained with the
+watcher job and never inferred from a bare `orderId`; the same state machine can
+contain the same order id under different plans.
 
 There is no payload-reference input in this ABI, and the contract is frozen:
 `chain-signal --payload-ref` is rejected up front instead of silently dropping
