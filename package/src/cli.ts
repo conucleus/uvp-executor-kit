@@ -622,7 +622,7 @@ export function buildProgram(): Command {
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainSignalOptions) => {
       if (options.payloadRef) {
-        // The frozen UVPStateMachine v0.8 ABI has no payloadRef input, so this
+        // The frozen UVPStateMachine v0.9 ABI has no payloadRef input, so this
         // flag would be silently dropped and the operator would walk away with
         // a "submitted" success that never carried the reference. Fail loudly;
         // only the 32-byte payloadHash goes on chain.
