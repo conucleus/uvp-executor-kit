@@ -567,7 +567,7 @@ describe('Product API mode', () => {
   });
 });
 
-describe('request id passthrough (ETH-10)', () => {
+describe('request id passthrough', () => {
   it('attaches the server x-request-id header to task, prepare, submit, and proof results', async () => {
     const fetch: ProductApiFetch = async (url) => {
       if (url.includes('/product/tasks?')) {
@@ -645,9 +645,9 @@ describe('request id passthrough (ETH-10)', () => {
     })).resolves.toMatchObject({ submissionId: 'sub_hdr', requestId: 'req-header-obj-1' });
   });
 
-  it('ignores the retired x-uvp-request-id response header (canonical x-request-id only)', async () => {
+  it('does not read the request id from unknown request-id headers (only x-request-id is canonical)', async () => {
     // The server stamps responses exclusively with x-request-id (api/server.ts);
-    // the historical x-uvp-request-id response fallback was purged.
+    // other request-id-shaped headers must never populate requestId.
     const fetch: ProductApiFetch = async () => ({
       ok: true,
       status: 200,
@@ -777,7 +777,7 @@ describe('frozen typed-data validation', () => {
   });
 
   it('rejects a prepared submission whose signature message is missing or zeroing the plan id', () => {
-    // Audit #10: the signature commits to (planId, orderId). A prepared
+    // the signature commits to (planId, orderId). A prepared
     // submission without the plan field, or with the builder's zero placeholder,
     // could only produce a signature the chain rejects — fail at parse/sign time.
     const base = () => structuredClone(preparedSubmission()) as PreparedSignalContainer;

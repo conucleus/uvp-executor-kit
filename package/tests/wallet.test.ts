@@ -38,8 +38,8 @@ describe('wallet helpers', () => {
   });
 
   it('re-asserts owner-only permissions when overwriting an existing env file', async () => {
-    // Cluster K fix: writeFile's mode only applies to files it creates, so
-    // --overwrite kept the pre-existing (possibly loose) permissions.
+    // writeFile's mode only applies to files it creates, so
+    // --overwrite must re-assert owner-only permissions on the existing file.
     const dir = await mkdtemp(join(tmpdir(), 'uvp-wallet-overwrite-'));
     try {
       const envFile = join(dir, '.env.local');

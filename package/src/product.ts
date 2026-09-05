@@ -21,7 +21,7 @@ export type ProductSubmitIntent = 'confirm_stage' | 'reject_stage' | 'raise_disp
 const ZERO_BYTES32 = `0x${'0'.repeat(64)}` as const;
 
 /**
- * ETH-10: the chain-services API server stamps every response (success and
+ * The chain-services API server stamps every response (success and
  * error) with this header so executor-side results, errors, and logs can be
  * correlated end to end with server-side request logs.
  */
@@ -141,7 +141,7 @@ export interface ProductSignalContainer extends Record<string, unknown> {
   readonly orderId: string;
   readonly title: string;
   readonly status: string;
-  /** ETH-10: x-request-id echoed by the server response that produced this object. */
+  /** x-request-id echoed by the server response that produced this object. */
   readonly requestId?: string;
 }
 
@@ -166,7 +166,7 @@ export interface PreparedSignalContainer extends Record<string, unknown> {
   readonly humanSummary: ProductSubmitHumanSummary;
   readonly typedData: ProductSubmitTypedData;
   readonly evidence: readonly Record<string, unknown>[];
-  /** ETH-10: x-request-id echoed by the server response that produced this object. */
+  /** x-request-id echoed by the server response that produced this object. */
   readonly requestId?: string;
 }
 
@@ -176,7 +176,7 @@ export interface SubmittedSignalContainer extends Record<string, unknown> {
   readonly taskId: string;
   readonly orderId: string;
   readonly status: string;
-  /** ETH-10: x-request-id echoed by the server response that produced this object. */
+  /** x-request-id echoed by the server response that produced this object. */
   readonly requestId?: string;
 }
 
@@ -256,7 +256,7 @@ export class ProductApiError extends ExecutorKitError {
   readonly code?: string;
   readonly details?: unknown;
   /**
-   * ETH-10: request id of the failed call, taken from the x-request-id response
+   * request id of the failed call, taken from the x-request-id response
    * header (falling back to the id the server embeds in error bodies) so the
    * failure can be matched against server-side logs.
    */
@@ -291,7 +291,7 @@ export async function listSignalContainers(input: ListSignalContainersInput): Pr
     throw new ValidationError('Product tasks response must contain a tasks array');
   }
   // The transport returns a bare array, so every task carries the response's
-  // request id (ETH-10) to keep "which request produced this row" answerable.
+  // request id to keep "which request produced this row" answerable.
   return tasks.map((task, index) => attachResponseRequestId(parseSignalContainer(task, `tasks[${index}]`), requestId));
 }
 
@@ -587,7 +587,7 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
   requireExactKeys(message, PRODUCT_SUBMIT_TYPED_DATA_FIELDS.map((field) => field.name), `${label}.message`);
   const planId = normalizeBytes32(requiredString(message, 'planId', `${label}.message`), `${label}.message.planId`);
   if (planId === ZERO_BYTES32) {
-    // Audit #10: the signature commits to (planId, orderId) and the contract
+    // The signature commits to (planId, orderId) and the contract
     // verifies plan existence, so a zero-planId prepared submission could only
     // produce a signature that can never land. The protocol-bindings builder's
     // optional-planId zero default exists solely for shape-checking gates; a
@@ -695,7 +695,7 @@ function requireExactKeys(
 
 /**
  * Internal transport result: the parsed JSON body plus the server's request id
- * (ETH-10) read from the response headers when present.
+  * Read from the response headers when present.
  */
 interface ProductApiJsonResult {
   readonly body: unknown;
@@ -808,7 +808,7 @@ function productApiErrorFromResponse(response: ProductApiFetchResponse, payload:
   const message = typeof record.message === 'string' && record.message.trim().length > 0
     ? record.message
     : `Product API request failed with HTTP ${response.status}`;
-  // ETH-10: the x-request-id response header is authoritative; the id the
+  // The x-request-id response header is authoritative; the id the
   // server embeds in error bodies is the fallback when headers are unavailable.
   const requestId = productApiResponseRequestId(response)
     ?? (typeof record.requestId === 'string' && record.requestId.trim().length > 0 ? record.requestId.trim() : undefined);
@@ -816,7 +816,7 @@ function productApiErrorFromResponse(response: ProductApiFetchResponse, payload:
 }
 
 /**
- * ETH-10: read the server's request id from the response headers. Supports both
+ * Read the server's request id from the response headers. Supports both
  * fetch-like header objects (`headers.get(name)`, as returned by real fetch
  * implementations) and plain records with any key casing.
  */
@@ -852,7 +852,7 @@ function readResponseHeader(response: ProductApiFetchResponse, name: string): st
 }
 
 /**
- * ETH-10: attach the response's request id to a parsed result object without
+ * Attach the response's request id to a parsed result object without
  * disturbing shapes when the header was absent (the requestId key is simply
  * not added).
  */

@@ -12,7 +12,7 @@ Two co-equal signal-producer surfaces:
 - **Chain-native**: watch `UVPStateMachine.HookReady` events, route ready hooks to
   configured handlers, and submit authorized `submitSignal` callback transactions
   from a participant wallet.
-- **Product API (PRD105 P0)**: the non-browser signal-producer gate for enterprise
+- **Product API**: the non-browser signal-producer gate for enterprise
   scripts, supervised AI agents, and future MCP clients. All producers dock at the
   same Product API prepare/sign/submit/proof boundary.
 
@@ -77,7 +77,7 @@ to `./uvp-watcher-state`, overridden by `--state-dir` or the
 `UVP_WATCHER_STATE_DIR` env var; `--jobs-file <path>` places the jobs file
 exactly at that path with the cursor beside it. The startup log reports the
 resolved storage mode and paths. Pass `--job-store memory` to keep jobs and the
-cursor in process memory (the pre-ETH-07 behavior); a persisted cursor whose
+cursor in process memory; a persisted cursor whose
 chain id or state-machine set no longer matches the configuration is ignored
 and rewritten on the next successful round.
 
@@ -99,9 +99,9 @@ uvp-executor chain-signal \
 ```
 
 In the three chain examples above, `--dry-run` is an explicit test aid: the
-flag only builds and prints what would be sent without broadcasting. The
-behavior of the commands is unchanged — without the flag they perform the real
-action, and real execution is always the default.
+flag only builds and prints what would be sent without broadcasting. Without
+the flag the commands perform the real action, and real execution is always
+the default.
 
 Use Product API task mode for participant-facing signal containers:
 

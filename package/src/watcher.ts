@@ -52,7 +52,7 @@ export interface StateMachineHookReady {
   readonly type: 'HookReady';
   readonly eventId: Hex;
   readonly stateMachineAddress?: Address;
-  /** PRD95 §10.1：订单级事件全部 plan-scoped。 */
+  /** 订单级事件全部 plan-scoped。 */
   readonly planId: Hex;
   readonly orderId: Hex;
   readonly hookId: Hex;
@@ -69,7 +69,7 @@ export interface StateMachineHookReady {
 export interface StateMachineSignal {
   readonly orderId: Hex | string;
   /**
-   * Audit #10: the state machine ABI is plan-scoped, so every signal carries the
+   * The state machine ABI is plan-scoped, so every signal carries the
    * owning order's planId as the first submitSignal argument. The zero
    * placeholder is rejected before signing/broadcasting: it can never pass the
    * on-chain (planId, orderId) existence check.
@@ -167,7 +167,7 @@ export interface StateMachineWatcherConfig extends SubmitStateMachineSignalConfi
   readonly retry?: StateMachineRetryConfig;
   readonly jobStore?: StateMachineJobStore;
   /**
-   * ETH-07: optional durable store for the scan cursor (the next block to scan).
+   * Optional durable store for the scan cursor (the next block to scan).
    * When configured, the watcher persists the cursor after every successful
    * round and restores it before the first poll, so a restart resumes instead
    * of rescanning from fromBlock. Without it the cursor stays in process memory.
@@ -406,7 +406,7 @@ export interface StateMachineJobPatch {
   readonly updatedAt: string;
   readonly attempts?: number;
   readonly matchedKey?: string;
-  /** Audit #10: records the order planId once it is known so retries can resubmit. */
+  /** Records the order planId once it is known so retries can resubmit. */
   readonly planId?: Hex;
   readonly submissions?: readonly StateMachineJobSubmission[];
   readonly lastError?: ClassifiedExecutorKitError;
@@ -590,7 +590,7 @@ export interface StateMachineCursorContext {
 }
 
 /**
- * ETH-07: durable store for the watcher scan cursor (the next block to scan).
+ * Durable store for the watcher scan cursor (the next block to scan).
  * The job-store abstraction does not fit: jobs are keyed by bytes32 ids with
  * required event fields, while the cursor is a single block number bound to the
  * watcher identity above.
@@ -701,7 +701,7 @@ export class StateMachineWatcher {
   }
 
   /**
-   * ETH-07: load the persisted scan cursor once per watcher instance before the
+   * Load the persisted scan cursor once per watcher instance before the
    * first poll. A restored cursor replaces the initial fromBlock so a restarted
    * watcher resumes where the previous process stopped instead of rescanning
    * the already-processed range (job idempotency absorbs that today, but the
@@ -963,7 +963,7 @@ export class StateMachineWatcher {
 
     const submissions = [];
     const signals = normalizeHandlerResult(handlerResult);
-    // Audit #10 + cluster K: the plan-scoped submitSignal ABI requires the order
+    // The plan-scoped submitSignal ABI requires the order
     // planId. Resolution order: an explicit per-signal planId (handler-supplied
     // or the new config `signals[].planId` field) wins; otherwise the planId
     // decoded from the HookReady event itself (the event is the authoritative
@@ -987,9 +987,9 @@ export class StateMachineWatcher {
     // Resume support: a signal with a prior real (non-dry-run) broadcast or a
     // duplicate_signal dedupe fact is already delivered on chain. Re-running
     // the job — manual `jobs retry` or a rescan of an open job — must continue
-    // with the next pending signal instead of replaying delivered ones, which
-    // previously dead-locked multi-signal jobs in `ignored` on the first
-    // duplicate.
+    // with the next pending signal instead of replaying delivered ones;
+    // replaying them would dead-lock multi-signal jobs in `ignored` on the
+    // first duplicate.
     const deliveredSignalIndexes = deliveredSignalIndexesFromSubmissions(currentJob.submissions);
     for (const [index, signal] of signals.entries()) {
       if (deliveredSignalIndexes.has(index)) {
@@ -1816,7 +1816,7 @@ function normalizeRetryConfig(config: StateMachineRetryConfig | Record<string, u
 }
 
 function normalizeStateMachineSignal(signal: StateMachineSignal): StateMachineSignalCallArgs {
-  // Audit #10: submitSignal is plan-scoped. Unlike the payloadHash zero
+  // submitSignal is plan-scoped. Unlike the payloadHash zero
   // sentinel below, a zero planId is NOT a legitimate encoding: the contract
   // verifies that (planId, orderId) exists, so the zero placeholder can only
   // produce a transaction that reverts. Refuse to build it instead of letting

@@ -43,7 +43,7 @@ describe('participant entrypoint', () => {
       deadline,
     });
 
-    // Audit #10: UVPStateMachineSignal is plan-scoped — planId is the first
+    // UVPStateMachineSignal is plan-scoped — planId is the first
     // field of the signed message and callers must pass the real order planId
     // instead of relying on the builder's zero placeholder default.
     expect(typedData).toEqual({
@@ -141,7 +141,7 @@ describe('participant entrypoint', () => {
       functionName: 'submitSignalFor',
       chainId: 31337,
     });
-    // Audit #10: planId is the first ABI argument of submitSignalFor.
+    // planId is the first ABI argument of submitSignalFor.
     expect(call.args).toEqual([
       planId,
       orderId,

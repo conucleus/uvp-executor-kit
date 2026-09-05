@@ -71,7 +71,7 @@ interface ChainWatchOptions {
   fromBlock?: string;
   pollIntervalMs?: string;
   jobsFile?: string;
-  /** ETH-07: file (default) persists jobs and the scan cursor under --state-dir; memory keeps the old in-process behavior. */
+  /** file (default) persists jobs and the scan cursor under --state-dir; memory keeps jobs and cursor in process memory. */
   jobStore?: string;
   stateDir?: string;
   dryRun?: boolean;
@@ -706,9 +706,9 @@ export const DEFAULT_WATCHER_STATE_DIR = './uvp-watcher-state';
 export const WATCHER_STATE_DIR_ENV = 'UVP_WATCHER_STATE_DIR';
 
 /**
- * ETH-07: what the CLI builds for watcher state. `file` (default) persists both
+ * What the CLI builds for watcher state. `file` (default) persists both
  * the job store and the scan cursor so a restart resumes instead of rescanning;
- * `memory` is the explicit escape hatch preserving the old in-process behavior.
+ * `memory` keeps jobs and the cursor in process memory.
  */
 export type WatcherStorageSummary =
   | { readonly mode: 'memory' }

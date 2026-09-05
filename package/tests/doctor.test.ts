@@ -382,16 +382,15 @@ describe('Product API doctor', () => {
     });
     expect(report.taskReadiness?.nextActionLabel).toContain('Required evidence not yet uploaded');
     expect(report.ok).toBe(false);
-    // The embedded readiness check mirrors the verdict instead of being
-    // hardcoded ok:true: consumers reading only the nested check must see the
-    // blocked state.
+    // The embedded readiness check mirrors the verdict: consumers reading
+    // only the nested check must see the blocked state.
     expect(report.taskReadiness?.ok).toBe(false);
     expect(report.taskReadiness?.check.ok).toBe(false);
   });
 
   it('reports next action as proof for a task completed with the canonical done status', async () => {
-    // Cluster K fix: Product's frozen completion enum is `done`; readiness.ok
-    // used to omit it, so a completed task reported not-ready.
+    // Product's frozen completion enum includes `done`; readiness.ok must
+    // count it as complete, otherwise a completed task reports not-ready.
     const fetch: ProductApiFetch = async (url) => {
       if (!url.includes('/product/')) {
         return jsonResponse({ service: 'chain-services' });

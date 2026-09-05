@@ -444,7 +444,7 @@ describe('honest execution exit codes', () => {
   });
 });
 
-describe('watcher state storage (ETH-07)', () => {
+describe('watcher state storage', () => {
   it('defaults to the file-backed state directory and honors flag, env, and jobs-file overrides', () => {
     const previousEnv = process.env[WATCHER_STATE_DIR_ENV];
     delete process.env[WATCHER_STATE_DIR_ENV];

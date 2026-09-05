@@ -399,9 +399,9 @@ describe('executor HTTP server', () => {
   });
 
   it('resolves concurrent duplicate dispatches to exactly one accepted job', async () => {
-    // Cluster K fix: dispatch idempotency used to be a read-then-create pair,
-    // so two racing dispatches could both pass the existence check. The store
-    // create is now a conditional write.
+    // Dispatch idempotency requires a conditional store create: a
+    // read-then-create pair would let two racing dispatches both pass the
+    // existence check.
     let outboundCalls = 0;
     const executor = await startExecutorServer({
       executorId: 'exec-executor',
@@ -445,9 +445,9 @@ describe('executor HTTP server', () => {
   });
 
   it('never follows a callback redirect and never replays the bearer to the redirect target', async () => {
-    // Cluster K fix: the callback fetch used the default redirect:"follow", so
-    // a 3xx answer replayed the Authorization bearer to whatever host the
-    // redirect pointed at. Redirects are now manual and count as failures.
+    // The callback fetch must not follow redirects: following a 3xx answer
+    // would replay the Authorization bearer to whatever host the
+    // redirect pointed at. Redirects are manual and count as failures.
     const seen: { path: string; authorization?: string }[] = [];
     const redirector = createServer((request, response) => {
       seen.push({

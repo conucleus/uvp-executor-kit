@@ -145,7 +145,7 @@ describe('state machine chain watcher', () => {
     expect(result.job?.matchedKey).toBe('exec.main#START');
     expect(matchedKeys).toEqual(['exec.main#START']);
     expect(submission.request.functionName).toBe('submitSignal');
-    // Audit #10: planId is the first submitSignal argument.
+    // planId is the first submitSignal argument.
     expect(submission.request.args).toEqual([
       PLAN_ID,
       ORDER_ID,
@@ -1136,10 +1136,11 @@ describe('state machine chain watcher', () => {
   });
 
   it('resumes a partially delivered multi-signal job from the next pending signal instead of replaying', async () => {
-    // Cluster K fix: after a partial multi-signal failure, `jobs retry` used to
-    // resubmit every signal from index 0; the chain answered the already
-    // delivered one with SignalAlreadyExists and the job parked in terminal
-    // `ignored`, which `jobs retry` rejects — a dead-locked job. The retry now
+    // Retry resume contract: after a partial multi-signal failure, retrying
+    // must not resubmit signals that already have a prior real broadcast —
+    // the chain would answer the already delivered one with
+    // SignalAlreadyExists and the job would park in terminal
+    // `ignored`, which `jobs retry` rejects — a dead-locked job. Retry
     // resumes from the first signal without a prior real broadcast.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();
@@ -1247,8 +1248,8 @@ describe('state machine chain watcher', () => {
   });
 
   it('refuses to retry an attempts-exhausted submitted job instead of dead-lettering it', async () => {
-    // Cluster K fix: `jobs retry` used to move a broadcast-but-unconfirmed job
-    // straight to dead_letter once attempts were exhausted. deadLetter refuses
+    // A broadcast-but-unconfirmed submitted job must not be moved
+    // straight to dead_letter once attempts are exhausted. deadLetter refuses
     // that state, and retry must refuse it too: the tx may still confirm.
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',
@@ -1317,7 +1318,7 @@ describe('state machine callback tx helper', () => {
     expect(result.request.chainId).toBe(31_337);
     expect(result.request.functionName).toBe('submitSignal');
     expect(result.request.data.slice(0, 10)).toBe(STATE_MACHINE_FIXTURE.functions.submitSignal.selector);
-    // Audit #10: planId leads the ABI arguments.
+    // planId leads the ABI arguments.
     expect(result.request.args.slice(0, 5)).toEqual([
       PLAN_ID,
       ORDER_ID,
@@ -1359,7 +1360,7 @@ describe('state machine callback tx helper', () => {
   });
 
   it('refuses to build a submitSignal tx when the signal has no plan id', async () => {
-    // Audit #10 negative: submitSignal(planId, ...) is plan-scoped. A missing
+    // submitSignal(planId, ...) is plan-scoped. A missing
     // planId (or the builder's zero placeholder) must fail loudly instead of
     // producing a tx that can only revert on the on-chain (planId, orderId)
     // existence check.
@@ -1423,10 +1424,9 @@ describe('state machine callback tx helper', () => {
   });
 
   it('feeds the HookReady event planId into config-driven signals and persists it on the job', async () => {
-    // Cluster K fix: the watcher used to drop event.planId, so every
-    // config-driven job (createStateMachineHandlersFromConfig) died in
-    // dead_letter with "planId is required". The event is now the default
-    // planId source for signals that do not declare one.
+    // The HookReady event planId is the default planId source for
+    // config-driven signals that do not declare one; without it such jobs
+    // die in dead_letter with "planId is required".
     const store = new InMemoryStateMachineJobStore();
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',
@@ -1896,10 +1896,10 @@ describe('submitSignal receipt visibility', () => {
   });
 
   it('consults the receipt before rebroadcasting after a retryable broadcast failure', async () => {
-    // Cluster K fix: a receipt-wait timeout is retryable, but the tx may
-    // already be mined. Rebroadcasting put a second transaction on chain for
-    // the same signal; the retry loop now looks the receipt up first and
-    // adopts the mined tx as a confirmed submission.
+    // A receipt-wait timeout is retryable, but the tx may
+    // already be mined: blind rebroadcast would put a second transaction on
+    // chain for the same signal. The retry loop consults the receipt first
+    // and adopts the mined tx as a confirmed submission.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();
     try {

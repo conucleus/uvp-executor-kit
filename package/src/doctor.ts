@@ -308,9 +308,9 @@ async function checkTaskReadiness(
     }
 
     // One readiness verdict drives both the outer check and the embedded
-    // readiness copy: previously the embedded check.ok was hardcoded true,
-    // which contradicted readiness.ok and hid failures from consumers that
-    // only looked at the nested check. The canonical completion state `done`
+    // readiness copy: the embedded check.ok must equal readiness.ok so
+    // consumers that only look at the nested check cannot miss a failure.
+    // The canonical completion state `done`
     // is part of the verdict, not an alias afterthought.
     const readinessOk = canSubmit || taskComplete;
     const readinessCheck = {
