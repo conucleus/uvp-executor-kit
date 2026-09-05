@@ -270,7 +270,8 @@ async function checkTaskReadiness(
     // legacy aliases for compatibility with older Product API deployments,
     // but never omit the canonical completion state or proof guidance becomes
     // unreachable for completed tasks.
-    if (summary.status === 'done' || summary.status === 'confirmed' || summary.status === 'completed') {
+    const taskComplete = summary.status === 'done' || summary.status === 'confirmed' || summary.status === 'completed';
+    if (taskComplete) {
       nextAction = 'proof';
       nextActionLabel = 'Task is complete. Run product proof to verify on-chain confirmation.';
     } else if (canSubmit) {
@@ -290,16 +291,24 @@ async function checkTaskReadiness(
       nextActionLabel = blockedReason ?? 'Task is not yet ready for submission. Check the blocked reason.';
     }
 
+    // One readiness verdict drives both the outer check and the embedded
+    // readiness copy: previously the embedded check.ok was hardcoded true,
+    // which contradicted readiness.ok and hid failures from consumers that
+    // only looked at the nested check. The canonical completion state `done`
+    // is part of the verdict, not an alias afterthought.
+    const readinessOk = canSubmit || taskComplete;
+    const readinessCheck = {
+      ok: readinessOk,
+      label: 'task-readiness',
+      detail: nextActionLabel,
+      latencyMs,
+    };
+
     return {
-      check: {
-        ok: canSubmit || summary.status === 'done' || summary.status === 'confirmed' || summary.status === 'completed',
-        label: 'task-readiness',
-        detail: nextActionLabel,
-        latencyMs,
-      },
+      check: readinessCheck,
       readiness: {
-        ok: canSubmit || summary.status === 'confirmed' || summary.status === 'completed',
-        check: { ok: true, label: 'task-readiness', detail: nextActionLabel, latencyMs },
+        ok: readinessOk,
+        check: readinessCheck,
         taskId: summary.taskId,
         orderId: summary.orderId,
         title: summary.title,

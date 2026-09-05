@@ -335,6 +335,48 @@ describe('Product API doctor', () => {
     });
     expect(report.taskReadiness?.nextActionLabel).toContain('Required evidence not yet uploaded');
     expect(report.ok).toBe(false);
+    // The embedded readiness check mirrors the verdict instead of being
+    // hardcoded ok:true: consumers reading only the nested check must see the
+    // blocked state.
+    expect(report.taskReadiness?.ok).toBe(false);
+    expect(report.taskReadiness?.check.ok).toBe(false);
+  });
+
+  it('reports next action as proof for a task completed with the canonical done status', async () => {
+    // Cluster K fix: Product's frozen completion enum is `done`; readiness.ok
+    // used to omit it, so a completed task reported not-ready.
+    const fetch: ProductApiFetch = async (url) => {
+      if (!url.includes('/product/')) {
+        return jsonResponse({ service: 'chain-services' });
+      }
+      return jsonResponse({
+        task: {
+          taskId: 'task_done',
+          orderId: 'order_3b',
+          title: 'Completed inspection',
+          status: 'done',
+          assigneeWallet: submitter,
+          canSubmit: false,
+        },
+      });
+    };
+
+    const report = await runProductDoctor({
+      chainServicesUrl: 'http://chain.local/api',
+      walletAddress: submitter,
+      taskId: 'task_done',
+      fetch,
+    });
+
+    expect(report.taskReadiness).toMatchObject({
+      taskId: 'task_done',
+      status: 'done',
+      nextAction: 'proof',
+    });
+    expect(report.taskReadiness?.ok).toBe(true);
+    expect(report.taskReadiness?.check.ok).toBe(true);
+    expect(report.taskReadiness?.nextActionLabel).toContain('Run product proof');
+    expect(report.ok).toBe(true);
   });
 
   it('reports next action as proof for a confirmed task', async () => {
