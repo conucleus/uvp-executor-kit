@@ -1,4 +1,4 @@
-import { access, mkdir, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import type { Address, Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
@@ -74,6 +74,10 @@ export async function writeWalletEnvFile(
   const wallet = createWalletEnv(options);
   await mkdir(dirname(envFile), { recursive: true });
   await writeFile(envFile, wallet.envText, { mode: 0o600 });
+  // writeFile's `mode` only applies to files it creates: with --overwrite the
+  // file already exists and keeps its (possibly looser) permissions, so the
+  // owner-only mode must be re-asserted explicitly.
+  await chmod(envFile, 0o600);
   return {
     address: wallet.address,
     envFile,
