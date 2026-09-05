@@ -8,12 +8,14 @@ import { describe, expect, it } from 'vitest';
 import { classifyExecutorKitError, CodedExecutorKitError } from '../src/errors.js';
 import {
   buildSubmitStateMachineSignalCall,
+  createStateMachineHandlersFromConfig,
   createStateMachineWatcher,
   deadLetterStateMachineJob,
   decodeHookReadyLog,
   FileStateMachineCursorStore,
   FileStateMachineJobStore,
   hookReadyEventId,
+  InMemoryStateMachineJobStore,
   loadStateMachineHandlerConfig,
   MAX_CONSECUTIVE_POLL_FAILURES,
   retryStateMachineJob,
@@ -21,6 +23,7 @@ import {
   SubmitSignalReceiptError,
   stateMachineHandlerConfigToExecutorConfigDTO,
   stateMachineJobToExecutorJobDTO,
+  stateMachineJobId,
   summarizeSupplierOps,
   type StateMachinePublicClient,
   type StateMachineRawLog,
@@ -39,6 +42,9 @@ const TX_HASH = `0x${'33'.repeat(32)}` as Hex;
 const PAYLOAD_HASH = `0x${'44'.repeat(32)}` as Hex;
 const BUYER_SOURCE_ID = keccak256(stringToBytes('buyer'));
 const EXEC_MAIN_CMP_ID = keccak256(stringToBytes('exec.main.cmp'));
+/** Shared private-key env fixture for tests that exercise the broadcast path. */
+const KEY_ENV = 'UVP_RECEIPT_TEST_PRIVATE_KEY';
+const TEST_PRIVATE_KEY = `0x${'ab'.repeat(32)}`;
 const STATE_MACHINE_FIXTURE = JSON.parse(
   readFileSync(new URL('../../../uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.10.json', import.meta.url), 'utf8'),
 ) as {
@@ -1128,6 +1134,159 @@ describe('state machine chain watcher', () => {
     expect(retried.status).toBe('handled');
     expect(retried.job?.status).toBe('matched');
   });
+
+  it('resumes a partially delivered multi-signal job from the next pending signal instead of replaying', async () => {
+    // Cluster K fix: after a partial multi-signal failure, `jobs retry` used to
+    // resubmit every signal from index 0; the chain answered the already
+    // delivered one with SignalAlreadyExists and the job parked in terminal
+    // `ignored`, which `jobs retry` rejects — a dead-locked job. The retry now
+    // resumes from the first signal without a prior real broadcast.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: fakeReceiptClient(31_337, { status: 'success' }),
+        artifact: artifactIndex(),
+        retry: { maxAttempts: 3, baseDelayMs: 0 },
+        handlers: {
+          '*': (event) => ([
+            { planId: PLAN_ID, orderId: event.orderId, source: 'buyer', signalName: 'exec.main.cmp' },
+            { planId: PLAN_ID, orderId: event.orderId, source: 'seller', signalName: 'exec.main.cmp' },
+          ]),
+        },
+      });
+
+      // Seed the exact post-partial-failure state: signal 0 was really
+      // broadcast (no error), signal 1 failed and exhausted the run.
+      const event = decodeHookReadyLog(hookReadyLog(), artifactIndex())!;
+      const seeded = await watcher.config.jobStore.upsertDetected(event, {
+        now: '2026-04-28T00:00:00.000Z',
+        maxAttempts: 3,
+      });
+      await watcher.config.jobStore.update(seeded.id, {
+        status: 'failed',
+        updatedAt: '2026-04-28T00:00:01.000Z',
+        attempts: 3,
+        submissions: [
+          { signalIndex: 0, attempt: 1, dryRun: false, txHash: TX_HASH },
+          {
+            signalIndex: 1,
+            attempt: 3,
+            error: { kind: 'rpc_network', message: 'fetch failed', retryable: true },
+          },
+        ],
+        lastError: { kind: 'rpc_network', message: 'fetch failed', retryable: true },
+      });
+
+      const result = await retryStateMachineJob(watcher, seeded.id, {
+        operator: 'ops@example.com',
+        reason: 'rpc recovered',
+      });
+
+      // Only the pending signal was rebroadcast — one broadcast total.
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(result.status).toBe('handled');
+      expect(result.job?.status).toBe('confirmed');
+      expect(result.job?.lastError).toBeUndefined();
+      // Audit trail: the seeded history is preserved and exactly one new
+      // submission (signalIndex 1, successful) was appended.
+      const submissions = result.job?.submissions ?? [];
+      expect(submissions).toHaveLength(3);
+      expect(submissions[2]).toMatchObject({ signalIndex: 1, dryRun: false, txHash: TX_HASH });
+      expect(submissions[2]?.error).toBeUndefined();
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('treats a duplicate signal on resume as delivered and keeps later signals progressing', async () => {
+    // The deadlock variant without prior state: the first signal is already on
+    // chain (chain answers SignalAlreadyExists) while the second still has to
+    // go out. The duplicate advances the run instead of ending it.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub({
+      estimateGasError: { code: 3, message: 'execution reverted: SignalAlreadyExists()', times: 1 },
+    });
+    try {
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: fakeReceiptClient(31_337, { status: 'success' }),
+        artifact: artifactIndex(),
+        retry: { maxAttempts: 3, baseDelayMs: 0 },
+        handlers: {
+          '*': (event) => ([
+            { planId: PLAN_ID, orderId: event.orderId, source: 'buyer', signalName: 'exec.main.cmp' },
+            { planId: PLAN_ID, orderId: event.orderId, source: 'seller', signalName: 'exec.main.cmp' },
+          ]),
+        },
+      });
+
+      const result = await watcher.handleLog(hookReadyLog());
+
+      // Signal 0 answered duplicate (estimateGas revert), signal 1 broadcast
+      // and confirmed: exactly one tx went out and the job finished.
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(result.status).toBe('handled');
+      expect(result.job?.status).toBe('confirmed');
+      const submissions = result.job?.submissions ?? [];
+      expect(submissions[0]?.error?.kind).toBe('duplicate_signal');
+      expect(submissions[0]?.signalIndex).toBe(0);
+      expect(submissions[1]).toMatchObject({ signalIndex: 1, dryRun: false, txHash: TX_HASH });
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('refuses to retry an attempts-exhausted submitted job instead of dead-lettering it', async () => {
+    // Cluster K fix: `jobs retry` used to move a broadcast-but-unconfirmed job
+    // straight to dead_letter once attempts were exhausted. deadLetter refuses
+    // that state, and retry must refuse it too: the tx may still confirm.
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      dryRun: true,
+      artifact: artifactIndex(),
+      retry: { maxAttempts: 2 },
+      handlers: {
+        '*': (event) => ({
+          planId: PLAN_ID,
+          orderId: event.orderId,
+          source: 'buyer',
+          signalName: 'exec.main.cmp',
+          payloadHash: PAYLOAD_HASH,
+        }),
+      },
+    });
+    const result = await watcher.handleLog(hookReadyLog());
+    const jobId = result.job?.id;
+    if (!jobId) {
+      throw new Error('expected job id');
+    }
+    await watcher.config.jobStore.update(jobId, {
+      status: 'submitted',
+      updatedAt: '2026-04-28T00:00:02.000Z',
+      attempts: 2,
+    });
+
+    await expect(retryStateMachineJob(watcher, jobId, {
+      operator: 'ops@example.com',
+    })).rejects.toThrow(/broadcast without a confirmed receipt/);
+
+    const after = await watcher.config.jobStore.get(jobId);
+    expect(after?.status).toBe('submitted');
+    expect(after?.manualActions).toBeUndefined();
+  });
 });
 
 describe('state machine callback tx helper', () => {
@@ -1234,7 +1393,7 @@ describe('state machine callback tx helper', () => {
     })).toThrow(/planId is required/);
   });
 
-  it('fails the job instead of submitting when neither handler nor job carries a plan id', async () => {
+  it('fails the job instead of submitting when the event, handler, and job all lack a plan id', async () => {
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',
       stateMachineAddress: STATE_MACHINE,
@@ -1252,13 +1411,76 @@ describe('state machine callback tx helper', () => {
       },
     });
 
-    const result = await watcher.handleLog(hookReadyLog());
+    // A HookReady log with the zero planId placeholder: the event cannot
+    // provide one either, so nothing may be broadcast.
+    const result = await watcher.handleLog(hookReadyLog(STATE_MACHINE, `0x${'00'.repeat(32)}` as Hex));
 
     // No planId anywhere: nothing may be broadcast, and the job records the
     // structural reason so the operator can fix the handler config.
     expect(result.submissions).toHaveLength(0);
     expect(result.job?.status).toBe('dead_letter');
     expect(result.error?.message).toContain('planId is required');
+  });
+
+  it('feeds the HookReady event planId into config-driven signals and persists it on the job', async () => {
+    // Cluster K fix: the watcher used to drop event.planId, so every
+    // config-driven job (createStateMachineHandlersFromConfig) died in
+    // dead_letter with "planId is required". The event is now the default
+    // planId source for signals that do not declare one.
+    const store = new InMemoryStateMachineJobStore();
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      dryRun: true,
+      artifact: artifactIndex(),
+      jobStore: store,
+      handlers: createStateMachineHandlersFromConfig({
+        handlers: {
+          '*': { signals: [{ source: 'buyer', stageIdentifier: 'exec.main', signalName: 'cmp' }] },
+        },
+      }),
+    });
+
+    const result = await watcher.handleLog(hookReadyLog());
+    const submission = result.submissions[0];
+    if (!submission || !submission.dryRun) {
+      throw new Error('expected a dry-run submission');
+    }
+
+    expect(result.status).toBe('handled');
+    expect(result.job?.status).toBe('matched');
+    expect(submission.request.args[0]).toBe(PLAN_ID);
+    expect((await store.get(result.job!.id))?.planId).toBe(PLAN_ID);
+  });
+
+  it('prefers an explicit config signal planId over the event planId', async () => {
+    const configPlanId = `0x${'88'.repeat(32)}` as Hex;
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      dryRun: true,
+      artifact: artifactIndex(),
+      handlers: createStateMachineHandlersFromConfig({
+        handlers: {
+          '*': { signals: [{ source: 'buyer', stageIdentifier: 'exec.main', signalName: 'cmp', planId: configPlanId }] },
+        },
+      }),
+    });
+
+    // The event carries PLAN_ID, but the explicit config signal planId wins.
+    const result = await watcher.handleLog(hookReadyLog());
+    const submission = result.submissions[0];
+    if (!submission || !submission.dryRun) {
+      throw new Error('expected a dry-run submission');
+    }
+    expect(submission.request.args[0]).toBe(configPlanId);
+    // The job record itself keeps the event-sourced planId (the log is the
+    // authoritative carrier); the per-signal override lives in the submission.
+    expect(result.job?.planId).toBe(PLAN_ID);
   });
 });
 
@@ -1436,8 +1658,6 @@ describe('executor error classification', () => {
 });
 
 describe('submitSignal receipt visibility', () => {
-  const KEY_ENV = 'UVP_RECEIPT_TEST_PRIVATE_KEY';
-  const TEST_PRIVATE_KEY = `0x${'ab'.repeat(32)}`;
   const SIGNAL = {
     planId: PLAN_ID,
     orderId: ORDER_ID,
@@ -1625,7 +1845,7 @@ describe('submitSignal receipt visibility', () => {
     }
   });
 
-  it('routes a real SignalAlreadyExists revert on replay into an ignored job instead of failed', async () => {
+  it('treats a real SignalAlreadyExists revert on replay as delivered instead of failing the job', async () => {
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     // Restart replay of an already-committed signal: the chain rejects the
     // resubmission with the real contract revert text.
@@ -1638,6 +1858,7 @@ describe('submitSignal receipt visibility', () => {
         stateMachineAddress: STATE_MACHINE,
         chainId: 31_337,
         privateKeyEnv: KEY_ENV,
+        publicClient: fakeReceiptClient(31_337, { status: 'success' }),
         artifact: artifactIndex(),
         retry: { maxAttempts: 3 },
         handlers: {
@@ -1654,12 +1875,82 @@ describe('submitSignal receipt visibility', () => {
       const result = await watcher.handleLog(hookReadyLog());
 
       // The duplicate is a dedupe fact, not a failure: recognized from the real
-      // revert text without any explicit code, and the job is ignored.
-      expect(result.status).toBe('ignored');
-      expect(result.job?.status).toBe('ignored');
-      expect(result.error?.kind).toBe('duplicate_signal');
-      expect(result.error?.retryable).toBe(false);
-      expect(result.error?.message).toContain('SignalAlreadyExists');
+      // revert text without any explicit code, counted as delivered, and the
+      // run finishes. The job stays in the open `submitted` lane (the signal is
+      // on chain but this process never saw its receipt), so a later scan or
+      // retry can still observe the real outcome.
+      expect(result.status).toBe('handled');
+      expect(result.job?.status).toBe('submitted');
+      expect(result.error).toBeUndefined();
+      expect(result.job?.lastError).toBeUndefined();
+      const submissions = result.job?.submissions ?? [];
+      expect(submissions[submissions.length - 1]?.error).toMatchObject({
+        kind: 'duplicate_signal',
+        retryable: false,
+      });
+      expect(submissions[submissions.length - 1]?.error?.message).toContain('SignalAlreadyExists');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('consults the receipt before rebroadcasting after a retryable broadcast failure', async () => {
+    // Cluster K fix: a receipt-wait timeout is retryable, but the tx may
+    // already be mined. Rebroadcasting put a second transaction on chain for
+    // the same signal; the retry loop now looks the receipt up first and
+    // adopts the mined tx as a confirmed submission.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async waitForTransactionReceipt() {
+            throw new Error('Request timed out.');
+          },
+          async getTransactionReceipt() {
+            return { status: 'success' };
+          },
+        },
+        artifact: artifactIndex(),
+        retry: { maxAttempts: 3, baseDelayMs: 0 },
+        handlers: {
+          '*': (event) => ({
+            planId: PLAN_ID,
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          }),
+        },
+      });
+
+      const result = await watcher.handleLog(hookReadyLog());
+
+      // Exactly one broadcast: the receipt-wait failure was answered by a
+      // receipt lookup that found the mined tx, so no rebroadcast happened.
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(result.job?.status).toBe('confirmed');
+      expect(result.job?.lastError).toBeUndefined();
+      const submissions = result.job?.submissions ?? [];
+      expect(submissions).toHaveLength(2);
+      expect(submissions[0]?.error?.kind).toBe('rpc_network');
+      expect(submissions[0]?.txHash).toBe(TX_HASH);
+      expect(submissions[1]).toMatchObject({ signalIndex: 0, dryRun: false, txHash: TX_HASH });
+      expect(submissions[1]?.error).toBeUndefined();
     } finally {
       await stub.close();
       delete process.env[KEY_ENV];
@@ -1721,7 +2012,7 @@ describe('submitSignal receipt visibility', () => {
   });
 });
 
-function hookReadyLog(address = STATE_MACHINE): StateMachineRawLog {
+function hookReadyLog(address = STATE_MACHINE, planId: Hex = PLAN_ID): StateMachineRawLog {
   return {
     address,
     data: encodeAbiParameters(
@@ -1733,7 +2024,7 @@ function hookReadyLog(address = STATE_MACHINE): StateMachineRawLog {
     ),
     topics: [
       keccak256(stringToHex(STATE_MACHINE_FIXTURE.events.HookReady.signature)),
-      PLAN_ID,
+      planId,
       ORDER_ID,
       HOOK_ID,
     ],
@@ -1762,13 +2053,15 @@ type JsonRpcRequest = { readonly id?: unknown; readonly method?: string };
  * waiting comes from an injected StateMachinePublicClient.
  */
 async function startJsonRpcStub(options: {
-  readonly estimateGasError?: { readonly code: number; readonly message: string };
+  readonly estimateGasError?: { readonly code: number; readonly message: string; readonly times?: number };
 } = {}): Promise<{
   readonly url: string;
   readonly methods: string[];
   close(): Promise<void>;
 }> {
   const methods: string[] = [];
+  let estimateGasErrors = 0;
+  const estimateGasErrorLimit = options.estimateGasError?.times ?? Number.POSITIVE_INFINITY;
   const handlers: Record<string, () => unknown> = {
     eth_call: () => '0x',
     eth_estimateGas: () => '0x5208',
@@ -1809,7 +2102,12 @@ async function startJsonRpcStub(options: {
       const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as JsonRpcRequest | readonly JsonRpcRequest[];
       const respondOne = (body: JsonRpcRequest, id: unknown) => {
         methods.push(body.method ?? '');
-        if (body.method === 'eth_estimateGas' && options.estimateGasError) {
+        if (
+          body.method === 'eth_estimateGas'
+          && options.estimateGasError
+          && estimateGasErrors < estimateGasErrorLimit
+        ) {
+          estimateGasErrors += 1;
           return {
             jsonrpc: '2.0',
             id: body.id ?? id ?? 1,

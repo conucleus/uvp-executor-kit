@@ -386,7 +386,10 @@ ABI recorded in
 
 `planId` is part of the event and submit boundary. It must be retained with the
 watcher job and never inferred from a bare `orderId`; the same state machine can
-contain the same order id under different plans.
+contain the same order id under different plans. The watcher persists the
+planId decoded from each `HookReady` event on the job and uses it as the default
+for every signal that does not declare one; a handler-config signal may pin an
+explicit `planId` (`handlers.<key>.signals[].planId`) when it must diverge.
 
 There is no payload-reference input in this ABI, and the contract is frozen:
 `chain-signal --payload-ref` is rejected up front instead of silently dropping
