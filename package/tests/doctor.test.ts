@@ -426,7 +426,11 @@ describe('Product API doctor', () => {
     expect(report.ok).toBe(true);
   });
 
-  it('reports next action as proof for a confirmed task', async () => {
+  it('treats only the canonical done status as complete (no completion aliases)', async () => {
+    // Product's TaskStatus vocabulary is open|submitted|blocked|done. The
+    // historical `confirmed`/`completed` completion aliases were purged, so a
+    // non-canonical status must surface as not-ready instead of being silently
+    // treated as a completed task.
     const fetch: ProductApiFetch = async (url) => {
       if (!url.includes('/product/')) {
         return jsonResponse({ service: 'chain-services' });
@@ -453,10 +457,10 @@ describe('Product API doctor', () => {
     expect(report.taskReadiness).toMatchObject({
       taskId: 'task_confirmed',
       status: 'confirmed',
-      nextAction: 'proof',
+      nextAction: 'wait',
     });
-    expect(report.taskReadiness?.nextActionLabel).toContain('Run product proof');
-    expect(report.ok).toBe(true);
+    expect(report.taskReadiness?.nextActionLabel).not.toContain('Run product proof');
+    expect(report.taskReadiness?.ok).toBe(false);
   });
 
   it('reports per-task readiness without wallet address', async () => {

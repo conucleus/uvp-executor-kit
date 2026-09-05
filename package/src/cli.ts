@@ -729,7 +729,7 @@ export interface WatcherStorageResolution {
  * Resolve where the CLI keeps watcher state.
  *
  * - `--job-store memory` opts out of persistence entirely.
- * - `--jobs-file <path>` keeps the legacy exact jobs path; the cursor lives
+ * - `--jobs-file <path>` pins the exact jobs path; the cursor lives
  *   beside it as `<dir>/cursor.json` so one directory is one watcher state.
  * - Otherwise jobs and cursor live in `--state-dir` (flag), then
  *   UVP_WATCHER_STATE_DIR (env), then `./uvp-watcher-state`.

@@ -280,11 +280,13 @@ async function checkTaskReadiness(
     let nextAction: TaskReadinessResult['nextAction'] = 'blocked';
     let nextActionLabel = 'This task is not ready for action.';
 
-    // Product's frozen TaskStatus completion enum is `done`.  Keep the
-    // legacy aliases for compatibility with older Product API deployments,
-    // but never omit the canonical completion state or proof guidance becomes
-    // unreachable for completed tasks.
-    const taskComplete = summary.status === 'done' || summary.status === 'confirmed' || summary.status === 'completed';
+    // Product's frozen TaskStatus vocabulary is open|submitted|blocked|done
+    // (ProductTaskDTO in @uvp-eth/product-dto; the /product/tasks endpoints
+    // return it verbatim). Completion is exactly `done`; historical
+    // `confirmed`/`completed` aliases were purged — the server has never
+    // emitted them as task status, and treating them as complete would mask
+    // non-canonical payloads instead of surfacing them.
+    const taskComplete = summary.status === 'done';
     if (taskComplete) {
       nextAction = 'proof';
       nextActionLabel = 'Task is complete. Run product proof to verify on-chain confirmation.';

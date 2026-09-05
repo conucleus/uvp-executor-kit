@@ -622,12 +622,12 @@ describe('request id passthrough (ETH-10)', () => {
     expect(submitted.requestId).toBe('req-submit-1');
   });
 
-  it('reads the request id from fetch-style header objects and the x-uvp-request-id fallback', async () => {
+  it('reads the request id from fetch-style header objects (any key casing)', async () => {
     const fetch: ProductApiFetch = async () => ({
       ok: true,
       status: 200,
       headers: {
-        get: (name: string) => name === 'x-uvp-request-id' ? '  req-fallback-1\n' : null,
+        get: (name: string) => name === 'x-request-id' ? '  req-header-obj-1\n' : null,
       },
       text: async () => JSON.stringify({
         submissionId: 'sub_hdr',
@@ -642,7 +642,34 @@ describe('request id passthrough (ETH-10)', () => {
       chainServicesUrl: 'http://chain.local',
       submissionId: 'sub_hdr',
       fetch,
-    })).resolves.toMatchObject({ submissionId: 'sub_hdr', requestId: 'req-fallback-1' });
+    })).resolves.toMatchObject({ submissionId: 'sub_hdr', requestId: 'req-header-obj-1' });
+  });
+
+  it('ignores the retired x-uvp-request-id response header (canonical x-request-id only)', async () => {
+    // The server stamps responses exclusively with x-request-id (api/server.ts);
+    // the historical x-uvp-request-id response fallback was purged.
+    const fetch: ProductApiFetch = async () => ({
+      ok: true,
+      status: 200,
+      headers: {
+        get: (name: string) => name === 'x-uvp-request-id' ? 'req-retired-1' : null,
+      },
+      text: async () => JSON.stringify({
+        submissionId: 'sub_hdr',
+        prepareId: 'prep_hdr',
+        taskId: 'task_hdr',
+        orderId: 'order_hdr',
+        status: 'confirmed',
+      }),
+    });
+
+    const submission = await getSignalContainerProof({
+      chainServicesUrl: 'http://chain.local',
+      submissionId: 'sub_hdr',
+      fetch,
+    });
+    expect(submission.submissionId).toBe('sub_hdr');
+    expect(submission.requestId).toBeUndefined();
   });
 
   it('leaves results untouched when the response carries no headers', async () => {

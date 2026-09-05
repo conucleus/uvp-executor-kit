@@ -26,8 +26,6 @@ const ZERO_BYTES32 = `0x${'0'.repeat(64)}` as const;
  * correlated end to end with server-side request logs.
  */
 export const PRODUCT_API_REQUEST_ID_HEADER = 'x-request-id';
-/** Legacy/alternate inbound alias the server also accepts; checked as a fallback. */
-export const PRODUCT_API_REQUEST_ID_HEADER_FALLBACK = 'x-uvp-request-id';
 
 export interface ProductApiFetchInit {
   readonly method?: string;
@@ -823,8 +821,7 @@ function productApiErrorFromResponse(response: ProductApiFetchResponse, payload:
  * implementations) and plain records with any key casing.
  */
 export function productApiResponseRequestId(response: ProductApiFetchResponse): string | undefined {
-  return readResponseHeader(response, PRODUCT_API_REQUEST_ID_HEADER)
-    ?? readResponseHeader(response, PRODUCT_API_REQUEST_ID_HEADER_FALLBACK);
+  return readResponseHeader(response, PRODUCT_API_REQUEST_ID_HEADER);
 }
 
 function readResponseHeader(response: ProductApiFetchResponse, name: string): string | undefined {
@@ -856,7 +853,8 @@ function readResponseHeader(response: ProductApiFetchResponse, name: string): st
 
 /**
  * ETH-10: attach the response's request id to a parsed result object without
- * disturbing shapes when the header was absent (backward compatible).
+ * disturbing shapes when the header was absent (the requestId key is simply
+ * not added).
  */
 function attachResponseRequestId<T extends Record<string, unknown>>(value: T, requestId: string | undefined): T {
   if (requestId === undefined) {
