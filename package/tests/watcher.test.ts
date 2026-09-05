@@ -1957,6 +1957,136 @@ describe('submitSignal receipt visibility', () => {
     }
   });
 
+  it('throws the receipt error and never rebroadcasts when the recovered receipt reverted', async () => {
+    // Replay-guard reverted branch: the receipt-wait timed out (retryable, tx
+    // already broadcast), but the receipt lookup finds the tx mined with a
+    // reverted status. Rebroadcasting the same signal is pointless, so the
+    // recovery throws the same non-retryable SubmitSignalReceiptError as the
+    // direct receipt path instead of returning a retry decision.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async waitForTransactionReceipt() {
+            throw new Error('Request timed out.');
+          },
+          async getTransactionReceipt() {
+            return { status: 'reverted' };
+          },
+        },
+        artifact: artifactIndex(),
+        retry: { maxAttempts: 3, baseDelayMs: 0 },
+        handlers: {
+          '*': (event) => ({
+            planId: PLAN_ID,
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          }),
+        },
+      });
+
+      // The recovery path itself throws the receipt error for a reverted tx.
+      const recovery = watcher as unknown as {
+        recoverBroadcastSubmission(config: unknown, signal: unknown, txHash: Hex): Promise<unknown>;
+      };
+      await expect(recovery.recoverBroadcastSubmission(watcher.config, SIGNAL, TX_HASH))
+        .rejects.toBeInstanceOf(SubmitSignalReceiptError);
+
+      const result = await watcher.handleLog(hookReadyLog());
+
+      // Exactly one broadcast: the reverted receipt is a definitive answer, so
+      // the bounded retry budget is never spent rebroadcasting it.
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(result.job?.status).toBe('dead_letter');
+      expect(result.error?.retryable).toBe(false);
+      expect(result.error?.message).toContain('submitSignal transaction receipt status reverted');
+      // The already-broadcast tx stays visible in the audit trail.
+      const submissions = result.job?.submissions ?? [];
+      expect(submissions[submissions.length - 1]?.txHash).toBe(TX_HASH);
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('falls back to the bounded retry when the broadcast receipt cannot be found', async () => {
+    // Replay-guard no-receipt branch: getTransactionReceipt resolves null (the
+    // tx is not mined yet, or the node simply has no receipt for it), so the
+    // recovery returns undefined and the caller keeps its normal retry
+    // decision — rebroadcast within the bounded budget.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async waitForTransactionReceipt() {
+            throw new Error('Request timed out.');
+          },
+          async getTransactionReceipt() {
+            return null;
+          },
+        },
+        artifact: artifactIndex(),
+        retry: { maxAttempts: 3, baseDelayMs: 0 },
+        handlers: {
+          '*': (event) => ({
+            planId: PLAN_ID,
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          }),
+        },
+      });
+
+      const result = await watcher.handleLog(hookReadyLog());
+
+      // The normal retry path ran to exhaustion: one broadcast per attempt.
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(3);
+      expect(result.job?.status).toBe('failed');
+      expect(result.error?.kind).toBe('rpc_network');
+      expect(result.error?.retryable).toBe(true);
+      const submissions = result.job?.submissions ?? [];
+      expect(submissions).toHaveLength(3);
+      for (const submission of submissions) {
+        expect(submission.txHash).toBe(TX_HASH);
+        expect(submission.error?.kind).toBe('rpc_network');
+      }
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
   it('reports confirmed:true only after a successful receipt', async () => {
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();
