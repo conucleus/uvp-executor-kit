@@ -960,13 +960,28 @@ export function executionOutcomeFailed(result: {
     || result.job?.status === 'dead_letter';
 }
 
+/**
+ * Outcome error kinds that classify a skip, not a run failure:
+ * `missing_handler` is a foreign HookReady event this executor is not
+ * configured for (a shared chain always carries other suppliers' hooks), and
+ * `duplicate_signal` is the chain's own dedupe fact for an already-delivered
+ * signal. A scan that only met these must exit 0.
+ */
+const BENIGN_SCAN_OUTCOME_ERROR_KINDS = new Set(['missing_handler', 'duplicate_signal']);
+
 export function chainPollExecutionFailed(poll: {
   readonly results?: readonly {
     readonly error?: unknown;
     readonly job?: { readonly status?: string };
   }[];
 }): boolean {
-  return (poll.results ?? []).some(executionOutcomeFailed);
+  return (poll.results ?? []).some((result) => {
+    if (!executionOutcomeFailed(result)) {
+      return false;
+    }
+    const kind = (result.error as { readonly kind?: string } | undefined)?.kind;
+    return !BENIGN_SCAN_OUTCOME_ERROR_KINDS.has(kind ?? '');
+  });
 }
 
 export async function main(argv = process.argv): Promise<void> {

@@ -262,11 +262,30 @@ describe('executor CLI', () => {
 describe('honest execution exit codes', () => {
   it('flags poll outcomes that carry errors or terminal failure states', () => {
     expect(chainPollExecutionFailed({ results: [{ status: 'handled', submissions: [] }] })).toBe(false);
+    // A foreign HookReady event (another supplier's hook on a shared chain) is
+    // a skip, not a run failure: a scan that only met these must exit 0.
     expect(chainPollExecutionFailed({
       results: [{
         status: 'ignored',
         submissions: [],
         error: { kind: 'missing_handler', message: 'no state machine handler', retryable: false },
+      }],
+    })).toBe(false);
+    // duplicate_signal is the chain's own dedupe fact for an already-delivered
+    // signal: a benign outcome that must not fail the scan exit code either.
+    expect(chainPollExecutionFailed({
+      results: [{
+        status: 'ignored',
+        submissions: [],
+        error: { kind: 'duplicate_signal', message: 'SignalAlreadyExists()', retryable: false },
+      }],
+    })).toBe(false);
+    // Real submission failures still fail the scan.
+    expect(chainPollExecutionFailed({
+      results: [{
+        status: 'handled',
+        submissions: [],
+        error: { kind: 'rpc_network', message: 'fetch failed', retryable: true },
       }],
     })).toBe(true);
     expect(executionOutcomeFailed({})).toBe(false);
@@ -533,10 +552,10 @@ describe('watcher state storage (ETH-07)', () => {
       expect(firstRun.watcher?.jobStore).toBe('file');
       expect(firstRun.watcher?.nextBlock).toBe('13');
       expect(firstRun.poll?.fromBlock).toBe('10');
-      // Honest exit code: the config-only handler has no planId, so the dry-run
-      // submission fails with validation_failure (dead_letter). The log was
-      // still fully processed — the cursor advances below.
-      expect(process.exitCode).toBe(1);
+      // The config-only handler carries no planId, and since the planId fix it
+      // no longer needs one: the planId decoded from the HookReady event feeds
+      // the submission, so the dry-run scan succeeds and exits 0.
+      expect(process.exitCode).toBeUndefined();
 
       const storedCursor = JSON.parse(
         await readFile(join(stateDir, 'cursor.json'), 'utf8'),
@@ -547,11 +566,19 @@ describe('watcher state storage (ETH-07)', () => {
         stateMachines: [RETRY_STATE_MACHINE.toLowerCase()],
       });
       const storedJobs = JSON.parse(await readFile(join(stateDir, 'jobs.json'), 'utf8')) as {
-        jobs?: Array<{ status?: string; lastError?: { kind?: string } }>;
+        jobs?: Array<{
+          status?: string;
+          planId?: string;
+          lastError?: { kind?: string };
+          submissions?: Array<{ request?: { args?: string[] } }>;
+        }>;
       };
       expect(storedJobs.jobs).toHaveLength(1);
-      expect(storedJobs.jobs?.[0]?.status).toBe('dead_letter');
-      expect(storedJobs.jobs?.[0]?.lastError?.kind).toBe('validation_failure');
+      expect(storedJobs.jobs?.[0]?.status).toBe('matched');
+      expect(storedJobs.jobs?.[0]?.lastError).toBeUndefined();
+      // The event planId is persisted on the job and leads the submitSignal args.
+      expect(storedJobs.jobs?.[0]?.planId).toBe(RETRY_PLAN_ID);
+      expect(storedJobs.jobs?.[0]?.submissions?.[0]?.request?.args?.[0]).toBe(RETRY_PLAN_ID);
 
       // Restart (new process, head advanced to 15): resumes from the persisted
       // cursor at block 13; the confirmed 10..12 range is not rescanned.
@@ -636,9 +663,10 @@ describe('watcher state storage (ETH-07)', () => {
       expect(run.watcher?.jobStore).toBe('memory');
       await expect(readFile(join(stateDir, 'cursor.json'), 'utf8')).rejects.toThrow();
       await expect(readFile(join(stateDir, 'jobs.json'), 'utf8')).rejects.toThrow();
-      // Same honest exit as the file run: the dry-run submission itself lacks a
-      // planId; the point here is that nothing was written to the state dir.
-      expect(process.exitCode).toBe(1);
+      // The dry-run submission takes its planId from the event and succeeds, so
+      // the run exits 0; the point here is that nothing was written to the
+      // state dir.
+      expect(process.exitCode).toBeUndefined();
     } finally {
       stub.close();
       console.log = originalLog;
