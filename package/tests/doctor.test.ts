@@ -1,3 +1,4 @@
+import { createServer } from 'node:http';
 import { describe, expect, it } from 'vitest';
 import { main } from '../src/cli.js';
 import { runProductDoctor } from '../src/doctor.js';
@@ -207,6 +208,52 @@ describe('Product API doctor', () => {
     expect(report.checks[0]).toMatchObject({ ok: false, label: 'reachability' });
     expect(report.checks[0]?.detail).toContain('fetch failed');
     expect(report.ok).toBe(false);
+  });
+
+  it('never follows a Product API redirect and never replays the bearer to the redirect target', async () => {
+    // Audit S11 same-class fix: the reachability probe carries the
+    // Authorization bearer from --auth-token-env, and the default
+    // redirect:"follow" policy would replay it to whatever host a 3xx points
+    // at. Redirects are now manual and fail the reachability check.
+    const seen: { path: string; authorization?: string }[] = [];
+    const redirector = createServer((request, response) => {
+      seen.push({
+        path: request.url ?? '',
+        ...(typeof request.headers.authorization === 'string'
+          ? { authorization: request.headers.authorization }
+          : {}),
+      });
+      response.statusCode = 302;
+      response.setHeader('location', '/leak');
+      response.end();
+    });
+    await new Promise<void>((resolve) => redirector.listen(0, '127.0.0.1', resolve));
+    const redirectorAddress = redirector.address();
+    if (!redirectorAddress || typeof redirectorAddress === 'string') {
+      throw new Error('redirect test server did not bind to a TCP address');
+    }
+
+    try {
+      // No injected fetch: the real global fetch must honor the manual policy.
+      const report = await runProductDoctor({
+        chainServicesUrl: `http://127.0.0.1:${redirectorAddress.port}`,
+        headers: { Authorization: 'Bearer secret-doctor-token' },
+      });
+
+      const reachability = report.checks.find((c) => c.label === 'reachability');
+      expect(reachability?.ok).toBe(false);
+      expect(reachability?.detail).toContain('HTTP 302 redirect');
+      expect(reachability?.detail).toContain('redirects are refused');
+      expect(report.ok).toBe(false);
+
+      // The redirect was never followed: the /leak target saw zero requests,
+      // and every observed request carried (only) the original bearer.
+      expect(seen.filter((entry) => entry.path.startsWith('/leak'))).toEqual([]);
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((entry) => entry.authorization === 'Bearer secret-doctor-token')).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => redirector.close(() => resolve()));
+    }
   });
 
   it('reports task-visibility failure independently of reachability', async () => {

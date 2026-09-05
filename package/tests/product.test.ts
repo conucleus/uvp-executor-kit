@@ -1,4 +1,5 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -158,6 +159,52 @@ describe('Product API mode', () => {
       console.log = originalLog;
       restoreFetch(originalFetch);
       restoreEnv(envName, previousEnv);
+    }
+  });
+
+  it('never follows a Product API redirect and never replays the bearer to the redirect target', async () => {
+    // Audit S11 same-class fix: --auth-token-env injects an Authorization
+    // bearer into every product fetch (including this one's headers), and the
+    // default redirect:"follow" policy would replay it to whatever host a 3xx
+    // points at. Redirects are now manual and count as request failures.
+    const seen: { path: string; authorization?: string }[] = [];
+    const redirector = createServer((request, response) => {
+      seen.push({
+        path: request.url ?? '',
+        ...(typeof request.headers.authorization === 'string'
+          ? { authorization: request.headers.authorization }
+          : {}),
+      });
+      response.statusCode = 302;
+      response.setHeader('location', '/leak');
+      response.end();
+    });
+    await new Promise<void>((resolve) => redirector.listen(0, '127.0.0.1', resolve));
+    const redirectorAddress = redirector.address();
+    if (!redirectorAddress || typeof redirectorAddress === 'string') {
+      throw new Error('redirect test server did not bind to a TCP address');
+    }
+
+    try {
+      // No injected fetch: the real global fetch must honor the manual policy.
+      const error = await listSignalContainers({
+        chainServicesUrl: `http://127.0.0.1:${redirectorAddress.port}`,
+        walletAddress: submitter,
+        headers: { Authorization: 'Bearer secret-product-token' },
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ProductApiError);
+      expect((error as ProductApiError).status).toBe(302);
+      expect((error as ProductApiError).code).toBe('redirect');
+      expect((error as Error).message).toContain('redirects are refused');
+
+      // The redirect was never followed: the /leak target saw zero requests,
+      // and every observed request carried (only) the original bearer.
+      expect(seen.filter((entry) => entry.path.startsWith('/leak'))).toEqual([]);
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((entry) => entry.authorization === 'Bearer secret-product-token')).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => redirector.close(() => resolve()));
     }
   });
 

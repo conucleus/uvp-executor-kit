@@ -33,6 +33,21 @@ export interface ProductApiFetchInit {
   readonly method?: string;
   readonly headers?: Readonly<Record<string, string>>;
   readonly body?: string;
+  /**
+   * The transport always sets 'manual': these requests carry the Authorization
+   * bearer injected by `--auth-token-env`, and following a 3xx would replay it
+   * to whatever host the Location header points at.
+   */
+  readonly redirect?: 'manual';
+}
+
+/**
+ * Statuses a manual redirect policy refuses to follow: every 3xx plus the
+ * status-0 `opaqueredirect` response a filtered manual redirect yields. Callers
+ * treat any of these as a request failure so credentials are never replayed.
+ */
+export function isProductApiRedirectStatus(status: number): boolean {
+  return status === 0 || (status >= 300 && status < 400);
 }
 
 /**
@@ -712,8 +727,22 @@ async function requestProductApiJson(
   const response = await fetchFn(url, {
     method,
     headers,
+    // Never let fetch follow a redirect: these headers carry the Authorization
+    // bearer from --auth-token-env, and a 3xx would replay it to whatever host
+    // the Location header points at. A redirect is a request failure, full stop.
+    redirect: 'manual',
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
+  if (isProductApiRedirectStatus(response.status)) {
+    // Covers every 3xx and the status-0 opaqueredirect response a manual
+    // redirect policy yields: the request must fail instead of leaking the
+    // bearer to the redirect target.
+    throw new ProductApiError(
+      response.status,
+      'redirect',
+      `Product API request for ${path} was answered with HTTP ${response.status} instead of a direct response; redirects are refused so the Authorization bearer is never replayed to the redirect target`,
+    );
+  }
   const payload = await readProductApiBody(response);
   if (!response.ok) {
     throw productApiErrorFromResponse(response, payload);

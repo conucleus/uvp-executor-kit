@@ -1,6 +1,7 @@
 import {
   getSignalContainer,
   getSignalContainerProof,
+  isProductApiRedirectStatus,
   listSignalContainers,
   resolveProductApiFetch,
   summarizeSignalContainer,
@@ -152,8 +153,21 @@ async function checkReachability(
     if (input.principalId && input.principalId.trim().length > 0) {
       headers['x-uvp-principal-id'] = input.principalId.trim();
     }
-    const response = await fetchFn(url, { method: 'GET', headers });
+    // Same redirect discipline as the product transport: the reachability
+    // probe carries the Authorization bearer from --auth-token-env and must
+    // never follow a 3xx that would replay it to another host.
+    const response = await fetchFn(url, { method: 'GET', headers, redirect: 'manual' });
     const latencyMs = Date.now() - started;
+    if (isProductApiRedirectStatus(response.status)) {
+      // Every 3xx (and the status-0 opaqueredirect response a manual redirect
+      // policy yields) is a failed probe, not a reachable API.
+      return {
+        ok: false,
+        label: 'reachability',
+        detail: `Product API responded HTTP ${response.status} redirect; redirects are refused so the Authorization bearer is never replayed to the redirect target`,
+        latencyMs,
+      };
+    }
     if (response.ok || response.status < 500) {
       return { ok: true, label: 'reachability', detail: `Product API responded HTTP ${response.status}`, latencyMs };
     }
