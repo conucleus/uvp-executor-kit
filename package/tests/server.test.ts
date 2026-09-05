@@ -398,6 +398,124 @@ describe('executor HTTP server', () => {
     }
   });
 
+  it('resolves concurrent duplicate dispatches to exactly one accepted job', async () => {
+    // Cluster K fix: dispatch idempotency used to be a read-then-create pair,
+    // so two racing dispatches could both pass the existence check. The store
+    // create is now a conditional write.
+    let outboundCalls = 0;
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+      fetchImpl: async () => {
+        outboundCalls += 1;
+        return new Response('ok', { status: 200 });
+      },
+    });
+    try {
+      const dispatch = () => fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-race', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' }),
+      });
+      const [first, second] = await Promise.all([dispatch(), dispatch()]);
+
+      expect([first.status, second.status].sort()).toEqual([202, 409]);
+      const jobs = await getJobs(executor.url);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]?.id).toBe('dispatch-race');
+      expect(outboundCalls).toBeLessThanOrEqual(1);
+    } finally {
+      await executor.close();
+    }
+  });
+
+  it('never follows a callback redirect and never replays the bearer to the redirect target', async () => {
+    // Cluster K fix: the callback fetch used the default redirect:"follow", so
+    // a 3xx answer replayed the Authorization bearer to whatever host the
+    // redirect pointed at. Redirects are now manual and count as failures.
+    const seen: { path: string; authorization?: string }[] = [];
+    const redirector = createServer((request, response) => {
+      seen.push({
+        path: request.url ?? '',
+        ...(typeof request.headers.authorization === 'string'
+          ? { authorization: request.headers.authorization }
+          : {}),
+      });
+      if ((request.url ?? '').startsWith('/v0/signals')) {
+        response.statusCode = 302;
+        response.setHeader('location', '/leak');
+        response.end();
+        return;
+      }
+      response.statusCode = 200;
+      response.end('redirect-target');
+    });
+    await new Promise<void>((resolve) => redirector.listen(0, '127.0.0.1', resolve));
+    const redirectorAddress = redirector.address();
+    if (!redirectorAddress || typeof redirectorAddress === 'string') {
+      throw new Error('redirect test server did not bind to a TCP address');
+    }
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+    });
+
+    try {
+      const callbackUrl = `http://127.0.0.1:${redirectorAddress.port}/v0/signals`;
+      const accepted = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-redirect', effect, callbackUrl }),
+      });
+      expect(accepted.status).toBe(202);
+
+      await eventually(async () => {
+        const jobs = await getJobs(executor.url);
+        expect(jobs[0]?.status).toBe('callback_failed');
+        expect(jobs[0]?.lastError).toContain('callback endpoint failed with 302');
+      });
+
+      // The redirect was never followed: only the callback endpoint itself was
+      // hit (once per bounded retry), never the /leak target.
+      expect(seen.filter((entry) => entry.path === '/leak')).toEqual([]);
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((entry) => entry.authorization === `Bearer ${callbackToken}`)).toBe(true);
+    } finally {
+      await executor.close();
+      await new Promise<void>((resolve) => redirector.close(() => resolve()));
+    }
+  });
+
   it('rejects dispatches without a dispatchId instead of synthesizing a timestamped job id', async () => {
     const executor = await startExecutorServer({
       executorId: 'exec-executor',

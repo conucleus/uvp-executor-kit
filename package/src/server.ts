@@ -70,7 +70,12 @@ export interface ExecutorJob {
 }
 
 export interface ExecutorJobStore {
-  create(job: ExecutorJob): Promise<void>;
+  /**
+   * Conditional insert: resolves false when a job with the same id already
+   * exists. The check and the write are one atomic operation so concurrent
+   * duplicate dispatches cannot both pass a read-then-create sequence.
+   */
+  create(job: ExecutorJob): Promise<boolean>;
   update(
     jobId: string,
     patch: Pick<ExecutorJob, 'status' | 'updatedAt'> & Partial<Pick<ExecutorJob, 'lastError' | 'callbacks'>>,
@@ -127,8 +132,12 @@ const MAX_BODY_BYTES = 1_000_000;
 export class InMemoryExecutorJobStore implements ExecutorJobStore {
   private readonly jobs = new Map<string, ExecutorJob>();
 
-  async create(job: ExecutorJob): Promise<void> {
+  async create(job: ExecutorJob): Promise<boolean> {
+    if (this.jobs.has(job.id)) {
+      return false;
+    }
     this.jobs.set(job.id, structuredClone(job));
+    return true;
   }
 
   async update(
@@ -295,10 +304,9 @@ async function routeExecutorRequest(
       updatedAt: acceptedAt,
       callbackUrl: dispatch.callbackUrl,
     };
-    if (await context.jobStore.get(job.id)) {
+    if (!(await context.jobStore.create(job))) {
       return { status: 409, body: { error: 'job_already_exists', jobId: job.id } };
     }
-    await context.jobStore.create(job);
     queueMicrotask(() => {
       void processDispatch(context, job, dispatch, handler);
     });
@@ -400,6 +408,10 @@ async function postSignalCallback(
   const body = JSON.stringify({ signal });
   const response = await fetchImpl(callbackUrl, {
     method: 'POST',
+    // Never let fetch follow a redirect: the Authorization bearer (and the
+    // webhook signature header) would be replayed to whatever host the
+    // callback endpoint points at. A 3xx is a delivery failure, full stop.
+    redirect: 'manual',
     headers: {
       'authorization': `Bearer ${callbackToken}`,
       'content-type': 'application/json',
@@ -408,6 +420,8 @@ async function postSignalCallback(
     body,
   });
   if (!response.ok) {
+    // Includes every 3xx (and the status-0 opaqueredirect response a manual
+    // redirect policy yields): a redirecting callback endpoint failed.
     throw new Error(`callback endpoint failed with ${response.status}: ${await response.text()}`);
   }
 }
