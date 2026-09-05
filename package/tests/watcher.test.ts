@@ -40,7 +40,7 @@ const PAYLOAD_HASH = `0x${'44'.repeat(32)}` as Hex;
 const BUYER_SOURCE_ID = keccak256(stringToBytes('buyer'));
 const EXEC_MAIN_CMP_ID = keccak256(stringToBytes('exec.main.cmp'));
 const STATE_MACHINE_FIXTURE = JSON.parse(
-  readFileSync(new URL('../../../uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.9.json', import.meta.url), 'utf8'),
+  readFileSync(new URL('../../../uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.10.json', import.meta.url), 'utf8'),
 ) as {
   readonly hashes: {
     readonly artifactHash: Hex;
