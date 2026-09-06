@@ -460,6 +460,10 @@ describe('state machine chain watcher', () => {
     // A round whose cursor could not be persisted must not report success: the
     // next poll (or a restart) would silently rescan already-processed blocks.
     await expect(watcher.pollOnce()).rejects.toThrow('disk full');
+    // The in-memory cursor must not advance past the failed save either —
+    // otherwise this process would skip the unpersisted interval even without
+    // a restart. It stays pinned at the configured fromBlock.
+    expect(watcher.describe().nextBlock).toBe('10');
   });
 
   it('round-trips cursor state through the file cursor store and quarantines corrupt state', async () => {

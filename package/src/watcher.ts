@@ -765,13 +765,15 @@ export class StateMachineWatcher {
     for (const log of logs) {
       results.push(await this.handleLog(log));
     }
-    this.nextBlock = toBlock + 1n;
-    // Cursor persistence is part of the round's durability: if the save fails
-    // the round reports failure and the next poll rescans the same range, which
-    // the job store absorbs idempotently.
+    // Persistence is part of the round: save first, advance memory second. A
+    // save that fails after the memory advance used to leave the process
+    // holding an unpersisted skip interval — combined with a crash, blocks were
+    // silently never rescanned by this or any restarted instance.
+    const nextBlock = toBlock + 1n;
     if (this.config.cursorStore) {
-      await this.config.cursorStore.save(this.nextBlock, this.cursorContext());
+      await this.config.cursorStore.save(nextBlock, this.cursorContext());
     }
+    this.nextBlock = nextBlock;
 
     const decodeFailures = results.filter((result) => result.decodeFailure).length;
     return {
