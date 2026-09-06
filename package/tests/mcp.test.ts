@@ -134,7 +134,6 @@ function fundingTask(): Record<string, unknown> {
     sourceId: bytes32('02'),
     signalId: bytes32('03'),
     fundingImpact: 'Adapter placeholder: records funding condition only; no custody or settlement by UVP.',
-    requiredEvidence: ['guarantee-proof'],
     requiredInputs: [
       {
         inputId: 'funding-condition',
@@ -153,7 +152,6 @@ function fundingTask(): Record<string, unknown> {
     capabilityPlugin: {
       pluginKind: 'payment_placeholder',
       source: 'explicit',
-      requiredEvidence: ['guarantee-proof'],
     },
     primaryActionLabel: 'Confirm funding condition',
     proofRows: [{ label: 'Event', value: 'SignalSubmitted' }],

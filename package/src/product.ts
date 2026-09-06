@@ -193,7 +193,6 @@ export interface ProductTaskSummary {
   readonly stageName?: string;
   readonly deadline?: string;
   readonly fundingImpact?: string;
-  readonly requiredEvidence?: readonly string[];
   readonly canSubmit?: boolean;
   readonly blockedReason?: string;
   readonly performanceSlotId?: string;
@@ -402,7 +401,6 @@ export function summarizeSignalContainer(task: ProductSignalContainer | Record<s
     ...optionalString(parsed, 'stageName'),
     ...optionalString(parsed, 'deadline'),
     ...optionalString(parsed, 'fundingImpact'),
-    ...optionalStringArray(parsed, 'requiredEvidence'),
     ...optionalBoolean(parsed, 'canSubmit'),
     ...optionalString(parsed, 'blockedReason'),
     ...optionalString(parsed, 'performanceSlotId'),

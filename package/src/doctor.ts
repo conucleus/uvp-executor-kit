@@ -46,7 +46,6 @@ export interface TaskReadinessResult {
   readonly stageName?: string;
   readonly deadline?: string;
   readonly deadlineExpired?: boolean;
-  readonly requiredEvidence: readonly string[];
   readonly primaryActionLabel?: string;
   readonly nextAction: 'prepare' | 'wait' | 'proof' | 'blocked';
   readonly nextActionLabel: string;
@@ -337,7 +336,6 @@ async function checkTaskReadiness(
         ...(summary.stageName ? { stageName: summary.stageName } : {}),
         ...(summary.deadline ? { deadline: summary.deadline } : {}),
         ...(deadlineExpired !== undefined ? { deadlineExpired } : {}),
-        requiredEvidence: summary.requiredEvidence ?? [],
         ...(summary.primaryActionLabel ? { primaryActionLabel: summary.primaryActionLabel } : {}),
         nextAction,
         nextActionLabel,

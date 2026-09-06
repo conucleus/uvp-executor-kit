@@ -298,7 +298,6 @@ describe('Product API mode', () => {
       capabilityPlugin: {
         pluginKind: 'payment_placeholder',
         source: 'explicit',
-        requiredEvidence: ['guarantee-proof'],
       },
       businessPersonaLabels: ['Guarantor'],
       proofRows: [{ label: 'Event', value: 'SignalSubmitted' }],

@@ -311,7 +311,6 @@ describe('Product API doctor', () => {
           assigneeWallet: submitter,
           stageName: 'Customs release',
           deadline: '2099-01-01T00:00:00.000Z',
-          requiredEvidence: ['customs-docs'],
           canSubmit: true,
           primaryActionLabel: 'Confirm stage',
         },
@@ -334,7 +333,6 @@ describe('Product API doctor', () => {
       canSubmit: true,
       assigneeMatch: true,
       nextAction: 'prepare',
-      requiredEvidence: ['customs-docs'],
     });
     expect(report.taskReadiness?.nextActionLabel).toContain('Ready to prepare');
     expect(report.tasks).toBeUndefined();
@@ -359,7 +357,6 @@ describe('Product API doctor', () => {
           status: 'open',
           assigneeWallet: submitter,
           deadline: '2099-01-01T00:00:00.000Z',
-          requiredEvidence: ['shipping-docs'],
           canSubmit: false,
           blockedReason: 'Required evidence not yet uploaded',
         },
@@ -475,7 +472,6 @@ describe('Product API doctor', () => {
           status: 'open',
           assigneeWallet: submitter,
           canSubmit: true,
-          requiredEvidence: [],
         },
       });
     };
@@ -511,7 +507,6 @@ describe('Product API doctor', () => {
           status: 'open',
           assigneeWallet: '0x9999999999999999999999999999999999999999',
           canSubmit: true,
-          requiredEvidence: [],
         },
       });
     };
@@ -644,7 +639,6 @@ describe('doctor CLI', () => {
           assigneeWallet: submitter,
           stageName: 'Customs release',
           deadline: '2099-01-01T00:00:00.000Z',
-          requiredEvidence: ['customs-docs'],
           canSubmit: true,
           primaryActionLabel: 'Confirm stage',
         },
@@ -714,7 +708,6 @@ describe('doctor CLI', () => {
           canSubmit: true,
           sourceId: sourceIdHex,
           signalId: bytes32('03'),
-          requiredEvidence: [],
         },
       });
     }) as unknown as typeof globalThis.fetch;
