@@ -70,6 +70,9 @@ interface ChainWatchOptions {
   privateKeyEnv: string;
   fromBlock?: string;
   pollIntervalMs?: string;
+  confirmations?: string;
+  reorgWindow?: string;
+  getLogsBlockSpan?: string;
   jobsFile?: string;
   /** file (default) persists jobs and the scan cursor under --state-dir; memory keeps jobs and cursor in process memory. */
   jobStore?: string;
@@ -502,7 +505,7 @@ export function buildProgram(): Command {
 
   jobs
     .command('retry <jobId>')
-    .description('retry a failed or callback-pending state-machine watcher job')
+    .description('retry a failed, callback-pending, or confirmed state-machine watcher job (confirmed retries resubmit for reorg recovery)')
     .requiredOption('--jobs-file <path>', 'state-machine watcher jobs JSON file')
     .requiredOption('--rpc-url <url>', 'EVM RPC URL')
     .requiredOption('--state-machine <address>', 'UVPStateMachine contract address')
@@ -551,6 +554,9 @@ export function buildProgram(): Command {
     .option('--wallet-address <address>', 'executor wallet address shown as submitSignal sender in dry-run')
     .option('--private-key-env <name>', 'environment variable containing the callback tx private key', DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV)
     .option('--from-block <uint>', 'first block to scan; on restart a persisted scan cursor takes precedence')
+    .option('--confirmations <n>', 'finality buffer in blocks: scan only up to head - n (0 restores tip scanning)', '1')
+    .option('--reorg-window <blocks>', 'bounded reorg checkpoint window for the common-ancestor rollback', '64')
+    .option('--max-get-logs-block-span <blocks>', 'max blocks per eth_getLogs request; deeper ranges are chunked', '9999')
     .option('--jobs-file <path>', 'watcher jobs JSON file (default: <state-dir>/jobs.json)')
     .option('--state-dir <path>', `watcher state directory holding jobs.json and cursor.json (default: $${WATCHER_STATE_DIR_ENV} or ${DEFAULT_WATCHER_STATE_DIR})`)
     .option('--job-store <file|memory>', 'watcher job store: file persists jobs and scan cursor across restarts, memory keeps them in-process', 'file')
@@ -578,6 +584,9 @@ export function buildProgram(): Command {
     .option('--private-key-env <name>', 'environment variable containing the callback tx private key', DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV)
     .option('--from-block <uint>', 'first block to scan; on restart a persisted scan cursor takes precedence')
     .option('--poll-interval-ms <ms>', 'polling interval in milliseconds')
+    .option('--confirmations <n>', 'finality buffer in blocks: scan only up to head - n (0 restores tip scanning)', '1')
+    .option('--reorg-window <blocks>', 'bounded reorg checkpoint window for the common-ancestor rollback', '64')
+    .option('--max-get-logs-block-span <blocks>', 'max blocks per eth_getLogs request; deeper ranges are chunked', '9999')
     .option('--jobs-file <path>', 'watcher jobs JSON file (default: <state-dir>/jobs.json)')
     .option('--state-dir <path>', `watcher state directory holding jobs.json and cursor.json (default: $${WATCHER_STATE_DIR_ENV} or ${DEFAULT_WATCHER_STATE_DIR})`)
     .option('--job-store <file|memory>', 'watcher job store: file persists jobs and scan cursor across restarts, memory keeps them in-process', 'file')
@@ -796,6 +805,9 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Prom
     ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
     ...(options.fromBlock ? { fromBlock: options.fromBlock } : {}),
     ...(options.pollIntervalMs ? { pollIntervalMs: parsePositiveInteger(options.pollIntervalMs, 'pollIntervalMs') } : {}),
+    ...(options.confirmations !== undefined ? { confirmations: parseNonNegativeIntegerOption(options.confirmations, 'confirmations') } : {}),
+    ...(options.reorgWindow !== undefined ? { reorgWindow: parsePositiveInteger(options.reorgWindow, 'reorgWindow') } : {}),
+    ...(options.getLogsBlockSpan !== undefined ? { getLogsBlockSpan: parsePositiveInteger(options.getLogsBlockSpan, 'getLogsBlockSpan') } : {}),
     onPoll: (poll) => {
       console.log(stringifyForTransport({ poll }));
     },
@@ -934,6 +946,18 @@ function parsePort(value: string): number {
     throw new ValidationError('port must be between 0 and 65535');
   }
   return port;
+}
+
+/** confirmations allows 0 (tip scanning for throwaway local chains). */
+function parseNonNegativeIntegerOption(value: string, fieldName: string): number {
+  if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+    throw new ValidationError(`${fieldName} must be a non-negative integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new ValidationError(`${fieldName} must be a non-negative safe integer`);
+  }
+  return parsed;
 }
 
 function waitForShutdown(close: () => Promise<void>): Promise<void> {

@@ -77,9 +77,44 @@ to `./uvp-watcher-state`, overridden by `--state-dir` or the
 `UVP_WATCHER_STATE_DIR` env var; `--jobs-file <path>` places the jobs file
 exactly at that path with the cursor beside it. The startup log reports the
 resolved storage mode and paths. Pass `--job-store memory` to keep jobs and the
-cursor in process memory; a persisted cursor whose
-chain id or state-machine set no longer matches the configuration is ignored
-and rewritten on the next successful round.
+cursor in process memory; a persisted cursor whose chain id, state-machine set,
+or chain genesis hash no longer matches the configuration is discarded with an
+operator alert and rewritten on the next successful round (a reset dev chain at
+the same chain id is caught by the genesis hash, not silently adopted).
+
+State files are written atomically (temp file + rename). A crash-truncated or
+structurally invalid `jobs.json`/`cursor.json` is moved aside to
+`<file>.corrupt-<timestamp>` for inspection and recreated from scratch instead
+of aborting every later read.
+
+### Reorg and Outage Defenses
+
+The watcher applies the same defenses as the chain-services indexer, with
+configurable parameters (`--confirmations`, `--reorg-window`,
+`--max-get-logs-block-span` on `chain-once`/`chain-watch`):
+
+- **Finality buffer**: each round scans only up to `head - confirmations`
+  (default 1), so a short reorg cannot flip already-processed logs and their
+  confirmed submissions behind the cursor. `--confirmations 0` restores tip
+  scanning for throwaway local chains.
+- **Cursor block-hash continuity**: each successful round remembers the
+  canonical hash of its last scanned block (plus exponentially spaced anchors
+  inside the reorg window, default 64 blocks). The next round verifies the
+  hash before appending; on mismatch it walks the anchors to the common
+  ancestor and rescans from there. A reorg deeper than the window falls back
+  to rescanning from `--from-block`.
+- **Chunked log reads**: scan ranges larger than `--max-get-logs-block-span`
+  (default 9999) are split into multiple `eth_getLogs` calls, so deep-lag
+  catch-up rounds do not trip provider query limits.
+- **Poll backoff**: the watch loop never aborts on failed polls. Consecutive
+  failures are reported through the error channel and the poll cadence backs
+  off exponentially (capped at 8x the interval), returning to the configured
+  cadence on the first successful round.
+- **Resend backoff**: a signal whose prior broadcast was never confirmed is
+  rebroadcast with exponential backoff (30s base, 10min cap) anchored to the
+  job's `lastSignalAttemptAt`, instead of once per poll round. The chain's
+  `idempotencyKey` remains the dedupe anchor; the backoff only stops the
+  per-round gas burn. Manual `jobs retry` bypasses the throttle.
 
 Build or submit one state-machine signal:
 
@@ -320,7 +355,10 @@ Watcher job semantics:
   during `submitSignal` is recorded as a delivered dedupe fact and leaves the
   job in the non-terminal `submitted` state (the signal is on chain but this
   process never observed its receipt, so a later scan or retry can still
-  check the real outcome).
+  check the real outcome). `jobs retry` also accepts `confirmed` jobs: the
+  retry resubmits every signal, which is the manual recovery channel when a
+  reorg flipped a confirmation off the canonical chain (the on-chain
+  idempotency key absorbs the duplicate when the signal actually survived).
 - HookReady-topic logs that fail to decode (e.g. from a mixed-version
   deployment) never crash the watcher: the scan skips them, records an
   `ignored` job with the raw log preserved, counts them in poll results and
@@ -333,6 +371,14 @@ Watcher job semantics:
   exponential backoff from the configured base delay. Multi-signal callback
   runs record per-signal delivery results, so partial success stays visible
   instead of being collapsed into a single outcome.
+- When a callback HMAC secret is configured, dispatched callbacks are signed
+  over `timestamp.nonce.body` and carry `x-uvp-webhook-signature`,
+  `x-uvp-webhook-timestamp`, and `x-uvp-webhook-nonce` headers. Receivers
+  verify with `verifyWebhookSignature(body, signature, secret, { timestamp,
+  nonce })`: it fails closed on a missing timestamp/nonce, enforces an
+  acceptance window (5 minutes by default), and `createWebhookReplayGuard`
+  burns each nonce once inside the window — a captured `(body, signature)`
+  pair can no longer be replayed forever.
 
 ## SDK Surface
 
