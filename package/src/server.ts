@@ -1,4 +1,4 @@
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -18,6 +18,11 @@ export const DEFAULT_CALLBACK_HOST_ALLOWLIST_ENV = 'UVP_EXECUTOR_CALLBACK_HOST_A
 export const DEFAULT_CALLBACK_MAX_ATTEMPTS = 3;
 export const DEFAULT_CALLBACK_RETRY_BASE_DELAY_MS = 250;
 export const WEBHOOK_SIGNATURE_HEADER = 'x-uvp-webhook-signature';
+export const WEBHOOK_TIMESTAMP_HEADER = 'x-uvp-webhook-timestamp';
+export const WEBHOOK_NONCE_HEADER = 'x-uvp-webhook-nonce';
+/** Acceptance window for the webhook timestamp; outside it a captured request no longer verifies. */
+export const DEFAULT_WEBHOOK_TIMESTAMP_TOLERANCE_MS = 5 * 60_000;
+const DEFAULT_WEBHOOK_REPLAY_MAX_NONCES = 10_000;
 
 const LOOPBACK_CALLBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 
@@ -415,7 +420,7 @@ async function postSignalCallback(
     headers: {
       'authorization': `Bearer ${callbackToken}`,
       'content-type': 'application/json',
-      ...(callbackHmacSecret ? { [WEBHOOK_SIGNATURE_HEADER]: `sha256=${createHmac('sha256', callbackHmacSecret).update(body).digest('hex')}` } : {}),
+      ...(callbackHmacSecret ? webhookSignatureHeaders(callbackHmacSecret, body) : {}),
     },
     body,
   });
@@ -427,21 +432,127 @@ async function postSignalCallback(
 }
 
 /**
- * Verify the `x-uvp-webhook-signature` value over the exact raw request body.
- * Receivers should call this before parsing JSON and reject false, malformed,
- * or missing signatures.  Constant-time comparison prevents timing leaks.
+ * Timestamp+nonce authenticated HMAC for outbound webhook callbacks.
+ *
+ * A bare HMAC over the body is replayable forever: capturing (body, signature)
+ * is enough to re-deliver the callback at any later time. The MAC therefore
+ * covers `timestamp.nonce.body`, the timestamp is rejected outside the
+ * acceptance window, and the nonce is single-use per window via the replay
+ * guard — a captured request dies with the window.
+ */
+export interface WebhookSignatureFields {
+  /** Unix timestamp in seconds, sent as the timestamp header. */
+  readonly timestamp: string;
+  /** Random hex nonce, sent as the nonce header. */
+  readonly nonce: string;
+}
+
+export function newWebhookSignatureFields(nowMs: () => number = Date.now): WebhookSignatureFields {
+  return {
+    timestamp: Math.floor(nowMs() / 1000).toString(),
+    nonce: randomBytes(16).toString('hex'),
+  };
+}
+
+export function signWebhookBody(
+  secret: string,
+  body: string | Uint8Array,
+  fields: WebhookSignatureFields,
+): string {
+  return `sha256=${createHmac('sha256', secret)
+    .update(webhookSignedPayload(body, fields))
+    .digest('hex')}`;
+}
+
+function webhookSignedPayload(body: string | Uint8Array, fields: WebhookSignatureFields): string {
+  return `${fields.timestamp}.${fields.nonce}.${typeof body === 'string' ? body : Buffer.from(body).toString('utf8')}`;
+}
+
+export interface VerifyWebhookSignatureOptions {
+  /** Value of the `x-uvp-webhook-timestamp` header (unix seconds). */
+  readonly timestamp?: string;
+  /** Value of the `x-uvp-webhook-nonce` header. */
+  readonly nonce?: string;
+  readonly nowMs?: () => number;
+  readonly toleranceMs?: number;
+}
+
+/**
+ * Verify the `x-uvp-webhook-signature` value over the exact raw request body
+ * together with its timestamp and nonce headers. Receivers should call this
+ * before parsing JSON and reject false, malformed, missing, or stale
+ * signatures. Constant-time comparison prevents timing leaks.
+ *
+ * Fail-closed on absent timestamp/nonce: a legacy body-only signature is
+ * exactly the permanently replayable shape this scheme exists to kill.
  */
 export function verifyWebhookSignature(
   body: string | Uint8Array,
   signature: string | undefined,
   secret: string,
+  options: VerifyWebhookSignatureOptions = {},
 ): boolean {
   if (!signature || !secret) return false;
   const match = /^sha256=([0-9a-f]{64})$/i.exec(signature.trim());
   if (!match) return false;
-  const expected = createHmac('sha256', secret).update(body).digest();
+  const timestamp = options.timestamp?.trim();
+  const nonce = options.nonce?.trim();
+  if (!timestamp || !/^(0|[1-9][0-9]{0,9})$/.test(timestamp)) return false;
+  if (!nonce || !/^[0-9a-f]{16,64}$/i.test(nonce)) return false;
+
+  const nowMs = (options.nowMs ?? Date.now)();
+  const toleranceMs = options.toleranceMs ?? DEFAULT_WEBHOOK_TIMESTAMP_TOLERANCE_MS;
+  const timestampMs = Number(timestamp) * 1000;
+  if (Math.abs(nowMs - timestampMs) > toleranceMs) return false;
+
+  const expected = createHmac('sha256', secret)
+    .update(webhookSignedPayload(body, { timestamp, nonce }))
+    .digest();
   const supplied = Buffer.from(match[1]!, 'hex');
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
+
+export interface WebhookReplayGuard {
+  /**
+   * Record a nonce sighting. Resolves false when the same nonce was already
+   * seen inside the acceptance window — the request is a replay.
+   */
+  observe(nonce: string, timestampMs: number, nowMs?: number): boolean;
+}
+
+export function createWebhookReplayGuard(options: {
+  readonly toleranceMs?: number;
+  readonly maxTrackedNonces?: number;
+} = {}): WebhookReplayGuard {
+  const toleranceMs = options.toleranceMs ?? DEFAULT_WEBHOOK_TIMESTAMP_TOLERANCE_MS;
+  const maxTrackedNonces = options.maxTrackedNonces ?? DEFAULT_WEBHOOK_REPLAY_MAX_NONCES;
+  const seen = new Map<string, number>();
+  return {
+    observe(nonce: string, timestampMs: number, nowMs: number = Date.now()): boolean {
+      const previous = seen.get(nonce);
+      if (previous !== undefined && Math.abs(nowMs - previous) <= toleranceMs) {
+        return false;
+      }
+      seen.delete(nonce);
+      seen.set(nonce, timestampMs);
+      if (seen.size > maxTrackedNonces) {
+        const oldest = seen.keys().next().value;
+        if (oldest !== undefined) {
+          seen.delete(oldest);
+        }
+      }
+      return true;
+    },
+  };
+}
+
+function webhookSignatureHeaders(secret: string, body: string): Record<string, string> {
+  const fields = newWebhookSignatureFields();
+  return {
+    [WEBHOOK_SIGNATURE_HEADER]: signWebhookBody(secret, body, fields),
+    [WEBHOOK_TIMESTAMP_HEADER]: fields.timestamp,
+    [WEBHOOK_NONCE_HEADER]: fields.nonce,
+  };
 }
 
 function normalizeExecutorConfig(value: unknown): ExecutorConfig {

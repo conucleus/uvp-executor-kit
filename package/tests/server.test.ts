@@ -1,5 +1,4 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { createHmac } from 'node:crypto';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,12 +7,17 @@ import type { RuntimeExecutorHandler } from '../src/runtime.js';
 import {
   assertCallbackUrlAllowed,
   createHandlersFromExecutorConfig,
+  createWebhookReplayGuard,
   DEFAULT_CALLBACK_MAX_ATTEMPTS,
   DEFAULT_CALLBACK_RETRY_BASE_DELAY_MS,
   loadExecutorConfig,
   parseCallbackHostAllowlist,
+  signWebhookBody,
   startExecutorServer,
   verifyWebhookSignature,
+  WEBHOOK_NONCE_HEADER,
+  WEBHOOK_SIGNATURE_HEADER,
+  WEBHOOK_TIMESTAMP_HEADER,
   type ExecutorJob,
 } from '../src/server.js';
 
@@ -30,13 +34,37 @@ const effect = {
 } as const;
 
 describe('executor HTTP server', () => {
-  it('provides fail-closed constant-time webhook HMAC verification for receivers', () => {
+  it('verifies timestamped nonce-bound webhook HMACs and rejects replays of captured requests', () => {
     const body = '{"signal":{"orderId":"order-1"}}';
-    const signature = `sha256=${createHmac('sha256', callbackToken).update(body).digest('hex')}`;
-    expect(verifyWebhookSignature(body, signature, callbackToken)).toBe(true);
-    expect(verifyWebhookSignature(body, signature.replace(/.$/, '0'), callbackToken)).toBe(false);
-    expect(verifyWebhookSignature(body, undefined, callbackToken)).toBe(false);
-    expect(verifyWebhookSignature(`${body} `, signature, callbackToken)).toBe(false);
+    const nowMs = () => 1_800_000_000_000;
+    const fields = { timestamp: '1800000000', nonce: 'a'.repeat(32) };
+    const signature = signWebhookBody(callbackToken, body, fields);
+    const verify = (overrides: Partial<Parameters<typeof verifyWebhookSignature>[3]> = {}) =>
+      verifyWebhookSignature(body, signature, callbackToken, { ...fields, nowMs, ...overrides });
+
+    expect(verify()).toBe(true);
+    expect(verify({ nonce: 'b'.repeat(32) })).toBe(false);
+    expect(verify({ timestamp: '1799000000' })).toBe(false);
+    // A captured (body, signature) pair without timestamp+nonce no longer
+    // verifies: the bare-body HMAC was permanently replayable.
+    expect(verifyWebhookSignature(body, signature, callbackToken)).toBe(false);
+    // Outside the acceptance window the signature is stale even when intact.
+    expect(verify({ nowMs: () => 1_800_000_000_000 + 5 * 60_000 + 1 })).toBe(false);
+    expect(verifyWebhookSignature(body, signWebhookBody(callbackToken, body, fields).replace(/.$/, '0'), callbackToken, { ...fields, nowMs })).toBe(false);
+    expect(verifyWebhookSignature(body, undefined, callbackToken, { ...fields, nowMs })).toBe(false);
+    expect(verifyWebhookSignature(`${body} `, signature, callbackToken, { ...fields, nowMs })).toBe(false);
+    expect(verifyWebhookSignature(body, signWebhookBody('wrong-secret', body, fields), callbackToken, { ...fields, nowMs })).toBe(false);
+  });
+
+  it('burns each webhook nonce once inside the acceptance window', () => {
+    const guard = createWebhookReplayGuard();
+    const at = 1_800_000_000_000;
+    expect(guard.observe('c'.repeat(32), at, at)).toBe(true);
+    expect(guard.observe('c'.repeat(32), at, at + 1000)).toBe(false);
+    expect(guard.observe('d'.repeat(32), at, at + 1000)).toBe(true);
+    // The first nonce is only burned for the window; after it expires the
+    // entry is stale and a (pathological) reuse is treated as fresh.
+    expect(guard.observe('c'.repeat(32), at, at + 5 * 60_000 + 1)).toBe(true);
   });
 
   it('accepts dispatches and posts callback signals to a webhook endpoint', async () => {
@@ -110,6 +138,68 @@ describe('executor HTTP server', () => {
     } finally {
       await executor.close();
       await new Promise<void>((resolve) => callbackEndpoint.close(() => resolve()));
+    }
+  });
+
+  it('signs dispatched callback bodies with timestamp+nonce headers a receiver can verify', async () => {
+    const hmacSecret = 'callback-hmac-secret';
+    const captured: { readonly body: string; readonly headers: Record<string, string | string[] | undefined> }[] = [];
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      callbackHmacSecret: hmacSecret,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+      fetchImpl: async (_input, init) => {
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        captured.push({ body: String(init?.body ?? ''), headers });
+        return new Response('ok', { status: 200 });
+      },
+    });
+
+    try {
+      const response = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-signed', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' }),
+      });
+      expect(response.status).toBe(202);
+      await eventually(async () => {
+        const jobs = await getJobs(executor.url);
+        expect(jobs[0]?.status).toBe('callback_succeeded');
+      });
+
+      expect(captured).toHaveLength(1);
+      const delivery = captured[0]!;
+      const timestamp = delivery.headers[WEBHOOK_TIMESTAMP_HEADER];
+      const nonce = delivery.headers[WEBHOOK_NONCE_HEADER];
+      expect(typeof timestamp).toBe('string');
+      expect(typeof nonce).toBe('string');
+      expect(verifyWebhookSignature(delivery.body, delivery.headers[WEBHOOK_SIGNATURE_HEADER] as string, hmacSecret, {
+        timestamp: typeof timestamp === 'string' ? timestamp : undefined,
+        nonce: typeof nonce === 'string' ? nonce : undefined,
+      })).toBe(true);
+      // The MAC covers timestamp+nonce: replaying the same signature against a
+      // different nonce must fail.
+      expect(verifyWebhookSignature(delivery.body, delivery.headers[WEBHOOK_SIGNATURE_HEADER] as string, hmacSecret, {
+        timestamp: typeof timestamp === 'string' ? timestamp : undefined,
+        nonce: 'e'.repeat(32),
+      })).toBe(false);
+    } finally {
+      await executor.close();
     }
   });
 
