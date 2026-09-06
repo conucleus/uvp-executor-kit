@@ -1106,6 +1106,47 @@ describe('state machine chain watcher', () => {
     expect(result.error?.code).toBe('RPC_NETWORK');
   });
 
+  it('counts only real failures in attempts so completed dry-run multi-signal jobs stay retryable', async () => {
+    // 0200#19: attempts used to accumulate per signal x per attempt with
+    // successes included, so a finished dry-run multi-signal job hit the
+    // manual retry entry already >= maxAttempts and the dead-letter branch
+    // killed a job that had never failed once.
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      dryRun: true,
+      artifact: artifactIndex(),
+      retry: { maxAttempts: 3, baseDelayMs: 0 },
+      handlers: {
+        '*': (event) => ([
+          { planId: PLAN_ID, orderId: event.orderId, source: 'buyer', signalName: 'exec.main.cmp' },
+          { planId: PLAN_ID, orderId: event.orderId, source: 'seller', signalName: 'exec.main.cmp' },
+        ]),
+      },
+    });
+
+    const first = await watcher.handleLog(hookReadyLog());
+    expect(first.job?.status).toBe('matched');
+    // One handler run plus two successful signal submissions: zero failures.
+    expect(first.job?.attempts).toBe(0);
+    expect(first.job?.submissions).toHaveLength(2);
+
+    const jobId = first.job?.id;
+    if (!jobId) {
+      throw new Error('expected job id');
+    }
+    const retried = await retryStateMachineJob(watcher, jobId, {
+      operator: 'ops@example.com',
+      reason: 'flipping dry-run off for the real run',
+    });
+    // No dead-letter: the retry entry saw zero real failures.
+    expect(retried.error).toBeUndefined();
+    expect(retried.job?.status).toBe('matched');
+    expect(retried.job?.lastError).toBeUndefined();
+  });
+
   it('re-opens a failed job through the manual retry channel', async () => {
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',

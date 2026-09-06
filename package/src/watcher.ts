@@ -1035,18 +1035,21 @@ export class StateMachineWatcher {
     ): Promise<SubmitStateMachineSignalResult> => {
       let lastError: ClassifiedExecutorKitError | undefined;
       for (let attemptForSignal = 1; attemptForSignal <= this.config.retry.maxAttempts; attemptForSignal += 1) {
-        attempts += 1;
         try {
           const result = await submitStateMachineSignal(eventSubmitConfig, signal);
-          jobSubmissions.push(toJobSubmission(signalIndex, attempts, result));
+          jobSubmissions.push(toJobSubmission(signalIndex, attemptForSignal, result));
           currentJob = await this.updateJob(job.id, {
             updatedAt: this.config.now(),
-            attempts,
             submissions: jobSubmissions,
           });
           return result;
         } catch (error) {
           const classified = classifyExecutorKitError(error);
+          // attempts is the job-level count of REAL failures: successes and
+          // per-signal bookkeeping must not consume the retry budget, or a
+          // completed multi-signal dry-run arrives at the manual retry entry
+          // already "exhausted" and gets dead-lettered without ever failing.
+          attempts += 1;
           lastError = classified;
           // Fail-closed audit trail: a tx that was broadcast before the failure
           // (receipt reverted or receipt wait threw) must stay visible on the
@@ -1054,7 +1057,7 @@ export class StateMachineWatcher {
           const broadcastTxHash = broadcastTxHashFromError(error);
           jobSubmissions.push({
             signalIndex,
-            attempt: attempts,
+            attempt: attemptForSignal,
             ...(broadcastTxHash ? { txHash: broadcastTxHash } : {}),
             error: classified,
           });
@@ -1071,10 +1074,9 @@ export class StateMachineWatcher {
           if (classified.retryable && broadcastTxHash !== undefined && attemptForSignal < this.config.retry.maxAttempts) {
             const recovered = await this.recoverBroadcastSubmission(eventSubmitConfig, signal, broadcastTxHash);
             if (recovered) {
-              jobSubmissions.push(toJobSubmission(signalIndex, attempts, recovered));
+              jobSubmissions.push(toJobSubmission(signalIndex, attemptForSignal, recovered));
               currentJob = await this.updateJob(job.id, {
                 updatedAt: this.config.now(),
-                attempts,
                 submissions: jobSubmissions,
                 clearLastError: true,
               });
@@ -1100,17 +1102,17 @@ export class StateMachineWatcher {
     };
     let handlerResult: StateMachineHookReadyHandlerResult = undefined;
     for (let attemptForHandler = 1; attemptForHandler <= this.config.retry.maxAttempts; attemptForHandler += 1) {
-      attempts += 1;
       try {
         handlerResult = await resolved.handler(event, context);
         currentJob = await this.updateJob(job.id, {
           updatedAt: this.config.now(),
-          attempts,
           submissions: jobSubmissions,
         });
         break;
       } catch (error) {
         const classified = classifyExecutorKitError(error, 'handler_failure');
+        // See submitSignalWithJobRetry: attempts counts real failures only.
+        attempts += 1;
         currentJob = await this.updateJob(job.id, {
           updatedAt: this.config.now(),
           attempts,
