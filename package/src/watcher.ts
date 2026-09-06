@@ -54,6 +54,13 @@ export const DEFAULT_REORG_WINDOW_BLOCKS = 64;
 export const DEFAULT_GET_LOGS_BLOCK_SPAN = 9_999;
 /** Cap on the poll-delay multiplier during consecutive-failure backoff. */
 export const POLL_FAILURE_BACKOFF_MULTIPLIER_CAP = 8;
+/**
+ * First wait before rebroadcasting a signal whose earlier broadcast was
+ * never confirmed (job-level resend backoff base).
+ */
+export const DEFAULT_RESEND_BACKOFF_BASE_DELAY_MS = 30_000;
+/** Ceiling of the resend backoff so an unconfirmed signal cannot starve forever. */
+export const DEFAULT_RESEND_BACKOFF_MAX_DELAY_MS = 600_000;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as const;
 
 export const HOOK_READY_TOPIC = keccak256(stringToBytes('HookReady(bytes32,bytes32,bytes32,bytes32,bytes32)'));
@@ -185,6 +192,9 @@ export interface StateMachineWatcherConfig extends SubmitStateMachineSignalConfi
   readonly fromBlock?: bigint | number | string;
   readonly pollIntervalMs?: number | string;
   readonly retry?: StateMachineRetryConfig;
+  readonly resendBackoff?: StateMachineResendBackoffConfig;
+  /** Monotonic wall clock (ms) driving the resend backoff; defaults to Date.now. */
+  readonly nowMs?: () => number;
   /**
    * Finality buffer in blocks (default DEFAULT_FINALITY_CONFIRMATIONS): each
    * round scans only up to head - confirmations. 0 restores tip scanning for
@@ -321,6 +331,17 @@ export interface StateMachineRetryConfig {
   readonly baseDelayMs?: number | string;
 }
 
+/**
+ * Backoff for rebroadcasting a signal whose prior broadcast was never
+ * confirmed. The rescan keeps re-triggering every poll round; without a
+ * growing wait the same signal went out once per round (the chain's
+ * idempotency key absorbs it, at gas cost).
+ */
+export interface StateMachineResendBackoffConfig {
+  readonly baseDelayMs?: number | string;
+  readonly maxDelayMs?: number | string;
+}
+
 export interface StateMachineArtifactIndex {
   readonly hooksByHookId?: Readonly<Record<string, StateMachineHookMetadata>>;
   readonly signals?: Readonly<Record<string, StateMachineSignalMetadata>>;
@@ -424,6 +445,12 @@ export interface StateMachineWatcherJob {
   readonly matchedKey?: string;
   readonly submissions: readonly StateMachineJobSubmission[];
   readonly lastError?: ClassifiedExecutorKitError;
+  /**
+   * Wall-clock time of the last real signal attempt (broadcast outcome
+   * known or not). The resend backoff anchors here — updatedAt also moves on
+   * unrelated bookkeeping, which would restart the throttle every round.
+   */
+  readonly lastSignalAttemptAt?: string;
   readonly manualActions?: readonly StateMachineJobManualAction[];
   readonly raw?: StateMachineRawLog;
 }
@@ -458,6 +485,7 @@ export interface StateMachineJobPatch {
   readonly submissions?: readonly StateMachineJobSubmission[];
   readonly lastError?: ClassifiedExecutorKitError;
   readonly clearLastError?: boolean;
+  readonly lastSignalAttemptAt?: string;
   readonly manualActions?: readonly StateMachineJobManualAction[];
 }
 
@@ -519,6 +547,7 @@ export class InMemoryStateMachineJobStore implements StateMachineJobStore {
       ...(patch.submissions ? { submissions: patch.submissions } : {}),
       ...(patch.clearLastError ? {} : currentLastError ? { lastError: currentLastError } : {}),
       ...(patch.lastError ? { lastError: patch.lastError } : {}),
+      ...(patch.lastSignalAttemptAt !== undefined ? { lastSignalAttemptAt: patch.lastSignalAttemptAt } : {}),
       ...(patch.manualActions ? { manualActions: patch.manualActions } : {}),
     };
     this.jobs.set(jobId, cloneJob(next));
@@ -604,6 +633,7 @@ export class FileStateMachineJobStore implements StateMachineJobStore {
       ...(patch.submissions ? { submissions: patch.submissions } : {}),
       ...(patch.clearLastError ? {} : currentLastError ? { lastError: currentLastError } : {}),
       ...(patch.lastError ? { lastError: patch.lastError } : {}),
+      ...(patch.lastSignalAttemptAt !== undefined ? { lastSignalAttemptAt: patch.lastSignalAttemptAt } : {}),
       ...(patch.manualActions ? { manualActions: patch.manualActions } : {}),
     };
     jobs.set(jobId, cloneJob(next));
@@ -955,6 +985,8 @@ export class StateMachineWatcher {
      * own idempotency keys absorb a duplicate when the prior signal survived.
      */
     readonly resubmitDelivered?: boolean;
+    /** Manual retries skip the resend backoff: the operator asked for it now. */
+    readonly bypassResendBackoff?: boolean;
   }): Promise<StateMachineLogProcessResult> {
     if (log.topics[0] !== HOOK_READY_TOPIC) {
       return {
@@ -1040,6 +1072,7 @@ export class StateMachineWatcher {
           jobSubmissions.push(toJobSubmission(signalIndex, attemptForSignal, result));
           currentJob = await this.updateJob(job.id, {
             updatedAt: this.config.now(),
+            lastSignalAttemptAt: this.config.now(),
             submissions: jobSubmissions,
           });
           return result;
@@ -1064,6 +1097,7 @@ export class StateMachineWatcher {
           currentJob = await this.updateJob(job.id, {
             updatedAt: this.config.now(),
             attempts,
+            lastSignalAttemptAt: this.config.now(),
             submissions: jobSubmissions,
             lastError: classified,
           });
@@ -1173,9 +1207,29 @@ export class StateMachineWatcher {
     const deliveredSignalIndexes = options?.resubmitDelivered
       ? new Set<number>()
       : deliveredSignalIndexesFromSubmissions(currentJob.submissions);
+    let deferredResend = false;
     for (const [index, signal] of signals.entries()) {
       if (deliveredSignalIndexes.has(index)) {
         continue;
+      }
+      // O13 resend backoff: a signal with prior unconfirmed broadcasts gets a
+      // growing (capped) wait before the next rebroadcast, so a rescan does
+      // not put the same transaction on chain once per poll round. Behavior
+      // otherwise unchanged — the chain's idempotency key stays the dedupe
+      // anchor — this only stops the per-round gas burn.
+      const priorUnconfirmedBroadcasts = !options?.bypassResendBackoff
+        ? unconfirmedBroadcastCount(currentJob.submissions, index)
+        : 0;
+      if (priorUnconfirmedBroadcasts > 0) {
+        const requiredDelayMs = resendBackoffDelayMs(this.config.resendBackoff, priorUnconfirmedBroadcasts);
+        const lastAttemptAtMs = Date.parse(currentJob.lastSignalAttemptAt ?? currentJob.updatedAt);
+        // A missing/unparseable anchor loses the clock: fall through to the
+        // resend (chain idempotency stays the dedupe anchor) instead of
+        // deferring forever.
+        if (Number.isFinite(lastAttemptAtMs) && this.config.nowMs() - lastAttemptAtMs < requiredDelayMs) {
+          deferredResend = true;
+          continue;
+        }
       }
       try {
         const result = await submitSignalWithJobRetry({
@@ -1222,13 +1276,24 @@ export class StateMachineWatcher {
       signals.length,
       this.config.dryRun,
     );
-    currentJob = await this.updateJob(job.id, {
-      status: finalStatus,
-      updatedAt: this.config.now(),
-      attempts,
-      submissions: jobSubmissions,
-      clearLastError: true,
-    });
+    if (deferredResend) {
+      // A deferred signal keeps the job open. Preserve updatedAt: rewriting
+      // now() would restart the backoff clock on every deferred round.
+      currentJob = await this.updateJob(job.id, {
+        status: finalStatus === 'matched' ? 'submitted' : finalStatus,
+        updatedAt: currentJob.updatedAt,
+        attempts,
+        submissions: jobSubmissions,
+      });
+    } else {
+      currentJob = await this.updateJob(job.id, {
+        status: finalStatus,
+        updatedAt: this.config.now(),
+        attempts,
+        submissions: jobSubmissions,
+        clearLastError: true,
+      });
+    }
 
     return {
       status: 'handled',
@@ -1568,8 +1633,12 @@ export async function retryStateMachineJob(
   // Retrying out of `confirmed` is the manual recovery channel for a
   // reorg-invalidated confirmation: the operator explicitly declares the prior
   // outcome invalid, so the run resubmits everything instead of treating the
-  // old broadcasts as delivered.
-  return watcher.handleLog(job.raw, { resubmitDelivered: job.status === 'confirmed' });
+  // old broadcasts as delivered. Manual retries also skip the resend backoff —
+  // the operator asked for the attempt now, not after the throttle window.
+  return watcher.handleLog(job.raw, {
+    resubmitDelivered: job.status === 'confirmed',
+    bypassResendBackoff: true,
+  });
 }
 
 export async function deadLetterStateMachineJob(
@@ -1942,6 +2011,8 @@ interface NormalizedStateMachineWatcherConfig extends NormalizedSubmitConfig {
   readonly reorgWindow: number;
   readonly getLogsBlockSpan: number;
   readonly retry: NormalizedStateMachineRetryConfig;
+  readonly resendBackoff: NormalizedStateMachineResendBackoffConfig;
+  readonly nowMs: () => number;
   readonly jobStore: StateMachineJobStore;
   readonly cursorStore?: StateMachineCursorStore;
   readonly now: () => string;
@@ -1958,6 +2029,11 @@ interface NormalizedStateMachineDeploymentWatcherConfig {
 interface NormalizedStateMachineRetryConfig {
   readonly maxAttempts: number;
   readonly baseDelayMs: number;
+}
+
+interface NormalizedStateMachineResendBackoffConfig {
+  readonly baseDelayMs: number;
+  readonly maxDelayMs: number;
 }
 
 function normalizeStateMachineWatcherConfig(config: StateMachineWatcherConfig): NormalizedStateMachineWatcherConfig {
@@ -1990,6 +2066,15 @@ function normalizeStateMachineWatcherConfig(config: StateMachineWatcherConfig): 
       ? parsePositiveInteger(asNumberOrString(config.getLogsBlockSpan, 'getLogsBlockSpan'), 'getLogsBlockSpan')
       : DEFAULT_GET_LOGS_BLOCK_SPAN,
     retry: normalizeRetryConfig(config.retry),
+    resendBackoff: {
+      baseDelayMs: config.resendBackoff?.baseDelayMs !== undefined
+        ? parseNonNegativeSafeInteger(asNumberOrString(config.resendBackoff.baseDelayMs, 'resendBackoff.baseDelayMs'), 'resendBackoff.baseDelayMs')
+        : DEFAULT_RESEND_BACKOFF_BASE_DELAY_MS,
+      maxDelayMs: config.resendBackoff?.maxDelayMs !== undefined
+        ? parseNonNegativeSafeInteger(asNumberOrString(config.resendBackoff.maxDelayMs, 'resendBackoff.maxDelayMs'), 'resendBackoff.maxDelayMs')
+        : DEFAULT_RESEND_BACKOFF_MAX_DELAY_MS,
+    },
+    nowMs: config.nowMs ?? (() => Date.now()),
     jobStore: config.jobStore ?? new InMemoryStateMachineJobStore(),
     ...(config.cursorStore ? { cursorStore: config.cursorStore } : {}),
     now: config.now ?? (() => new Date().toISOString()),
@@ -2387,6 +2472,33 @@ function deliveredSignalIndexesFromSubmissions(
     }
   }
   return delivered;
+}
+
+/**
+ * Broadcast-but-unconfirmed attempts for one signal: the exact re-send
+ * candidates the resend backoff throttles. Successful and dry-run submissions
+ * never count.
+ */
+function unconfirmedBroadcastCount(
+  submissions: readonly StateMachineJobSubmission[],
+  signalIndex: number,
+): number {
+  return submissions.filter((submission) =>
+    submission.signalIndex === signalIndex
+    && submission.dryRun !== true
+    && submission.txHash !== undefined
+    && submission.error !== undefined
+    && submission.error.kind !== 'duplicate_signal',
+  ).length;
+}
+
+/** Exponential resend delay capped at maxDelayMs. */
+function resendBackoffDelayMs(
+  config: NormalizedStateMachineResendBackoffConfig,
+  priorUnconfirmedBroadcasts: number,
+): number {
+  const exponent = Math.min(Math.max(priorUnconfirmedBroadcasts - 1, 0), 16);
+  return Math.min(config.baseDelayMs * 2 ** exponent, config.maxDelayMs);
 }
 
 function compareRawLogs(left: StateMachineRawLog, right: StateMachineRawLog): number {

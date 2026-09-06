@@ -1440,6 +1440,151 @@ describe('state machine chain watcher', () => {
     expect(retried.job?.status).toBe('matched');
   });
 
+  it('throttles rebroadcasts of unconfirmed signals with capped exponential backoff', async () => {
+    // O13: the rescan keeps meeting the open job every poll round; without a
+    // backoff the same unconfirmed signal was rebroadcast once per round. The
+    // chain idempotency key stays the dedupe anchor (accepted stance) — this
+    // only stops the per-round gas burn.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const anchorAt = Date.parse('2026-04-28T00:00:00.000Z');
+      let clockMs = anchorAt;
+      const buildWatcher = () => {
+        clockMs = anchorAt;
+        return createStateMachineWatcher({
+          rpcUrl: stub.url,
+          stateMachineAddress: STATE_MACHINE,
+          chainId: 31_337,
+          privateKeyEnv: KEY_ENV,
+          publicClient: fakeReceiptClient(31_337, { status: 'success' }),
+          artifact: artifactIndex(),
+          retry: { maxAttempts: 3, baseDelayMs: 0 },
+          resendBackoff: { baseDelayMs: 30_000, maxDelayMs: 60_000 },
+          now: () => new Date(clockMs).toISOString(),
+          nowMs: () => clockMs,
+          handlers: {
+            '*': (event) => ({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: PAYLOAD_HASH,
+            }),
+          },
+        });
+      };
+
+      const watcher = buildWatcher();
+      const event = decodeHookReadyLog(hookReadyLog(), artifactIndex())!;
+      const seeded = await watcher.config.jobStore.upsertDetected(event, {
+        now: '2026-04-28T00:00:00.000Z',
+        maxAttempts: 3,
+      });
+      await watcher.config.jobStore.update(seeded.id, {
+        status: 'submitted',
+        updatedAt: '2026-04-28T00:00:00.000Z',
+        lastSignalAttemptAt: '2026-04-28T00:00:00.000Z',
+        submissions: [
+          { signalIndex: 0, attempt: 1, dryRun: false, txHash: TX_HASH, error: { kind: 'rpc_network', message: 'Request timed out.', retryable: true } },
+        ],
+      });
+
+      // One second after the failed broadcast: still inside the 30s base
+      // delay, so the rescan defers instead of rebroadcasting.
+      clockMs = anchorAt + 1_000;
+      const deferred = await watcher.handleLog(hookReadyLog());
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(0);
+      expect(deferred.job?.status).toBe('submitted');
+
+      // Past the base delay the rescan rebroadcasts exactly once.
+      clockMs = anchorAt + 30_001;
+      const resent = await watcher.handleLog(hookReadyLog());
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(resent.job?.status).toBe('confirmed');
+
+      // Manual retry never waits on the throttle, even with four prior
+      // unconfirmed broadcasts (uncapped delay would be 30s * 2^3 = 240s).
+      await watcher.config.jobStore.update(seeded.id, {
+        status: 'submitted',
+        updatedAt: '2026-04-28T00:01:00.000Z',
+        submissions: [1, 2, 3, 4].map((attempt) => ({
+          signalIndex: 0,
+          attempt,
+          dryRun: false,
+          txHash: TX_HASH,
+          error: { kind: 'rpc_network', message: 'Request timed out.', retryable: true } as const,
+        })),
+      });
+      clockMs = anchorAt + 60_001;
+      const manual = await retryStateMachineJob(watcher, seeded.id, {
+        operator: 'ops@example.com',
+        now: () => new Date(clockMs).toISOString(),
+      });
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(2);
+      expect(manual.job?.status).toBe('confirmed');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('caps the resend backoff so a long-unconfirmed signal is never starved', async () => {
+    // Four prior unconfirmed broadcasts: uncapped delay would be 30s * 2^3 =
+    // 240s; the 60s cap keeps the wait bounded and the resend happens.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const anchorAt = Date.parse('2026-04-28T00:00:00.000Z');
+      const clockMs = anchorAt + 60_001;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: fakeReceiptClient(31_337, { status: 'success' }),
+        artifact: artifactIndex(),
+        retry: { maxAttempts: 3, baseDelayMs: 0 },
+        resendBackoff: { baseDelayMs: 30_000, maxDelayMs: 60_000 },
+        now: () => new Date(clockMs).toISOString(),
+        nowMs: () => clockMs,
+        handlers: {
+          '*': (event) => ({
+            planId: PLAN_ID,
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          }),
+        },
+      });
+      const event = decodeHookReadyLog(hookReadyLog(), artifactIndex())!;
+      const seeded = await watcher.config.jobStore.upsertDetected(event, {
+        now: '2026-04-28T00:00:00.000Z',
+        maxAttempts: 3,
+      });
+      await watcher.config.jobStore.update(seeded.id, {
+        status: 'submitted',
+        updatedAt: '2026-04-28T00:00:00.000Z',
+        lastSignalAttemptAt: '2026-04-28T00:00:00.000Z',
+        submissions: [1, 2, 3, 4].map((attempt) => ({
+          signalIndex: 0,
+          attempt,
+          dryRun: false,
+          txHash: TX_HASH,
+          error: { kind: 'rpc_network', message: 'Request timed out.', retryable: true } as const,
+        })),
+      });
+
+      const result = await watcher.handleLog(hookReadyLog());
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(result.job?.status).toBe('confirmed');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
   it('resumes a partially delivered multi-signal job from the next pending signal instead of replaying', async () => {
     // Retry resume contract: after a partial multi-signal failure, retrying
     // must not resubmit signals that already have a prior real broadcast —
