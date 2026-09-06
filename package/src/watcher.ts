@@ -1,5 +1,6 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import {
   createPublicClient,
   createWalletClient,
@@ -633,28 +634,34 @@ export class FileStateMachineCursorStore implements StateMachineCursorStore {
       return undefined;
     }
 
-    const parsed = JSON.parse(raw) as unknown;
-    if (!isRecord(parsed)) {
-      throw new ValidationError('cursor file must contain a JSON object');
-    }
-    // A cursor from a different chain or state-machine set belongs to another
-    // watcher identity: ignoring it (and overwriting on the next save) is the
-    // safe reconfiguration behavior, not data corruption.
-    if (!cursorContextMatches(parsed, context)) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (!isRecord(parsed)) {
+        throw new ValidationError('cursor file must contain a JSON object');
+      }
+      // A cursor from a different chain or state-machine set belongs to another
+      // watcher identity: ignoring it (and overwriting on the next save) is the
+      // safe reconfiguration behavior, not data corruption.
+      if (!cursorContextMatches(parsed, context)) {
+        return undefined;
+      }
+      if (parsed.cursor === undefined || parsed.cursor === null) {
+        return undefined;
+      }
+      return parseStoredCursor(parsed.cursor);
+    } catch (error) {
+      // A crash-truncated or structurally invalid file is recoverable, not
+      // poisoned: quarantine the bytes for inspection and start fresh.
+      await quarantineCorruptStateFile(this.filePath, raw, error, 'cursor');
       return undefined;
     }
-    if (parsed.cursor === undefined || parsed.cursor === null) {
-      return undefined;
-    }
-    return parseStoredCursor(parsed.cursor);
   }
 
   async save(cursor: bigint, context: StateMachineCursorContext): Promise<void> {
     if (typeof cursor !== 'bigint' || cursor < 0n) {
       throw new ValidationError('cursor must be a non-negative bigint block number');
     }
-    await mkdir(dirname(this.filePath), { recursive: true });
-    await writeFile(
+    await writeStateFileAtomically(
       this.filePath,
       `${JSON.stringify({
         version: 1,
@@ -663,7 +670,6 @@ export class FileStateMachineCursorStore implements StateMachineCursorStore {
         stateMachines: [...context.stateMachines],
         updatedAt: new Date().toISOString(),
       }, null, 2)}\n`,
-      'utf8',
     );
   }
 }
@@ -2226,6 +2232,17 @@ async function readStateMachineJobsFile(filePath: string): Promise<Map<Hex, Stat
     return new Map();
   }
 
+  try {
+    return parseStateMachineJobsFile(raw);
+  } catch (error) {
+    // Quarantine-and-recover instead of throwing forever: a truncated write
+    // used to poison every later read, aborting the watch loop permanently.
+    await quarantineCorruptStateFile(filePath, raw, error, 'jobs');
+    return new Map();
+  }
+}
+
+function parseStateMachineJobsFile(raw: string): Map<Hex, StateMachineWatcherJob> {
   const parsed = JSON.parse(raw) as unknown;
   const values = Array.isArray(parsed)
     ? parsed
@@ -2242,12 +2259,45 @@ async function readStateMachineJobsFile(filePath: string): Promise<Map<Hex, Stat
   }));
 }
 
-async function writeStateMachineJobsFile(filePath: string, jobs: ReadonlyMap<Hex, StateMachineWatcherJob>): Promise<void> {
+/**
+ * Whole-file persistence must be tmp+rename: a plain writeFile that crashes
+ * mid-write leaves a truncated file that used to make every later parse throw
+ * and eventually abort the watch loop.
+ */
+async function writeStateFileAtomically(filePath: string, contents: string): Promise<void> {
   await mkdir(dirname(filePath), { recursive: true });
-  await writeFile(
+  const temporaryPath = `${filePath}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`;
+  try {
+    await writeFile(temporaryPath, contents, 'utf8');
+    await rename(temporaryPath, filePath);
+  } catch (error) {
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
+ * Keep the damaged bytes instead of deleting them silently: the operator can
+ * still inspect the quarantined file while the process recovers with empty
+ * state.
+ */
+async function quarantineCorruptStateFile(filePath: string, raw: string, error: unknown, kind: 'jobs' | 'cursor'): Promise<void> {
+  const quarantinePath = `${filePath}.corrupt-${new Date().toISOString().replaceAll(/[:.]/g, '')}`;
+  try {
+    await rename(filePath, quarantinePath);
+  } catch {
+    return;
+  }
+  console.error(
+    `executor-kit: ${kind} state file ${filePath} was unreadable (${error instanceof Error ? error.message : String(error)});`
+    + ` it was moved to ${quarantinePath} and will be recreated from scratch. The raw contents began with: ${raw.slice(0, 120)}`,
+  );
+}
+
+async function writeStateMachineJobsFile(filePath: string, jobs: ReadonlyMap<Hex, StateMachineWatcherJob>): Promise<void> {
+  await writeStateFileAtomically(
     filePath,
     `${JSON.stringify({ version: 1, jobs: [...jobs.values()] }, stateMachineJobJsonReplacer, 2)}\n`,
-    'utf8',
   );
 }
 

@@ -1,10 +1,10 @@
 import { readFileSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { encodeAbiParameters, keccak256, stringToBytes, stringToHex, type Hex } from 'viem';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { classifyExecutorKitError, CodedExecutorKitError } from '../src/errors.js';
 import {
   buildSubmitStateMachineSignalCall,
@@ -462,9 +462,10 @@ describe('state machine chain watcher', () => {
     await expect(watcher.pollOnce()).rejects.toThrow('disk full');
   });
 
-  it('round-trips cursor state through the file cursor store and rejects corrupt state', async () => {
+  it('round-trips cursor state through the file cursor store and quarantines corrupt state', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'uvp-cursor-store-'));
     const cursorFile = join(dir, 'nested', 'cursor.json');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const store = new FileStateMachineCursorStore(cursorFile);
       expect(await store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] })).toBeUndefined();
@@ -475,12 +476,17 @@ describe('state machine chain watcher', () => {
       await expect(store.load({ chainId: 1, stateMachines: [STATE_MACHINE] })).resolves.toBeUndefined();
       await expect(store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE_V2] })).resolves.toBeUndefined();
 
+      // A crash-truncated file must not poison the watcher forever: the bytes
+      // are quarantined beside the original path and the store recovers empty
+      // instead of throwing on every read.
       await writeFile(cursorFile, '{not json', 'utf8');
-      // Corrupt state must fail loudly (like the jobs file reader), never be
-      // silently treated as "no cursor".
       await expect(store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] }))
-        .rejects.toThrow();
+        .resolves.toBeUndefined();
+      const quarantined = (await readdir(dirname(cursorFile))).filter((name) => name.startsWith('cursor.json.corrupt-'));
+      expect(quarantined).toHaveLength(1);
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('was unreadable'));
 
+      // Structurally invalid cursors get the same recoverable treatment.
       await writeFile(cursorFile, JSON.stringify({
         version: 1,
         cursor: '-3',
@@ -488,12 +494,43 @@ describe('state machine chain watcher', () => {
         stateMachines: [STATE_MACHINE.toLowerCase()],
       }), 'utf8');
       await expect(store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] }))
-        .rejects.toThrow(/non-negative integer/);
+        .resolves.toBeUndefined();
 
       await expect(store.save(-1n, { chainId: 31_337, stateMachines: [STATE_MACHINE] }))
         .rejects.toThrow(ValidationError);
       expect(() => new FileStateMachineCursorStore(' ')).toThrow(ValidationError);
     } finally {
+      errorSpy.mockRestore();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a truncated jobs file by quarantining it instead of aborting every read', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-jobs-store-corrupt-'));
+    const jobsFile = join(dir, 'jobs.json');
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const store = new FileStateMachineJobStore(jobsFile);
+      const event = decodeHookReadyLog(hookReadyLog(), artifactIndex())!;
+      await store.upsertDetected(event, { now: '2026-04-28T00:00:00.000Z', maxAttempts: 3 });
+      expect((await store.list())).toHaveLength(1);
+
+      // Simulate a crash mid-write: the file is cut in half.
+      const healthy = await readFile(jobsFile, 'utf8');
+      await writeFile(jobsFile, healthy.slice(0, Math.floor(healthy.length / 2)), 'utf8');
+
+      const jobs = await store.list();
+      expect(jobs).toHaveLength(0);
+      const quarantined = (await readdir(dir)).filter((name) => name.startsWith('jobs.json.corrupt-'));
+      expect(quarantined).toHaveLength(1);
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('was unreadable'));
+
+      // The store is usable again: a fresh detection persists normally.
+      const recreated = await store.upsertDetected(event, { now: '2026-04-28T00:00:01.000Z', maxAttempts: 3 });
+      expect(recreated.status).toBe('detected');
+      expect((await store.list())).toHaveLength(1);
+    } finally {
+      errorSpy.mockRestore();
       await rm(dir, { recursive: true, force: true });
     }
   });
