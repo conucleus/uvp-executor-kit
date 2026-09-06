@@ -46,8 +46,14 @@ export const DEFAULT_FINALITY_CONFIRMATIONS = 1;
  * common-ancestor search when a reorg is detected past the finality buffer.
  */
 export const DEFAULT_REORG_WINDOW_BLOCKS = 64;
-/** Consecutive full-poll failures tolerated by start() before the watch loop aborts. */
-export const MAX_CONSECUTIVE_POLL_FAILURES = 3;
+/**
+ * Max blocks per eth_getLogs request. Deep-lag catch-up rounds used to issue
+ * one unbounded query that RPC providers reject outright, failing every round.
+ * Mirrors the chain-services indexer span.
+ */
+export const DEFAULT_GET_LOGS_BLOCK_SPAN = 9_999;
+/** Cap on the poll-delay multiplier during consecutive-failure backoff. */
+export const POLL_FAILURE_BACKOFF_MULTIPLIER_CAP = 8;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as const;
 
 export const HOOK_READY_TOPIC = keccak256(stringToBytes('HookReady(bytes32,bytes32,bytes32,bytes32,bytes32)'));
@@ -145,9 +151,10 @@ export type SubmitStateMachineSignalResult =
 export interface StateMachineWatchHandle {
   stop(): Promise<void> | void;
   /**
-   * Resolves when the loop is stopped manually via stop().
-   * Rejects when the loop aborts because consecutive full-poll failures exceeded
-   * MAX_CONSECUTIVE_POLL_FAILURES; the rejection is the fatal error to propagate.
+   * Resolves when the loop is stopped manually via stop(). The loop never
+   * aborts on its own: persistent poll failures are reported through onError
+   * and the poll cadence backs off exponentially (capped) so an RPC outage
+   * degrades the watcher instead of killing it.
    */
   readonly done: Promise<void>;
 }
@@ -190,6 +197,12 @@ export interface StateMachineWatcherConfig extends SubmitStateMachineSignalConfi
    * reorg slips past the finality buffer.
    */
   readonly reorgWindow?: number | string;
+  /**
+   * Max blocks per eth_getLogs request (default DEFAULT_GET_LOGS_BLOCK_SPAN);
+   * larger scan ranges are chunked so deep-lag catch-up rounds do not trip
+   * provider query limits.
+   */
+  readonly getLogsBlockSpan?: number | string;
   readonly jobStore?: StateMachineJobStore;
   /**
    * Optional durable store for the scan cursor (the next block to scan).
@@ -781,6 +794,7 @@ export class StateMachineWatcher {
       pollIntervalMs: this.config.pollIntervalMs,
       confirmations: this.config.confirmations,
       reorgWindow: this.config.reorgWindow,
+      getLogsBlockSpan: this.config.getLogsBlockSpan,
       handlerKeys: Object.keys(this.config.handlers),
       dryRun: this.config.dryRun,
       retry: this.config.retry,
@@ -868,13 +882,21 @@ export class StateMachineWatcher {
       return { fromBlock, toBlock, scannedLogs: 0, results: [], decodeFailures: 0 };
     }
 
+    // Chunk deep ranges: one unbounded eth_getLogs over a large gap is exactly
+    // the query RPC providers reject, which used to fail every catch-up round.
     const logBatches = await Promise.all(
       this.config.stateMachines.map(async (deployment) => {
-        const logs = await client.getLogs({
-          address: deployment.stateMachineAddress,
-          fromBlock,
-          toBlock,
-        });
+        const logs = (
+          await Promise.all(
+            blockRanges(fromBlock, toBlock, BigInt(this.config.getLogsBlockSpan)).map((range) =>
+              client.getLogs({
+                address: deployment.stateMachineAddress,
+                fromBlock: range.fromBlock,
+                toBlock: range.toBlock,
+              }),
+            ),
+          )
+        ).flat();
         return logs.map((log) => log.address ? log : { ...log, address: deployment.stateMachineAddress });
       }),
     );
@@ -1223,17 +1245,15 @@ export class StateMachineWatcher {
     // First-round failures still fail fast: a rejection here propagates out of start() itself.
     await run();
     let running = false;
+    let stopped = false;
     let consecutiveFailures = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     let resolveStopped: (() => void) | undefined;
-    let rejectFatal: ((error: unknown) => void) | undefined;
-    const done = new Promise<void>((resolve, reject) => {
+    const done = new Promise<void>((resolve) => {
       resolveStopped = resolve;
-      rejectFatal = reject;
     });
-    // Guard against unhandled rejections when a caller never observes `done`.
-    done.catch(() => {});
     const tick = (): void => {
-      if (running) {
+      if (running || stopped) {
         return;
       }
       running = true;
@@ -1242,24 +1262,30 @@ export class StateMachineWatcher {
           consecutiveFailures = 0;
         })
         .catch((error: unknown) => {
+          // Keep watching, but slow down: a permanent clearInterval abort had
+          // no recovery path, so a transient RPC outage killed the listener
+          // until a human restarted the process.
           consecutiveFailures += 1;
           this.config.onError?.(error);
-          if (consecutiveFailures > MAX_CONSECUTIVE_POLL_FAILURES) {
-            clearInterval(timer);
-            rejectFatal?.(new ExecutorKitError(
-              `state machine watch aborted after ${consecutiveFailures} consecutive failed polls: ${describeError(error)}`,
-            ));
-          }
         })
         .finally(() => {
           running = false;
+          if (!stopped) {
+            const delayMs = consecutiveFailures > 0
+              ? pollFailureDelayMs(this.config.pollIntervalMs, consecutiveFailures)
+              : this.config.pollIntervalMs;
+            timer = setTimeout(tick, delayMs);
+          }
         });
     };
-    const timer = setInterval(tick, this.config.pollIntervalMs);
+    tick();
 
     return {
       stop(): void {
-        clearInterval(timer);
+        stopped = true;
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
         resolveStopped?.();
       },
       done,
@@ -1912,6 +1938,7 @@ interface NormalizedStateMachineWatcherConfig extends NormalizedSubmitConfig {
   readonly pollIntervalMs: number;
   readonly confirmations: number;
   readonly reorgWindow: number;
+  readonly getLogsBlockSpan: number;
   readonly retry: NormalizedStateMachineRetryConfig;
   readonly jobStore: StateMachineJobStore;
   readonly cursorStore?: StateMachineCursorStore;
@@ -1957,6 +1984,9 @@ function normalizeStateMachineWatcherConfig(config: StateMachineWatcherConfig): 
     reorgWindow: config.reorgWindow !== undefined
       ? parsePositiveInteger(asNumberOrString(config.reorgWindow, 'reorgWindow'), 'reorgWindow')
       : DEFAULT_REORG_WINDOW_BLOCKS,
+    getLogsBlockSpan: config.getLogsBlockSpan !== undefined
+      ? parsePositiveInteger(asNumberOrString(config.getLogsBlockSpan, 'getLogsBlockSpan'), 'getLogsBlockSpan')
+      : DEFAULT_GET_LOGS_BLOCK_SPAN,
     retry: normalizeRetryConfig(config.retry),
     jobStore: config.jobStore ?? new InMemoryStateMachineJobStore(),
     ...(config.cursorStore ? { cursorStore: config.cursorStore } : {}),
@@ -2657,6 +2687,33 @@ function checkpointAnchorHeights(fromBlock: bigint, toBlock: bigint, reorgWindow
     heights.push(height);
   }
   return heights;
+}
+
+/** Chunk [fromBlock, toBlock] into inclusive spans of at most maxSpan blocks. */
+function blockRanges(
+  fromBlock: bigint,
+  toBlock: bigint,
+  maxSpan: bigint,
+): readonly { readonly fromBlock: bigint; readonly toBlock: bigint }[] {
+  if (maxSpan < 1n) {
+    throw new ValidationError('getLogsBlockSpan must be a positive number of blocks');
+  }
+  const ranges: { fromBlock: bigint; toBlock: bigint }[] = [];
+  for (let start = fromBlock; start <= toBlock; start = start + maxSpan) {
+    const end = start + maxSpan - 1n < toBlock ? start + maxSpan - 1n : toBlock;
+    ranges.push({ fromBlock: start, toBlock: end });
+  }
+  return ranges;
+}
+
+/**
+ * Poll delay after consecutive failures: exponential from the base interval,
+ * capped at POLL_FAILURE_BACKOFF_MULTIPLIER_CAP so a long RPC outage slows the
+ * watcher down instead of aborting it or flooding the dead endpoint.
+ */
+function pollFailureDelayMs(pollIntervalMs: number, consecutiveFailures: number): number {
+  const exponent = Math.min(Math.max(consecutiveFailures - 1, 0), 3);
+  return pollIntervalMs * Math.min(2 ** exponent, POLL_FAILURE_BACKOFF_MULTIPLIER_CAP);
 }
 
 function normalizeCallbackMode(value: string): ExecutorCallbackMode {

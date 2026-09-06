@@ -17,7 +17,6 @@ import {
   hookReadyEventId,
   InMemoryStateMachineJobStore,
   loadStateMachineHandlerConfig,
-  MAX_CONSECUTIVE_POLL_FAILURES,
   retryStateMachineJob,
   submitStateMachineSignal,
   SubmitSignalReceiptError,
@@ -740,8 +739,8 @@ describe('state machine chain watcher', () => {
       aborted = true;
     });
 
-    // Far more consecutive rounds than MAX_CONSECUTIVE_POLL_FAILURES: decode
-    // failures must never count as failed polls or abort the loop.
+    // Far more consecutive rounds than any old failure threshold: decode
+    // failures must never count as failed polls or stop the loop.
     const deadline = Date.now() + 500;
     while (polls < 12 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 5));
@@ -787,7 +786,11 @@ describe('state machine chain watcher', () => {
     await expect(watcher.start()).rejects.toThrow('rpc down');
   });
 
-  it('stops the watch loop and surfaces a fatal error after more consecutive failed polls than the threshold', async () => {
+  it('keeps the watch loop alive with backed-off retries when every poll keeps failing', async () => {
+    // F9: a permanent clearInterval abort after a few consecutive failures
+    // had no recovery path — a transient RPC outage killed the listener until
+    // a human restarted the process. The loop now reports through onError and
+    // slows down (capped exponential backoff) instead of stopping.
     const errors: unknown[] = [];
     let polls = 0;
     const watcher = createStateMachineWatcher({
@@ -821,16 +824,63 @@ describe('state machine chain watcher', () => {
     });
 
     const handle = await watcher.start();
-    await expect(handle.done).rejects.toThrow(/consecutive failed polls.*rpc down/s);
+    let rejected: unknown = undefined;
+    void handle.done.catch((error: unknown) => {
+      rejected = error;
+    });
 
-    // Threshold failures are reported through onError before the fatal abort.
-    expect(errors.length).toBe(MAX_CONSECUTIVE_POLL_FAILURES + 1);
+    // Far beyond the old 3-failure abort threshold.
+    const deadline = Date.now() + 300;
+    while (polls < 10 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(polls).toBeGreaterThanOrEqual(10);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // The loop is still polling (no abort), every failed poll was reported,
+    // and done never rejected.
+    expect(polls).toBeGreaterThan(10);
+    expect(errors.length).toBe(polls - 1);
+    expect(rejected).toBeUndefined();
 
-    const observedErrors = errors.length;
-    const observedPolls = polls;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    expect(errors.length).toBe(observedErrors);
-    expect(polls).toBe(observedPolls);
+    await handle.stop();
+  });
+
+  it('chunks deep getLogs ranges instead of issuing one unbounded query', async () => {
+    const getLogsCalls: unknown[] = [];
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      fromBlock: 10,
+      confirmations: 0,
+      getLogsBlockSpan: 10,
+      dryRun: true,
+      handlers: { '*': () => undefined },
+      publicClient: {
+        async getChainId() {
+          return 31_337;
+        },
+        async getBlockNumber() {
+          return 35n;
+        },
+        async getLogs(args) {
+          getLogsCalls.push(args);
+          return [];
+        },
+      },
+    });
+
+    const poll = await watcher.pollOnce();
+
+    expect(poll.fromBlock).toBe(10n);
+    expect(poll.toBlock).toBe(35n);
+    expect(getLogsCalls).toEqual([
+      { address: STATE_MACHINE, fromBlock: 10n, toBlock: 19n },
+      { address: STATE_MACHINE, fromBlock: 20n, toBlock: 29n },
+      { address: STATE_MACHINE, fromBlock: 30n, toBlock: 35n },
+    ]);
+    expect(watcher.describe().getLogsBlockSpan).toBe(10);
   });
 
   it('keeps watching when a successful round resets the consecutive-failure count', async () => {

@@ -588,8 +588,9 @@ export function buildProgram(): Command {
       console.log(stringifyForTransport({ watcher: watcher.describe(), storage }));
       const handle = await watcher.start();
       try {
-        // A fatal watch-loop abort (consecutive poll failures) rejects handle.done and
-        // propagates out of this command so the process exits non-zero.
+        // handle.done resolves on stop(); persistent poll failures are
+        // reported through the watcher's onError (stderr) with capped
+        // exponential backoff instead of aborting the loop.
         await Promise.race([
           handle.done,
           waitForShutdown(async () => {
