@@ -192,7 +192,8 @@ describe('state machine chain watcher', () => {
     const poll = await watcher.pollOnce();
 
     expect(poll.fromBlock).toBe(10n);
-    expect(poll.toBlock).toBe(12n);
+    // The finality buffer holds the scan one block behind the head by default.
+    expect(poll.toBlock).toBe(11n);
     expect(poll.scannedLogs).toBe(1);
     expect(poll.results[0]?.status).toBe('handled');
     expect(poll.results[0]?.job?.status).toBe('matched');
@@ -200,7 +201,7 @@ describe('state machine chain watcher', () => {
       {
         address: STATE_MACHINE,
         fromBlock: 10n,
-        toBlock: 12n,
+        toBlock: 11n,
       },
     ]);
   });
@@ -247,8 +248,8 @@ describe('state machine chain watcher', () => {
 
     expect(poll.scannedLogs).toBe(2);
     expect(getLogsCalls).toEqual([
-      { address: STATE_MACHINE, fromBlock: 10n, toBlock: 12n },
-      { address: STATE_MACHINE_V2, fromBlock: 10n, toBlock: 12n },
+      { address: STATE_MACHINE, fromBlock: 10n, toBlock: 11n },
+      { address: STATE_MACHINE_V2, fromBlock: 10n, toBlock: 11n },
     ]);
     expect(poll.results.map((result) => result.event?.stateMachineAddress)).toEqual([STATE_MACHINE, STATE_MACHINE_V2]);
     expect(poll.results[0]?.job?.id).not.toBe(poll.results[1]?.job?.id);
@@ -260,7 +261,7 @@ describe('state machine chain watcher', () => {
     const stateDir = join(dir, 'state');
     try {
       const getLogsCalls: unknown[] = [];
-      let headBlock = 12n;
+      let headBlock = 13n;
       const buildWatcher = () => createStateMachineWatcher({
         rpcUrl: 'http://127.0.0.1:8545',
         stateMachineAddress: STATE_MACHINE,
@@ -290,25 +291,27 @@ describe('state machine chain watcher', () => {
           async getLogs(args) {
             getLogsCalls.push(args);
             // The HookReady event exists at block 12 only.
-            return args.fromBlock <= 12n ? [hookReadyLog()] : [];
+            return args.fromBlock <= 12n && args.toBlock >= 12n ? [hookReadyLog()] : [];
           },
         },
       });
 
-      // First process: scans 10..12, handles the event, persists cursor 13.
+      // First process: with the head at 13 the finalized range is 10..12, the
+      // event is handled, and cursor 13 persists.
       const first = buildWatcher();
       const firstPoll = await first.pollOnce();
       expect(firstPoll.fromBlock).toBe(10n);
+      expect(firstPoll.toBlock).toBe(12n);
       expect(firstPoll.scannedLogs).toBe(1);
       expect(first.describe().nextBlock).toBe('13');
       expect(first.describe().cursorStore).toBe('file');
       expect(first.describe().jobStore).toBe('file');
       const storedCursor = JSON.parse(
         await readFile(join(stateDir, 'cursor.json'), 'utf8'),
-      ) as { version?: number; cursor?: string; chainId?: number; stateMachines?: string[] };
+      ) as { version?: number; nextBlock?: string; chainId?: number; stateMachines?: string[] };
       expect(storedCursor).toMatchObject({
-        version: 1,
-        cursor: '13',
+        version: 2,
+        nextBlock: '13',
         chainId: 31_337,
         stateMachines: [STATE_MACHINE.toLowerCase()],
       });
@@ -319,11 +322,11 @@ describe('state machine chain watcher', () => {
       const restarted = buildWatcher();
       const secondPoll = await restarted.pollOnce();
       expect(secondPoll.fromBlock).toBe(13n);
-      expect(secondPoll.toBlock).toBe(15n);
+      expect(secondPoll.toBlock).toBe(14n);
       expect(secondPoll.scannedLogs).toBe(0);
       expect(getLogsCalls).toEqual([
         { address: STATE_MACHINE, fromBlock: 10n, toBlock: 12n },
-        { address: STATE_MACHINE, fromBlock: 13n, toBlock: 15n },
+        { address: STATE_MACHINE, fromBlock: 13n, toBlock: 14n },
       ]);
       // The job store also survived the restart (no duplicate detection).
       const jobs = await restarted.config.jobStore.list();
@@ -334,12 +337,12 @@ describe('state machine chain watcher', () => {
     }
   });
 
-  it('ignores a persisted cursor bound to a different chain or state-machine set', async () => {
+  it('alerts on and discards a persisted cursor bound to a different chain, machine set, or genesis', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-cursor-ctx-'));
     try {
       const cursorFile = join(dir, 'cursor.json');
       const store = new FileStateMachineCursorStore(cursorFile);
-      await store.save(40n, { chainId: 31_337, stateMachines: [STATE_MACHINE.toLowerCase()] });
+      await store.save({ nextBlock: 40n }, { chainId: 31_337, stateMachines: [STATE_MACHINE.toLowerCase()] });
       const noLogsClient = (chainId: number): StateMachinePublicClient => ({
         async getChainId() {
           return chainId;
@@ -392,7 +395,81 @@ describe('state machine chain watcher', () => {
         cursorStore: new FileStateMachineCursorStore(cursorFile),
         publicClient: noLogsClient(31_337),
       });
-      expect((await resumed.pollOnce()).fromBlock).toBe(13n);
+      expect((await resumed.pollOnce()).fromBlock).toBe(12n);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('resets and alerts when the chain genesis hash changes under the same chain id', async () => {
+    // The Anvil-reset shape: chain id and machines are unchanged, but the
+    // chain itself is new. Without the genesis in the cursor identity the
+    // stale cursor silently drops every event until the new head passes it
+    // and --from-block stays suppressed.
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-cursor-genesis-'));
+    const errors: unknown[] = [];
+    try {
+      const cursorFile = join(dir, 'cursor.json');
+      const genesisA = `0x${'aa'.repeat(32)}`;
+      const genesisB = `0x${'bb'.repeat(32)}`;
+      const clientWith = (genesis: string, head: bigint): StateMachinePublicClient => ({
+        async getChainId() {
+          return 31_337;
+        },
+        async getBlockNumber() {
+          return head;
+        },
+        async getLogs() {
+          return [];
+        },
+        async getBlock(args: { readonly blockNumber: bigint }) {
+          if (args.blockNumber === 0n) {
+            return { hash: genesis };
+          }
+          return { hash: `0x${(Number(args.blockNumber) + 1).toString(16).padStart(64, '0')}` };
+        },
+      });
+
+      const first = createStateMachineWatcher({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        walletAddress: WALLET_ADDRESS,
+        fromBlock: 10,
+        dryRun: true,
+        handlers: { '*': () => undefined },
+        cursorStore: new FileStateMachineCursorStore(cursorFile),
+        publicClient: clientWith(genesisA, 30n),
+      });
+      await first.pollOnce();
+      const stored = JSON.parse(await readFile(cursorFile, 'utf8')) as { genesisHash?: string; nextBlock?: string };
+      expect(stored).toMatchObject({ genesisHash: genesisA, nextBlock: '30' });
+
+      // Same chain id, new genesis (reset chain with a shorter head): the
+      // cursor is discarded with an alert instead of suppressing --from-block.
+      const reset = createStateMachineWatcher({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        walletAddress: WALLET_ADDRESS,
+        fromBlock: 10,
+        dryRun: true,
+        handlers: { '*': () => undefined },
+        onError: (error) => {
+          errors.push(error);
+        },
+        cursorStore: new FileStateMachineCursorStore(cursorFile),
+        publicClient: clientWith(genesisB, 12n),
+      });
+      const poll = await reset.pollOnce();
+      expect(poll.fromBlock).toBe(10n);
+      expect(poll.toBlock).toBe(11n);
+      expect(errors).toHaveLength(1);
+      expect(String(errors[0])).toContain('genesis hash changed');
+      // The stale 40-block-position history is gone: the file now carries the
+      // new chain identity.
+      const after = JSON.parse(await readFile(cursorFile, 'utf8')) as { genesisHash?: string; nextBlock?: string };
+      expect(after).toMatchObject({ genesisHash: genesisB, nextBlock: '12' });
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -423,7 +500,7 @@ describe('state machine chain watcher', () => {
     expect(watcher.describe().cursorStore).toBe('memory');
     expect(watcher.describe().jobStore).toBe('memory');
     await watcher.pollOnce();
-    expect(watcher.describe().nextBlock).toBe('13');
+    expect(watcher.describe().nextBlock).toBe('12');
   });
 
   it('reports a failed cursor save as a failed round instead of pretending it was persisted', async () => {
@@ -438,7 +515,7 @@ describe('state machine chain watcher', () => {
       cursorStore: {
         kind: 'failing',
         async load() {
-          return undefined;
+          return { status: 'empty' } as const;
         },
         async save() {
           throw new Error('disk full');
@@ -472,35 +549,38 @@ describe('state machine chain watcher', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const store = new FileStateMachineCursorStore(cursorFile);
-      expect(await store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] })).toBeUndefined();
+      expect(await store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] })).toEqual({ status: 'empty' });
 
-      await store.save(4_194_304n, { chainId: 31_337, stateMachines: [STATE_MACHINE.toLowerCase()] });
-      expect(await store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] })).toBe(4_194_304n);
+      await store.save({ nextBlock: 4_194_304n }, { chainId: 31_337, stateMachines: [STATE_MACHINE.toLowerCase()] });
+      expect(await store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] })).toEqual({
+        status: 'restored',
+        nextBlock: 4_194_304n,
+      });
 
-      await expect(store.load({ chainId: 1, stateMachines: [STATE_MACHINE] })).resolves.toBeUndefined();
-      await expect(store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE_V2] })).resolves.toBeUndefined();
+      await expect(store.load({ chainId: 1, stateMachines: [STATE_MACHINE] })).resolves.toEqual({ status: 'foreign', reason: 'context' });
+      await expect(store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE_V2] })).resolves.toEqual({ status: 'foreign', reason: 'context' });
 
       // A crash-truncated file must not poison the watcher forever: the bytes
       // are quarantined beside the original path and the store recovers empty
       // instead of throwing on every read.
       await writeFile(cursorFile, '{not json', 'utf8');
       await expect(store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] }))
-        .resolves.toBeUndefined();
+        .resolves.toEqual({ status: 'empty' });
       const quarantined = (await readdir(dirname(cursorFile))).filter((name) => name.startsWith('cursor.json.corrupt-'));
       expect(quarantined).toHaveLength(1);
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('was unreadable'));
 
       // Structurally invalid cursors get the same recoverable treatment.
       await writeFile(cursorFile, JSON.stringify({
-        version: 1,
-        cursor: '-3',
+        version: 2,
+        nextBlock: '-3',
         chainId: 31_337,
         stateMachines: [STATE_MACHINE.toLowerCase()],
       }), 'utf8');
       await expect(store.load({ chainId: 31_337, stateMachines: [STATE_MACHINE] }))
-        .resolves.toBeUndefined();
+        .resolves.toEqual({ status: 'empty' });
 
-      await expect(store.save(-1n, { chainId: 31_337, stateMachines: [STATE_MACHINE] }))
+      await expect(store.save({ nextBlock: -1n }, { chainId: 31_337, stateMachines: [STATE_MACHINE] }))
         .rejects.toThrow(ValidationError);
       expect(() => new FileStateMachineCursorStore(' ')).toThrow(ValidationError);
     } finally {
@@ -589,7 +669,7 @@ describe('state machine chain watcher', () => {
     expect(poll.results[0]?.job).toBeUndefined();
     expect(poll.results[1]?.status).toBe('handled');
     expect(errors).toHaveLength(1);
-    expect(watcher.describe().nextBlock).toBe('13');
+    expect(watcher.describe().nextBlock).toBe('12');
     expect(watcher.describe().decodeFailures).toBe(1);
   });
 
@@ -1097,37 +1177,130 @@ describe('state machine chain watcher', () => {
     }
   });
 
-  it('does not retry confirmed jobs', async () => {
-    const watcher = createStateMachineWatcher({
-      rpcUrl: 'http://127.0.0.1:8545',
-      stateMachineAddress: STATE_MACHINE,
-      chainId: 31_337,
-      walletAddress: WALLET_ADDRESS,
-      dryRun: true,
-      artifact: artifactIndex(),
-      handlers: {
-        '*': (event) => ({
-          planId: PLAN_ID,
-          orderId: event.orderId,
-          source: 'buyer',
-          signalName: 'exec.main.cmp',
-          payloadHash: PAYLOAD_HASH,
-        }),
-      },
-    });
-    const result = await watcher.handleLog(hookReadyLog());
-    const jobId = result.job?.id;
-    if (!jobId) {
-      throw new Error('expected job id');
-    }
-    await watcher.config.jobStore.update(jobId, {
-      status: 'confirmed',
-      updatedAt: '2026-04-28T00:00:00.000Z',
-    });
+  it('re-opens a confirmed job through the manual retry channel with forced resubmission', async () => {
+    // F-03: `confirmed` used to be a permanent lock — retry refused it, so a
+    // reorg that flipped the confirmation off the canonical chain left the
+    // job stuck with no human recovery. The retry now resubmits every signal
+    // (the on-chain idempotency key absorbs a duplicate when the signal
+    // actually survived).
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: fakeReceiptClient(31_337, { status: 'success' }),
+        artifact: artifactIndex(),
+        retry: { maxAttempts: 3, baseDelayMs: 0 },
+        handlers: {
+          '*': (event) => ({
+            planId: PLAN_ID,
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          }),
+        },
+      });
+      const event = decodeHookReadyLog(hookReadyLog(), artifactIndex())!;
+      const seeded = await watcher.config.jobStore.upsertDetected(event, {
+        now: '2026-04-28T00:00:00.000Z',
+        maxAttempts: 3,
+      });
+      await watcher.config.jobStore.update(seeded.id, {
+        status: 'confirmed',
+        updatedAt: '2026-04-28T00:00:02.000Z',
+        submissions: [{ signalIndex: 0, attempt: 1, dryRun: false, txHash: TX_HASH }],
+      });
 
-    await expect(retryStateMachineJob(watcher, jobId, {
-      operator: 'ops@example.com',
-    })).rejects.toThrow('cannot be retried from status confirmed');
+      const recovered = await retryStateMachineJob(watcher, seeded.id, {
+        operator: 'ops@example.com',
+        reason: 'confirmation reorged away',
+        now: () => '2026-04-28T00:00:30.000Z',
+      });
+
+      // The delivered-set shortcut was ignored for the forced recovery: the
+      // signal was rebroadcast (and re-confirmed by the receipt stub).
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(recovered.status).toBe('handled');
+      expect(recovered.job?.status).toBe('confirmed');
+      expect(recovered.job?.submissions).toHaveLength(2);
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('rolls the scan cursor back to the common ancestor when a reorg flips the cursor block hash', async () => {
+    // F-03: with no hash continuity check, a short fork let the cursor pass a
+    // block that left the canonical chain, and everything on the orphaned
+    // branch was silently never rescanned.
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-reorg-'));
+    const errors: unknown[] = [];
+    const getLogsCalls: unknown[] = [];
+    try {
+      const cursorFile = join(dir, 'cursor.json');
+      // A tiny deterministic chain: hash(h) encodes the height, and the fork
+      // swaps the hash of one height to simulate the reorg.
+      let forkedAt: bigint | undefined = undefined;
+      const hashAt = (height: bigint): string => `0x${(Number(height) + (forkedAt !== undefined && height >= forkedAt ? 1000 : 0)).toString(16).padStart(64, '0')}`;
+      const client: StateMachinePublicClient = {
+        async getChainId() {
+          return 31_337;
+        },
+        async getBlockNumber() {
+          return 20n;
+        },
+        async getLogs(args) {
+          getLogsCalls.push(args);
+          return [];
+        },
+        async getBlock(args: { readonly blockNumber: bigint }) {
+          return { hash: args.blockNumber === 0n ? `0x${'aa'.repeat(32)}` : hashAt(args.blockNumber) };
+        },
+      };
+      const buildWatcher = () => createStateMachineWatcher({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        walletAddress: WALLET_ADDRESS,
+        fromBlock: 10,
+        dryRun: true,
+        handlers: { '*': () => undefined },
+        onError: (error: unknown) => {
+          errors.push(error);
+        },
+        cursorStore: new FileStateMachineCursorStore(cursorFile),
+        publicClient: client,
+      });
+
+      // Round 1: scan 10..19 and anchor canonical hashes at 19, 18, 16, 12
+      // (dense near the tip, exponential deeper).
+      const first = buildWatcher();
+      await first.pollOnce();
+      const stored = JSON.parse(await readFile(cursorFile, 'utf8')) as { nextBlock?: string; blockHash?: string; checkpoints?: Array<{ blockNumber: string }> };
+      expect(stored).toMatchObject({ nextBlock: '20' });
+      expect(stored.checkpoints?.map((checkpoint) => checkpoint.blockNumber)).toEqual(['12', '16', '18', '19']);
+
+      // A reorg rewrites block 18 (and everything above): the stored hash for
+      // height 19 no longer matches the canonical chain. The newest surviving
+      // anchor below the fork is 16, so the scan rolls back to 17.
+      forkedAt = 18n;
+      errors.length = 0;
+      const second = buildWatcher();
+      const poll = await second.pollOnce();
+
+      // Continuity check fired: the cursor rolled back to the common
+      // ancestor anchor and the round rescanned 17..19.
+      expect(errors).toHaveLength(1);
+      expect(String(errors[0])).toContain('rolling the scan cursor back');
+      expect(getLogsCalls.at(-1)).toMatchObject({ fromBlock: 17n, toBlock: 19n });
+      expect(poll.fromBlock).toBe(17n);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('keeps unconfirmed submissions non-terminal so rescans and retries can still observe them', async () => {

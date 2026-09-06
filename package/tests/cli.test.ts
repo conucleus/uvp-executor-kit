@@ -535,7 +535,8 @@ describe('watcher state storage', () => {
         ...extra,
       ];
 
-      // First run (head at block 12): scans 10..12 and persists state.
+      // First run (head at block 13): the finality buffer holds the scan one
+      // block back, so 10..12 is scanned and cursor 13 persists.
       await main(argv());
       const firstRun = JSON.parse(logs[0] ?? '{}') as {
         watcher?: { nextBlock?: string; cursorStore?: string; jobStore?: string };
@@ -559,9 +560,10 @@ describe('watcher state storage', () => {
 
       const storedCursor = JSON.parse(
         await readFile(join(stateDir, 'cursor.json'), 'utf8'),
-      ) as { cursor?: string; chainId?: number; stateMachines?: string[] };
+      ) as { version?: number; nextBlock?: string; chainId?: number; stateMachines?: string[] };
       expect(storedCursor).toMatchObject({
-        cursor: '13',
+        version: 2,
+        nextBlock: '13',
         chainId: 31_337,
         stateMachines: [RETRY_STATE_MACHINE.toLowerCase()],
       });
@@ -590,12 +592,12 @@ describe('watcher state storage', () => {
         poll?: { fromBlock?: string; toBlock?: string; scannedLogs?: number };
       };
       expect(secondRun.poll?.fromBlock).toBe('13');
-      expect(secondRun.poll?.toBlock).toBe('15');
+      expect(secondRun.poll?.toBlock).toBe('14');
       expect(secondRun.poll?.scannedLogs).toBe(0);
-      expect(secondRun.watcher?.nextBlock).toBe('16');
+      expect(secondRun.watcher?.nextBlock).toBe('15');
       expect(stub.getLogsCalls).toEqual([
         { address: RETRY_STATE_MACHINE, fromBlock: '0xa', toBlock: '0xc' },
-        { address: RETRY_STATE_MACHINE, fromBlock: '0xd', toBlock: '0xf' },
+        { address: RETRY_STATE_MACHINE, fromBlock: '0xd', toBlock: '0xe' },
       ]);
     } finally {
       stub.close();
@@ -687,7 +689,7 @@ async function startChainStub(): Promise<{
   setHeadBlock(hex: string): void;
   close(): Promise<void>;
 }> {
-  let head = '0xc';
+  let head = '0xd';
   const getLogsCalls: Array<{ address?: string; fromBlock?: string; toBlock?: string }> = [];
   const server = createServer((request, response) => {
     void (async () => {
@@ -713,7 +715,8 @@ async function startChainStub(): Promise<{
         };
         getLogsCalls.push({ address: filter.address, fromBlock: filter.fromBlock, toBlock: filter.toBlock });
         const from = Number.parseInt(filter.fromBlock ?? '0x0', 16);
-        result = Number.isFinite(from) && from <= 12 ? [hookReadyRpcLog()] : [];
+        const to = Number.parseInt(filter.toBlock ?? '0x0', 16);
+        result = Number.isFinite(from) && from <= 12 && to >= 12 ? [hookReadyRpcLog()] : [];
       }
       response.statusCode = 200;
       response.setHeader('content-type', 'application/json');

@@ -34,6 +34,18 @@ export { STATE_MACHINE_ABI } from '@uvp-eth/protocol-bindings';
 
 export const DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV = DEFAULT_SIGNING_KEY_ENV;
 export const DEFAULT_STATE_MACHINE_POLL_INTERVAL_MS = 4_000;
+/**
+ * Finality buffer in blocks: the watcher only scans up to head - N so a
+ * short reorg cannot flip already-processed logs (and their confirmed
+ * submissions) out from under the cursor. Mirrors the chain-services
+ * indexer's finalityConfirmations.
+ */
+export const DEFAULT_FINALITY_CONFIRMATIONS = 1;
+/**
+ * How many recent block-hash checkpoints the cursor keeps for the bounded
+ * common-ancestor search when a reorg is detected past the finality buffer.
+ */
+export const DEFAULT_REORG_WINDOW_BLOCKS = 64;
 /** Consecutive full-poll failures tolerated by start() before the watch loop aborts. */
 export const MAX_CONSECUTIVE_POLL_FAILURES = 3;
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as const;
@@ -166,6 +178,18 @@ export interface StateMachineWatcherConfig extends SubmitStateMachineSignalConfi
   readonly fromBlock?: bigint | number | string;
   readonly pollIntervalMs?: number | string;
   readonly retry?: StateMachineRetryConfig;
+  /**
+   * Finality buffer in blocks (default DEFAULT_FINALITY_CONFIRMATIONS): each
+   * round scans only up to head - confirmations. 0 restores tip scanning for
+   * throwaway local chains.
+   */
+  readonly confirmations?: number | string;
+  /**
+   * Bounded reorg checkpoint window (default DEFAULT_REORG_WINDOW_BLOCKS):
+   * recent scanned block hashes kept for the common-ancestor rollback when a
+   * reorg slips past the finality buffer.
+   */
+  readonly reorgWindow?: number | string;
   readonly jobStore?: StateMachineJobStore;
   /**
    * Optional durable store for the scan cursor (the next block to scan).
@@ -205,6 +229,15 @@ export interface StateMachinePublicClient {
   getTransactionReceipt?(args: {
     readonly hash: Hex;
   }): Promise<{ readonly status?: 'success' | 'reverted' | string } | null | undefined>;
+  /**
+   * Optional canonical block lookup powering the reorg defenses: the genesis
+   * hash binds the cursor identity to one chain, and per-round block hashes
+   * anchor the cursor continuity check. Absent on a client, all hash-based
+   * defenses degrade to the finality buffer alone.
+   */
+  getBlock?(args: {
+    readonly blockNumber: bigint;
+  }): Promise<{ readonly hash?: Hex | string }>;
 }
 
 export interface StateMachineLogProcessResult {
@@ -581,13 +614,43 @@ export class FileStateMachineJobStore implements StateMachineJobStore {
 
 /**
  * Identity of the scan position a cursor belongs to. A persisted cursor is only
- * restored when the watcher's chain id and state-machine set match, so
- * reconfiguring the watcher can never resume from a foreign scan position.
+ * restored when the watcher's chain id, state-machine set, and chain genesis
+ * hash match, so reconfiguring the watcher or resetting the chain (e.g. a fresh
+ * Anvil) can never resume from a foreign scan position.
  */
 export interface StateMachineCursorContext {
   readonly chainId: number;
   /** Lowercase state-machine addresses, sorted; the watcher derives this from its config. */
   readonly stateMachines: readonly string[];
+  /**
+   * Canonical genesis (block-0) hash. Known only when the RPC client can read
+   * blocks; a chain reset mints a different genesis even at the same chain id,
+   * which is exactly the silent-drop case the identity must catch.
+   */
+  readonly genesisHash?: string;
+}
+
+/** A remembered (height, canonical hash) anchor inside the reorg window. */
+export interface StateMachineCursorCheckpoint {
+  readonly blockNumber: bigint;
+  readonly blockHash: string;
+}
+
+export type StateMachineCursorLoadResult =
+  | {
+    readonly status: 'restored';
+    readonly nextBlock: bigint;
+    /** Canonical hash of block nextBlock - 1, when the saving round could read it. */
+    readonly blockHash?: string;
+    readonly checkpoints?: readonly StateMachineCursorCheckpoint[];
+  }
+  | { readonly status: 'empty' }
+  | { readonly status: 'foreign'; readonly reason: 'context' | 'genesis' };
+
+export interface StateMachineCursorState {
+  readonly nextBlock: bigint;
+  readonly blockHash?: string;
+  readonly checkpoints?: readonly StateMachineCursorCheckpoint[];
 }
 
 /**
@@ -600,13 +663,14 @@ export interface StateMachineCursorStore {
   /** Storage-mode label for diagnostics (`file`, ...); optional so custom stores stay compatible. */
   readonly kind?: string;
   /**
-   * Return the persisted next-block cursor for this context, or undefined when
-   * nothing usable is stored (absent file, foreign context). Structurally
-   * invalid state throws instead of being silently ignored.
+   * Resolve the persisted cursor for this context. `empty` when nothing usable
+   * is stored; `foreign` when a cursor exists but belongs to another watcher
+   * identity (the watcher alerts and starts fresh instead of silently adopting
+   * it). Structurally invalid state is quarantined and reported as `empty`.
    */
-  load(context: StateMachineCursorContext): Promise<bigint | undefined>;
+  load(context: StateMachineCursorContext): Promise<StateMachineCursorLoadResult>;
   /** Persist the cursor after a successful scan round advanced past its toBlock. */
-  save(cursor: bigint, context: StateMachineCursorContext): Promise<void>;
+  save(state: StateMachineCursorState, context: StateMachineCursorContext): Promise<void>;
 }
 
 export class FileStateMachineCursorStore implements StateMachineCursorStore {
@@ -620,54 +684,66 @@ export class FileStateMachineCursorStore implements StateMachineCursorStore {
     this.filePath = filePath;
   }
 
-  async load(context: StateMachineCursorContext): Promise<bigint | undefined> {
+  async load(context: StateMachineCursorContext): Promise<StateMachineCursorLoadResult> {
     let raw: string;
     try {
       raw = await readFile(this.filePath, 'utf8');
     } catch (error) {
       if (isNodeError(error) && error.code === 'ENOENT') {
-        return undefined;
+        return { status: 'empty' };
       }
       throw error;
     }
     if (raw.trim().length === 0) {
-      return undefined;
+      return { status: 'empty' };
     }
 
     try {
-      const parsed = JSON.parse(raw) as unknown;
-      if (!isRecord(parsed)) {
+      const decoded = JSON.parse(raw) as unknown;
+      if (!isRecord(decoded)) {
         throw new ValidationError('cursor file must contain a JSON object');
       }
-      // A cursor from a different chain or state-machine set belongs to another
-      // watcher identity: ignoring it (and overwriting on the next save) is the
-      // safe reconfiguration behavior, not data corruption.
-      if (!cursorContextMatches(parsed, context)) {
-        return undefined;
+      // A cursor from a different chain id, state-machine set, or genesis
+      // belongs to another watcher identity: report it as foreign so the
+      // watcher can alert and start fresh; the next successful save overwrites.
+      if (!cursorContextMatches(decoded, context)) {
+        return { status: 'foreign', reason: 'context' };
       }
-      if (parsed.cursor === undefined || parsed.cursor === null) {
-        return undefined;
+      const storedGenesis = typeof decoded.genesisHash === 'string' ? decoded.genesisHash.toLowerCase() : undefined;
+      if (context.genesisHash !== undefined && storedGenesis !== undefined && storedGenesis !== context.genesisHash) {
+        return { status: 'foreign', reason: 'genesis' };
       }
-      return parseStoredCursor(parsed.cursor);
+      if (decoded.nextBlock === undefined || decoded.nextBlock === null) {
+        return { status: 'empty' };
+      }
+      return {
+        status: 'restored',
+        nextBlock: parseStoredCursor(decoded.nextBlock),
+        ...(typeof decoded.blockHash === 'string' && decoded.blockHash.length > 0 ? { blockHash: decoded.blockHash.toLowerCase() } : {}),
+        ...(Array.isArray(decoded.checkpoints) ? { checkpoints: parseStoredCheckpoints(decoded.checkpoints) } : {}),
+      };
     } catch (error) {
       // A crash-truncated or structurally invalid file is recoverable, not
       // poisoned: quarantine the bytes for inspection and start fresh.
       await quarantineCorruptStateFile(this.filePath, raw, error, 'cursor');
-      return undefined;
+      return { status: 'empty' };
     }
   }
 
-  async save(cursor: bigint, context: StateMachineCursorContext): Promise<void> {
-    if (typeof cursor !== 'bigint' || cursor < 0n) {
+  async save(state: StateMachineCursorState, context: StateMachineCursorContext): Promise<void> {
+    if (typeof state.nextBlock !== 'bigint' || state.nextBlock < 0n) {
       throw new ValidationError('cursor must be a non-negative bigint block number');
     }
     await writeStateFileAtomically(
       this.filePath,
       `${JSON.stringify({
-        version: 1,
-        cursor: cursor.toString(),
+        version: 2,
+        nextBlock: state.nextBlock.toString(),
+        ...(state.blockHash ? { blockHash: state.blockHash } : {}),
+        ...(state.checkpoints && state.checkpoints.length > 0 ? { checkpoints: state.checkpoints.map((checkpoint) => ({ blockNumber: checkpoint.blockNumber.toString(), blockHash: checkpoint.blockHash })) } : {}),
         chainId: context.chainId,
         stateMachines: [...context.stateMachines],
+        ...(context.genesisHash ? { genesisHash: context.genesisHash } : {}),
         updatedAt: new Date().toISOString(),
       }, null, 2)}\n`,
     );
@@ -679,6 +755,12 @@ export class StateMachineWatcher {
   private nextBlock: bigint | undefined;
   private decodeFailuresTotal = 0;
   private cursorRestored = false;
+  /** True once a persisted cursor was adopted; the G-11 overshoot correction only applies to that case. */
+  private adoptedStoredCursor = false;
+  private genesisHash: string | undefined;
+  /** Canonical hash of block nextBlock - 1 from the last successful round, when readable. */
+  private cursorBlockHash: string | undefined;
+  private checkpoints: StateMachineCursorCheckpoint[] = [];
 
   constructor(config: StateMachineWatcherConfig) {
     this.config = normalizeStateMachineWatcherConfig(config);
@@ -697,6 +779,8 @@ export class StateMachineWatcher {
       fromBlock: this.config.fromBlock?.toString(),
       nextBlock: this.nextBlock?.toString(),
       pollIntervalMs: this.config.pollIntervalMs,
+      confirmations: this.config.confirmations,
+      reorgWindow: this.config.reorgWindow,
       handlerKeys: Object.keys(this.config.handlers),
       dryRun: this.config.dryRun,
       retry: this.config.retry,
@@ -707,43 +791,81 @@ export class StateMachineWatcher {
   }
 
   /**
-   * Load the persisted scan cursor once per watcher instance before the
-   * first poll. A restored cursor replaces the initial fromBlock so a restarted
-   * watcher resumes where the previous process stopped instead of rescanning
-   * the already-processed range (job idempotency absorbs that today, but the
-   * rescan wastes RPC calls and loses the audit position). Idempotent no-op
-   * when no cursor store is configured.
+   * Resolve the watcher's chain identity and load the persisted scan cursor
+   * once per watcher instance before the first poll. A restored cursor
+   * replaces the initial fromBlock so a restarted watcher resumes where the
+   * previous process stopped instead of rescanning the already-processed
+   * range. A cursor belonging to another identity is reported through
+   * onError and discarded — silently adopting it is how a reset dev chain
+   * drops every event until the new head passes the stale position.
    */
-  async restoreCursor(): Promise<void> {
+  async restoreCursor(client?: StateMachinePublicClient): Promise<void> {
     if (this.cursorRestored) {
       return;
     }
     this.cursorRestored = true;
+    this.genesisHash = client ? await tryGetBlockHash(client, 0n) : undefined;
     const store = this.config.cursorStore;
     if (!store) {
       return;
     }
-    const stored = await store.load(this.cursorContext());
-    if (stored !== undefined) {
-      this.nextBlock = stored;
+    const result = await store.load(this.cursorContext());
+    if (result.status === 'foreign') {
+      const cause = result.reason === 'genesis'
+        ? 'the chain genesis hash changed (chain reset or replacement chain at the same chain id)'
+        : 'the chain id or state-machine set changed';
+      this.config.onError?.(new ExecutorKitError(
+        `discarding the persisted scan cursor: ${cause}`
+        + `; rescanning from ${this.config.fromBlock !== undefined ? `fromBlock ${this.config.fromBlock}` : 'the current finalized head'}`
+        + ` (stored cursor file: ${store.kind === 'file' && 'filePath' in store ? String((store as { readonly filePath: string }).filePath) : store.kind ?? 'custom'})`,
+      ));
+      return;
+    }
+    if (result.status === 'restored') {
+      this.nextBlock = result.nextBlock;
+      this.cursorBlockHash = result.blockHash;
+      this.checkpoints = [...(result.checkpoints ?? [])];
+      this.adoptedStoredCursor = true;
     }
   }
 
   async pollOnce(): Promise<StateMachinePollResult> {
     const client = getPublicClient(this.config);
     await ensureChainId(client, this.config.chainId);
-    await this.restoreCursor();
+    await this.restoreCursor(client);
 
-    const toBlock = await client.getBlockNumber();
-    const fromBlock = this.nextBlock ?? this.config.fromBlock ?? toBlock;
+    const latestBlock = await client.getBlockNumber();
+    // Finality buffer: never scan the chain tip, so a short reorg cannot flip
+    // processed logs (and their confirmed submissions) behind the cursor.
+    const toBlock = latestBlock > BigInt(this.config.confirmations)
+      ? latestBlock - BigInt(this.config.confirmations)
+      : 0n;
+    let fromBlock = this.nextBlock ?? this.config.fromBlock ?? toBlock;
+
+    if (fromBlock > latestBlock) {
+      // The cursor sits beyond the live chain head: the chain shrank under us
+      // (node rollback, or a reset the genesis identity could not catch).
+      // Alert instead of spinning silently, and when the overshoot came from a
+      // adopted cursor, fall back to the configured fromBlock as the corrected
+      // rescan floor.
+      this.config.onError?.(new ExecutorKitError(
+        `scan cursor ${fromBlock} is beyond the chain head ${latestBlock}${this.adoptedStoredCursor ? ' (persisted cursor is stale)' : ''}`
+        + `; ${this.config.fromBlock !== undefined ? `rescanning from fromBlock ${this.config.fromBlock}` : 'waiting for the chain to grow'}`,
+      ));
+      if (this.adoptedStoredCursor && this.config.fromBlock !== undefined && this.config.fromBlock <= toBlock) {
+        fromBlock = this.config.fromBlock;
+        this.adoptedStoredCursor = false;
+      } else {
+        return { fromBlock, toBlock, scannedLogs: 0, results: [], decodeFailures: 0 };
+      }
+    } else {
+      fromBlock = await this.enforceCursorContinuity(client, fromBlock);
+    }
+
     if (fromBlock > toBlock) {
-      return {
-        fromBlock,
-        toBlock,
-        scannedLogs: 0,
-        results: [],
-        decodeFailures: 0,
-      };
+      // The finalized head has not caught up with the cursor yet — normal
+      // finality lag, nothing to scan this round.
+      return { fromBlock, toBlock, scannedLogs: 0, results: [], decodeFailures: 0 };
     }
 
     const logBatches = await Promise.all(
@@ -770,8 +892,27 @@ export class StateMachineWatcher {
     // holding an unpersisted skip interval — combined with a crash, blocks were
     // silently never rescanned by this or any restarted instance.
     const nextBlock = toBlock + 1n;
+    // Remember canonical hashes for the scanned range (dense near the tip,
+    // exponentially sparser deeper) so a later reorg can locate the common
+    // ancestor instead of falling back to a full rescan.
+    for (const anchorHeight of checkpointAnchorHeights(fromBlock, toBlock, this.config.reorgWindow)) {
+      const anchorHash = await tryGetBlockHash(client, anchorHeight);
+      if (anchorHash !== undefined) {
+        this.recordCheckpoint(anchorHeight, anchorHash);
+        if (anchorHeight === toBlock) {
+          this.cursorBlockHash = anchorHash;
+        }
+      }
+    }
     if (this.config.cursorStore) {
-      await this.config.cursorStore.save(nextBlock, this.cursorContext());
+      await this.config.cursorStore.save(
+        {
+          nextBlock,
+          ...(this.cursorBlockHash !== undefined ? { blockHash: this.cursorBlockHash } : {}),
+          ...(this.checkpoints.length > 0 ? { checkpoints: this.trimmedCheckpoints() } : {}),
+        },
+        this.cursorContext(),
+      );
     }
     this.nextBlock = nextBlock;
 
@@ -785,7 +926,14 @@ export class StateMachineWatcher {
     };
   }
 
-  async handleLog(log: StateMachineRawLog): Promise<StateMachineLogProcessResult> {
+  async handleLog(log: StateMachineRawLog, options?: {
+    /**
+     * Manual-recovery escape hatch for reorg-invalidated confirmations: ignore
+     * the "already delivered" shortcuts and resubmit every signal. The chain's
+     * own idempotency keys absorb a duplicate when the prior signal survived.
+     */
+    readonly resubmitDelivered?: boolean;
+  }): Promise<StateMachineLogProcessResult> {
     if (log.topics[0] !== HOOK_READY_TOPIC) {
       return {
         status: 'skipped',
@@ -998,7 +1146,9 @@ export class StateMachineWatcher {
     // with the next pending signal instead of replaying delivered ones;
     // replaying them would dead-lock multi-signal jobs in `ignored` on the
     // first duplicate.
-    const deliveredSignalIndexes = deliveredSignalIndexesFromSubmissions(currentJob.submissions);
+    const deliveredSignalIndexes = options?.resubmitDelivered
+      ? new Set<number>()
+      : deliveredSignalIndexesFromSubmissions(currentJob.submissions);
     for (const [index, signal] of signals.entries()) {
       if (deliveredSignalIndexes.has(index)) {
         continue;
@@ -1172,7 +1322,68 @@ export class StateMachineWatcher {
       stateMachines: this.config.stateMachines
         .map((deployment) => deployment.stateMachineAddress.toLowerCase())
         .sort(),
+      ...(this.genesisHash ? { genesisHash: this.genesisHash } : {}),
     };
+  }
+
+  /**
+   * Cursor block-hash continuity check plus bounded rollback, mirroring the
+   * chain-services indexer defenses. The stored hash anchors the last scanned
+   * height; a mismatch against the canonical chain means a reorg slipped past
+   * the finality buffer. The remembered checkpoints inside the reorg window
+   * are walked newest-first for the common ancestor, and the scan position is
+   * rolled back to it so the affected range is rescanned (job idempotency
+   * absorbs the overlap; on-chain idempotency keys absorb any rebroadcast).
+   * A reorg deeper than the window falls back to a full rescan from the
+   * configured floor instead of trusting a cursor that has provably diverged.
+   */
+  private async enforceCursorContinuity(
+    client: StateMachinePublicClient,
+    fromBlock: bigint,
+  ): Promise<bigint> {
+    if (!client.getBlock || this.cursorBlockHash === undefined || fromBlock <= 0n) {
+      return fromBlock;
+    }
+    const cursorHeight = fromBlock - 1n;
+    const canonicalHash = await tryGetBlockHash(client, cursorHeight);
+    if (canonicalHash === undefined || sameBlockHash(canonicalHash, this.cursorBlockHash)) {
+      return fromBlock;
+    }
+
+    const candidates = this.trimmedCheckpoints()
+      .filter((checkpoint) => checkpoint.blockNumber < fromBlock)
+      .sort((left, right) => (left.blockNumber > right.blockNumber ? -1 : left.blockNumber < right.blockNumber ? 1 : 0));
+    for (const candidate of candidates) {
+      const ancestorHash = await tryGetBlockHash(client, candidate.blockNumber);
+      if (ancestorHash !== undefined && sameBlockHash(ancestorHash, candidate.blockHash)) {
+        this.config.onError?.(new ExecutorKitError(
+          `chain reorg detected at height ${cursorHeight} (stored ${this.cursorBlockHash}, canonical ${canonicalHash});`
+          + ` rolling the scan cursor back to the common ancestor at block ${candidate.blockNumber} and rescanning from ${candidate.blockNumber + 1n}`,
+        ));
+        this.checkpoints = this.checkpoints.filter((checkpoint) => checkpoint.blockNumber <= candidate.blockNumber);
+        this.cursorBlockHash = candidate.blockHash;
+        return candidate.blockNumber + 1n;
+      }
+    }
+
+    const rescanFloor = this.config.fromBlock ?? 0n;
+    this.config.onError?.(new ExecutorKitError(
+      `chain reorg at height ${cursorHeight} deeper than the ${this.config.reorgWindow}-block checkpoint window;`
+      + ` rescanning from block ${rescanFloor} instead of trusting the diverged cursor`,
+    ));
+    this.checkpoints = [];
+    this.cursorBlockHash = undefined;
+    return rescanFloor;
+  }
+
+  private recordCheckpoint(blockNumber: bigint, blockHash: string): void {
+    this.checkpoints = this.checkpoints.filter((checkpoint) => checkpoint.blockNumber !== blockNumber);
+    this.checkpoints.push({ blockNumber, blockHash });
+    this.checkpoints.sort((left, right) => (left.blockNumber < right.blockNumber ? -1 : left.blockNumber > right.blockNumber ? 1 : 0));
+  }
+
+  private trimmedCheckpoints(): readonly StateMachineCursorCheckpoint[] {
+    return this.checkpoints.slice(-this.config.reorgWindow);
   }
 
   /**
@@ -1287,7 +1498,7 @@ export async function retryStateMachineJob(
   // explicit new run, so an exhausted retryable failure must get a fresh
   // budget; otherwise every failed job is immediately dead-lettered and the
   // documented `jobs retry` escape hatch is a dead channel.
-  if (job.attempts >= job.maxAttempts && job.status !== 'failed') {
+  if (job.attempts >= job.maxAttempts && job.status !== 'failed' && job.status !== 'confirmed') {
     if (job.status === 'submitted') {
       // Same refusal caliber as deadLetterStateMachineJob: a broadcast without
       // a confirmed receipt must be neither retried (blind replay risks a
@@ -1326,7 +1537,11 @@ export async function retryStateMachineJob(
     manualActions,
     clearLastError: true,
   });
-  return watcher.handleLog(job.raw);
+  // Retrying out of `confirmed` is the manual recovery channel for a
+  // reorg-invalidated confirmation: the operator explicitly declares the prior
+  // outcome invalid, so the run resubmits everything instead of treating the
+  // old broadcasts as delivered.
+  return watcher.handleLog(job.raw, { resubmitDelivered: job.status === 'confirmed' });
 }
 
 export async function deadLetterStateMachineJob(
@@ -1695,6 +1910,8 @@ interface NormalizedStateMachineWatcherConfig extends NormalizedSubmitConfig {
   readonly artifact?: StateMachineArtifactIndex;
   readonly fromBlock?: bigint;
   readonly pollIntervalMs: number;
+  readonly confirmations: number;
+  readonly reorgWindow: number;
   readonly retry: NormalizedStateMachineRetryConfig;
   readonly jobStore: StateMachineJobStore;
   readonly cursorStore?: StateMachineCursorStore;
@@ -1734,6 +1951,12 @@ function normalizeStateMachineWatcherConfig(config: StateMachineWatcherConfig): 
     pollIntervalMs: config.pollIntervalMs !== undefined
       ? parsePositiveInteger(config.pollIntervalMs, 'pollIntervalMs')
       : DEFAULT_STATE_MACHINE_POLL_INTERVAL_MS,
+    confirmations: config.confirmations !== undefined
+      ? parseNonNegativeSafeInteger(asNumberOrString(config.confirmations, 'confirmations'), 'confirmations')
+      : DEFAULT_FINALITY_CONFIRMATIONS,
+    reorgWindow: config.reorgWindow !== undefined
+      ? parsePositiveInteger(asNumberOrString(config.reorgWindow, 'reorgWindow'), 'reorgWindow')
+      : DEFAULT_REORG_WINDOW_BLOCKS,
     retry: normalizeRetryConfig(config.retry),
     jobStore: config.jobStore ?? new InMemoryStateMachineJobStore(),
     ...(config.cursorStore ? { cursorStore: config.cursorStore } : {}),
@@ -2171,7 +2394,11 @@ function isTerminalJobStatus(status: StateMachineJobStatus): boolean {
 }
 
 function isRetriableStateMachineJobStatus(status: StateMachineJobStatus): boolean {
-  return status === 'failed' || status === 'matched' || status === 'submitted';
+  // `confirmed` is retriable as the manual recovery channel: a reorg can flip
+  // a confirmation off the canonical chain while the job stays terminal
+  // forever otherwise. The retry resubmits and the on-chain idempotency key
+  // absorbs a duplicate when the signal actually survived.
+  return status === 'failed' || status === 'matched' || status === 'submitted' || status === 'confirmed';
 }
 
 function stateMachineJobStatusToExecutorStatus(status: StateMachineJobStatus): ExecutorJobStatusDTO {
@@ -2374,6 +2601,62 @@ function parseStoredCursor(value: unknown): bigint {
     throw new ValidationError('stored cursor must be a non-negative integer block number');
   }
   return BigInt(text);
+}
+
+function parseStoredCheckpoints(value: readonly unknown[]): readonly StateMachineCursorCheckpoint[] {
+  const parsed: StateMachineCursorCheckpoint[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry)) {
+      throw new ValidationError('stored cursor checkpoints must be objects');
+    }
+    parsed.push({
+      blockNumber: parseStoredCursor(entry.blockNumber),
+      blockHash: asString(entry.blockHash, 'checkpoint.blockHash').toLowerCase(),
+    });
+  }
+  return parsed;
+}
+
+/**
+ * Canonical block hash or undefined. Lookups can legitimately fail (pruned
+ * node, client without block support, RPC hiccup); the reorg defenses treat
+ * that as "no evidence" and keep the finality buffer as the only line rather
+ * than failing the round.
+ */
+async function tryGetBlockHash(client: StateMachinePublicClient, blockNumber: bigint): Promise<string | undefined> {
+  if (!client.getBlock) {
+    return undefined;
+  }
+  try {
+    const block = await client.getBlock({ blockNumber });
+    const hash = block?.hash;
+    return typeof hash === 'string' && hash.length > 0 ? hash.toLowerCase() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function sameBlockHash(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
+}
+
+/**
+ * Heights to anchor this round, newest-first with exponentially growing gaps
+ * (0, 1, 3, 7, ...): reorgs concentrate near the tip where anchors are dense,
+ * while a deep one degrades to the full-rescan floor anyway. Bounded by the
+ * configured reorg window and by fromBlock (lower blocks were anchored by the
+ * round that actually scanned them).
+ */
+function checkpointAnchorHeights(fromBlock: bigint, toBlock: bigint, reorgWindow: number): readonly bigint[] {
+  const heights: bigint[] = [];
+  for (let gap = 0n; gap <= BigInt(reorgWindow); gap = gap * 2n + 1n) {
+    const height = toBlock - gap;
+    if (height < fromBlock) {
+      break;
+    }
+    heights.push(height);
+  }
+  return heights;
 }
 
 function normalizeCallbackMode(value: string): ExecutorCallbackMode {
