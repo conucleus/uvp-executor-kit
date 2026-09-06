@@ -12,15 +12,14 @@ Two co-equal signal-producer surfaces:
 - **Chain-native**: watch `UVPStateMachine.HookReady` events, route ready hooks to
   configured handlers, and submit authorized `submitSignal` callback transactions
   from a participant wallet.
-- **Product API (PRD105 P0)**: the non-browser signal-producer gate for enterprise
+- **Product API**: the non-browser signal-producer gate for enterprise
   scripts, supervised AI agents, and future MCP clients. All producers dock at the
   same Product API prepare/sign/submit/proof boundary.
 
-For PRD109 repo-split convergence, executor-kit should keep using the same
-signal-container producer vocabulary as Order App: list tasks, prepare typed
-data, sign with an explicit participant key, submit, and fetch proof. It should
-consume executor, docked Zhixu, and resource-access surfaces from Product
-DTO/Product API.
+Executor-kit keeps using the same signal-container producer vocabulary as Order
+App: list tasks, prepare typed data, sign with an explicit participant key,
+submit, and fetch proof. It consumes executor, docked Zhixu, and resource-access
+surfaces from Product DTO/Product API.
 
 ## Local Commands
 
@@ -67,9 +66,55 @@ uvp-executor chain-watch \
   --state-machine 0x0000000000000000000000000000000000000001 \
   --chain-id 31337 \
   --config uvp-executor-kit/package/fixtures/state-machine-executor.config.json \
-  --jobs-file .uvp-executor-jobs.json \
   --dry-run
 ```
+
+By default the chain commands persist watcher state to files so a restart
+resumes where the previous process stopped instead of rescanning from
+`--from-block`: jobs land in `<state-dir>/jobs.json` and the scan cursor (the
+next block to scan) in `<state-dir>/cursor.json`. The state directory defaults
+to `./uvp-watcher-state`, overridden by `--state-dir` or the
+`UVP_WATCHER_STATE_DIR` env var; `--jobs-file <path>` places the jobs file
+exactly at that path with the cursor beside it. The startup log reports the
+resolved storage mode and paths. Pass `--job-store memory` to keep jobs and the
+cursor in process memory; a persisted cursor whose chain id, state-machine set,
+or chain genesis hash no longer matches the configuration is discarded with an
+operator alert and rewritten on the next successful round (a reset dev chain at
+the same chain id is caught by the genesis hash, not silently adopted).
+
+State files are written atomically (temp file + rename). A crash-truncated or
+structurally invalid `jobs.json`/`cursor.json` is moved aside to
+`<file>.corrupt-<timestamp>` for inspection and recreated from scratch instead
+of aborting every later read.
+
+### Reorg and Outage Defenses
+
+The watcher applies the same defenses as the chain-services indexer, with
+configurable parameters (`--confirmations`, `--reorg-window`,
+`--max-get-logs-block-span` on `chain-once`/`chain-watch`):
+
+- **Finality buffer**: each round scans only up to `head - confirmations`
+  (default 1), so a short reorg cannot flip already-processed logs and their
+  confirmed submissions behind the cursor. `--confirmations 0` restores tip
+  scanning for throwaway local chains.
+- **Cursor block-hash continuity**: each successful round remembers the
+  canonical hash of its last scanned block (plus exponentially spaced anchors
+  inside the reorg window, default 64 blocks). The next round verifies the
+  hash before appending; on mismatch it walks the anchors to the common
+  ancestor and rescans from there. A reorg deeper than the window falls back
+  to rescanning from `--from-block`.
+- **Chunked log reads**: scan ranges larger than `--max-get-logs-block-span`
+  (default 9999) are split into multiple `eth_getLogs` calls, so deep-lag
+  catch-up rounds do not trip provider query limits.
+- **Poll backoff**: the watch loop never aborts on failed polls. Consecutive
+  failures are reported through the error channel and the poll cadence backs
+  off exponentially (capped at 8x the interval), returning to the configured
+  cadence on the first successful round.
+- **Resend backoff**: a signal whose prior broadcast was never confirmed is
+  rebroadcast with exponential backoff (30s base, 10min cap) anchored to the
+  job's `lastSignalAttemptAt`, instead of once per poll round. The chain's
+  `idempotencyKey` remains the dedupe anchor; the backoff only stops the
+  per-round gas burn. Manual `jobs retry` bypasses the throttle.
 
 Build or submit one state-machine signal:
 
@@ -78,6 +123,7 @@ uvp-executor chain-signal \
   --rpc-url http://127.0.0.1:8545 \
   --state-machine 0x0000000000000000000000000000000000000001 \
   --chain-id 31337 \
+  --plan-id 0x2222222222222222222222222222222222222222222222222222222222222222 \
   --order-id 0x1111111111111111111111111111111111111111111111111111111111111111 \
   --source logistics-provider-a \
   --stage export.customs \
@@ -86,6 +132,11 @@ uvp-executor chain-signal \
   --wallet-address 0x0000000000000000000000000000000000000002 \
   --dry-run
 ```
+
+In the three chain examples above, `--dry-run` is an explicit test aid: the
+flag only builds and prints what would be sent without broadcasting. Without
+the flag the commands perform the real action, and real execution is always
+the default.
 
 Use Product API task mode for participant-facing signal containers:
 
@@ -133,6 +184,10 @@ the explicit `--private-key-env` name and verifies the prepared
 For authenticated Product APIs, pass `--auth-token-env <ENV_NAME>`; the CLI reads
 the bearer token only from that named env var and normal output reports only
 redacted auth status where applicable.
+Every task, prepare, submit, and proof result (and every `ProductApiError`)
+carries the server's `x-request-id` response header as `requestId` when present,
+so executor-side calls, errors, and logs can be correlated end to end with
+chain-services request logs.
 Funding and guarantee placeholder tasks use the same commands; the task summary
 keeps capability-plugin metadata, required inputs, settlement placeholder copy, proof
 rows, and funding impact language without treating UVP as a custodian,
@@ -276,6 +331,55 @@ uvp-executor jobs dead-letter <jobId> \
   --reason "manual review required"
 ```
 
+Watcher job semantics:
+
+- Callback transactions wait for the receipt by default (`waitForReceipt`
+  defaults to `true`). A job whose transaction was broadcast but not yet
+  receipted stays in the non-terminal `submitted` state, so later scans or
+  manual retries can observe the real on-chain outcome instead of trusting
+  the broadcast. When the receipt step itself fails after a successful
+  broadcast (reverted receipt, or waiting for the receipt throws), the error
+  carries the broadcast `txHash` and the job's `submissions` record keeps it,
+  so "already broadcast" transactions are never dropped from the audit trail.
+- Failures are classified from explicit machine-readable error codes first,
+  then from well-known real-world error texts and contract revert data
+  (for example `SignalAlreadyExists()`, `AccessControlUnauthorizedAccount`,
+  `insufficient funds`, nonce conflicts, timeouts, `ECONNRESET`, and HTTP
+  429). Transient (retryable) failures retry inside the run and land in
+  `failed` when exhausted, which `jobs retry` still accepts; deterministic
+  non-retryable failures and unrecognized errors dead-letter for human
+  triage via `jobs dead-letter`. A duplicate-signal fact
+  (`SignalAlreadyExists`) is not a failure, and where it surfaces decides the
+  job state: a handler that itself throws the duplicate classification ends
+  the job as terminal `ignored`, while a duplicate answered by the chain
+  during `submitSignal` is recorded as a delivered dedupe fact and leaves the
+  job in the non-terminal `submitted` state (the signal is on chain but this
+  process never observed its receipt, so a later scan or retry can still
+  check the real outcome). `jobs retry` also accepts `confirmed` jobs: the
+  retry resubmits every signal, which is the manual recovery channel when a
+  reorg flipped a confirmation off the canonical chain (the on-chain
+  idempotency key absorbs the duplicate when the signal actually survived).
+- HookReady-topic logs that fail to decode (e.g. from a mixed-version
+  deployment) never crash the watcher: the scan skips them, records an
+  `ignored` job with the raw log preserved, counts them in poll results and
+  `describe()`, and reports them through `onError`. The cursor advances so
+  the same log is not rescanned forever.
+- Process exit codes are honest: when a scan result carries an error, or any
+  job ends in `failed`/`dead_letter`, the process exits with status 1 even
+  though result objects were produced without throwing.
+- Runtime-host callback delivery has built-in retries: up to 3 attempts with
+  exponential backoff from the configured base delay. Multi-signal callback
+  runs record per-signal delivery results, so partial success stays visible
+  instead of being collapsed into a single outcome.
+- When a callback HMAC secret is configured, dispatched callbacks are signed
+  over `timestamp.nonce.body` and carry `x-uvp-webhook-signature`,
+  `x-uvp-webhook-timestamp`, and `x-uvp-webhook-nonce` headers. Receivers
+  verify with `verifyWebhookSignature(body, signature, secret, { timestamp,
+  nonce })`: it fails closed on a missing timestamp/nonce, enforces an
+  acceptance window (5 minutes by default), and `createWebhookReplayGuard`
+  burns each nonce once inside the window — a captured `(body, signature)`
+  pair can no longer be replayed forever.
+
 ## SDK Surface
 
 - `createStateMachineWatcher`: watches `HookReady` logs, resolves handlers, and
@@ -286,6 +390,9 @@ uvp-executor jobs dead-letter <jobId> \
 - `decodeHookReadyLog` and `hookReadyEventId`: normalize state-machine logs.
 - `InMemoryStateMachineJobStore` and `FileStateMachineJobStore`: record watcher
   job state for retries, dead-lettering, and Product/Ops projection.
+- `FileStateMachineCursorStore`: persists the watcher scan cursor (pass it as
+  `cursorStore` to `createStateMachineWatcher`) so a restarted watcher resumes
+  instead of rescanning from `fromBlock`; without it the cursor stays in memory.
 - `stateMachineHandlerConfigToExecutorConfigDTO`,
   `stateMachineJobToExecutorJobDTO`, and `summarizeSupplierOps`: product-facing
   DTO helpers.
@@ -321,17 +428,44 @@ order-level authorization, participant wallet signatures, and contract checks.
 
 ## ABI Boundary
 
-`createStateMachineWatcher` uses the fixed `UVPStateMachine v0.8` compact-hook
+`createStateMachineWatcher` uses the fixed `UVPStateMachine v0.9` compact-hook
 ABI recorded in
-`uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.8.json`:
+`uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.9.json`:
 
-- `HookReady(bytes32 orderId, bytes32 hookId, bytes32 stageId, bytes32 hookName)`;
-- `submitSignal(bytes32 orderId, bytes32 sourceId, bytes32 signalId, bytes32 payloadHash, bytes32 idempotencyKey)`.
+- `HookReady(bytes32 planId, bytes32 orderId, bytes32 hookId, bytes32 stageId, bytes32 hookName)`;
+- `submitSignal(bytes32 planId, bytes32 orderId, bytes32 sourceId, bytes32 signalId, bytes32 payloadHash, bytes32 idempotencyKey)`.
+
+`planId` is part of the event and submit boundary. It must be retained with the
+watcher job and never inferred from a bare `orderId`; the same state machine can
+contain the same order id under different plans. The watcher persists the
+planId decoded from each `HookReady` event on the job and uses it as the default
+for every signal that does not declare one; a handler-config signal may pin an
+explicit `planId` (`handlers.<key>.signals[].planId`) when it must diverge.
+
+There is no payload-reference input in this ABI, and the contract is frozen:
+`chain-signal --payload-ref` is rejected up front instead of silently dropping
+the reference. Only the 32-byte `payloadHash` goes on chain; record any
+off-chain payload reference in your own job/evidence store (the runtime
+callback envelope's `payloadRef` field is the off-chain channel for it).
 
 The contract also exposes `submitSignalFor(...)` and
 EIP-712 typed-data builders for gas-relay adapters. This package does not
 build a separate signed payload model; relayed business signatures must
 stay aligned with the contract's current EIP-712 digest.
+
+### Zero `payloadHash` Semantics
+
+In `submitSignal(bytes32 ..., bytes32 payloadHash, bytes32 ...)`, the value
+`bytes32(0)` (`0x0000000000000000000000000000000000000000000000000000000000000000`)
+is the **protocol-defined encoding of "no payload"**. It is a legitimate
+constant of the `UVPStateMachine` protocol — not a runtime fallback or default.
+
+Consequently, when a handler/config signal definition omits `payloadHash`, the
+kit encodes exactly `bytes32(0)`: this is the producer's explicit declaration
+that the signal carries no off-chain payload, and it is indistinguishable on
+chain from a producer passing the zero hash by hand. Any non-empty payload must
+be declared with its full 32-byte hash.
+
 
 ## Boundaries
 

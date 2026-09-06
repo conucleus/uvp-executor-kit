@@ -1,6 +1,7 @@
 import {
   getSignalContainer,
   getSignalContainerProof,
+  isProductApiRedirectStatus,
   listSignalContainers,
   resolveProductApiFetch,
   summarizeSignalContainer,
@@ -45,7 +46,6 @@ export interface TaskReadinessResult {
   readonly stageName?: string;
   readonly deadline?: string;
   readonly deadlineExpired?: boolean;
-  readonly requiredEvidence: readonly string[];
   readonly primaryActionLabel?: string;
   readonly nextAction: 'prepare' | 'wait' | 'proof' | 'blocked';
   readonly nextActionLabel: string;
@@ -152,8 +152,21 @@ async function checkReachability(
     if (input.principalId && input.principalId.trim().length > 0) {
       headers['x-uvp-principal-id'] = input.principalId.trim();
     }
-    const response = await fetchFn(url, { method: 'GET', headers });
+    // Same redirect discipline as the product transport: the reachability
+    // probe carries the Authorization bearer from --auth-token-env and must
+    // never follow a 3xx that would replay it to another host.
+    const response = await fetchFn(url, { method: 'GET', headers, redirect: 'manual' });
     const latencyMs = Date.now() - started;
+    if (isProductApiRedirectStatus(response.status)) {
+      // Every 3xx (and the status-0 opaqueredirect response a manual redirect
+      // policy yields) is a failed probe, not a reachable API.
+      return {
+        ok: false,
+        label: 'reachability',
+        detail: `Product API responded HTTP ${response.status} redirect; redirects are refused so the Authorization bearer is never replayed to the redirect target`,
+        latencyMs,
+      };
+    }
     if (response.ok || response.status < 500) {
       return { ok: true, label: 'reachability', detail: `Product API responded HTTP ${response.status}`, latencyMs };
     }
@@ -236,8 +249,8 @@ async function checkProofEndpoint(
 
 interface TaskReadinessCheckResult {
   readonly check: ProductDoctorCheck;
-  readonly readiness: TaskReadinessResult;
-  readonly rawTask: ProductSignalContainer;
+  readonly readiness?: TaskReadinessResult;
+  readonly rawTask?: ProductSignalContainer;
 }
 
 async function checkTaskReadiness(
@@ -266,7 +279,14 @@ async function checkTaskReadiness(
     let nextAction: TaskReadinessResult['nextAction'] = 'blocked';
     let nextActionLabel = 'This task is not ready for action.';
 
-    if (summary.status === 'confirmed' || summary.status === 'completed') {
+    // Product's frozen TaskStatus vocabulary is open|submitted|blocked|done
+    // (ProductTaskDTO in @uvp-eth/product-dto; the /product/tasks endpoints
+    // return it verbatim). Completion is exactly `done`; historical
+    // `confirmed`/`completed` aliases were purged — the server has never
+    // emitted them as task status, and treating them as complete would mask
+    // non-canonical payloads instead of surfacing them.
+    const taskComplete = summary.status === 'done';
+    if (taskComplete) {
       nextAction = 'proof';
       nextActionLabel = 'Task is complete. Run product proof to verify on-chain confirmation.';
     } else if (canSubmit) {
@@ -286,16 +306,24 @@ async function checkTaskReadiness(
       nextActionLabel = blockedReason ?? 'Task is not yet ready for submission. Check the blocked reason.';
     }
 
+    // One readiness verdict drives both the outer check and the embedded
+    // readiness copy: the embedded check.ok must equal readiness.ok so
+    // consumers that only look at the nested check cannot miss a failure.
+    // The canonical completion state `done`
+    // is part of the verdict, not an alias afterthought.
+    const readinessOk = canSubmit || taskComplete;
+    const readinessCheck = {
+      ok: readinessOk,
+      label: 'task-readiness',
+      detail: nextActionLabel,
+      latencyMs,
+    };
+
     return {
-      check: {
-        ok: canSubmit || summary.status === 'confirmed' || summary.status === 'completed',
-        label: 'task-readiness',
-        detail: nextActionLabel,
-        latencyMs,
-      },
+      check: readinessCheck,
       readiness: {
-        ok: canSubmit || summary.status === 'confirmed' || summary.status === 'completed',
-        check: { ok: true, label: 'task-readiness', detail: nextActionLabel, latencyMs },
+        ok: readinessOk,
+        check: readinessCheck,
         taskId: summary.taskId,
         orderId: summary.orderId,
         title: summary.title,
@@ -308,7 +336,6 @@ async function checkTaskReadiness(
         ...(summary.stageName ? { stageName: summary.stageName } : {}),
         ...(summary.deadline ? { deadline: summary.deadline } : {}),
         ...(deadlineExpired !== undefined ? { deadlineExpired } : {}),
-        requiredEvidence: summary.requiredEvidence ?? [],
         ...(summary.primaryActionLabel ? { primaryActionLabel: summary.primaryActionLabel } : {}),
         nextAction,
         nextActionLabel,
@@ -317,6 +344,7 @@ async function checkTaskReadiness(
     };
   } catch (error) {
     const classified = classifyExecutorKitError(error, 'unknown');
+    // No synthesized placeholder task/readiness data: the report only carries the failed check.
     return {
       check: {
         ok: false,
@@ -324,21 +352,6 @@ async function checkTaskReadiness(
         detail: classified.message,
         latencyMs: Date.now() - started,
       },
-      readiness: {
-        ok: false,
-        check: { ok: false, label: 'task-readiness', detail: classified.message, latencyMs: Date.now() - started },
-        taskId,
-        orderId: '',
-        title: '',
-        status: 'unknown',
-        canSubmit: false,
-        assigneeMatch: false,
-        configuredWallet: walletAddress ?? '',
-        requiredEvidence: [],
-        nextAction: 'blocked',
-        nextActionLabel: classified.message,
-      },
-      rawTask: { taskId, orderId: '', title: '', status: 'unknown' } as unknown as ProductSignalContainer,
     };
   }
 }

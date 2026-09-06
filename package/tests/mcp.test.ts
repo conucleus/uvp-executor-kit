@@ -134,7 +134,6 @@ function fundingTask(): Record<string, unknown> {
     sourceId: bytes32('02'),
     signalId: bytes32('03'),
     fundingImpact: 'Adapter placeholder: records funding condition only; no custody or settlement by UVP.',
-    requiredEvidence: ['guarantee-proof'],
     requiredInputs: [
       {
         inputId: 'funding-condition',
@@ -153,7 +152,6 @@ function fundingTask(): Record<string, unknown> {
     capabilityPlugin: {
       pluginKind: 'payment_placeholder',
       source: 'explicit',
-      requiredEvidence: ['guarantee-proof'],
     },
     primaryActionLabel: 'Confirm funding condition',
     proofRows: [{ label: 'Event', value: 'SignalSubmitted' }],
@@ -184,12 +182,15 @@ function submittedSubmission(): Record<string, unknown> {
 }
 
 function preparedSubmission(options: { readonly taskId?: string; readonly submitter?: Address } = {}): PreparedSignalContainer {
+  const planId = bytes32('06');
   const orderId = bytes32('01');
   const sourceId = bytes32('02');
   const signalId = bytes32('03');
   const payloadHash = bytes32('04');
   const idempotencyKey = bytes32('05');
-  const deadline = '1777777777';
+  // Deadlines are validated to be a decimal uint in the future, so the fixture
+  // computes one instead of pinning a date that ages into the past.
+  const deadline = String(Math.floor(Date.now() / 1000) + 3600);
   const preparedSubmitter = options.submitter ?? submitter;
   return {
     prepareId: 'prep_1',
@@ -225,6 +226,7 @@ function preparedSubmission(options: { readonly taskId?: string; readonly submit
     typedData: buildProductSubmitTypedData({
       chainId: 31337,
       verifyingContract,
+      planId,
       orderId,
       sourceId,
       signalId,

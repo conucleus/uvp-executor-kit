@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFile, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Command } from 'commander';
 import type { PreparedSignalContainer, ProductSubmitIntent } from './product.js';
@@ -23,6 +24,7 @@ import { runProductDoctor } from './doctor.js';
 import { stringifyForTransport } from './transport.js';
 import {
   createHandlersFromExecutorConfig,
+  DEFAULT_CALLBACK_HMAC_SECRET_ENV,
   DEFAULT_CALLBACK_TOKEN_ENV,
   DEFAULT_EXECUTOR_TOKEN_ENV,
   loadExecutorConfig,
@@ -37,6 +39,7 @@ import {
 } from './validation.js';
 import {
   DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV,
+  FileStateMachineCursorStore,
   FileStateMachineJobStore,
   createStateMachineHandlersFromConfig,
   createStateMachineWatcher,
@@ -47,6 +50,8 @@ import {
   stateMachineJobToExecutorJobDTO,
   summarizeSupplierOps,
   submitStateMachineSignal,
+  type StateMachineCursorStore,
+  type StateMachineJobStore,
 } from './watcher.js';
 import {
   addressFromPrivateKey,
@@ -65,7 +70,13 @@ interface ChainWatchOptions {
   privateKeyEnv: string;
   fromBlock?: string;
   pollIntervalMs?: string;
+  confirmations?: string;
+  reorgWindow?: string;
+  getLogsBlockSpan?: string;
   jobsFile?: string;
+  /** file (default) persists jobs and the scan cursor under --state-dir; memory keeps jobs and cursor in process memory. */
+  jobStore?: string;
+  stateDir?: string;
   dryRun?: boolean;
   waitForReceipt?: boolean;
 }
@@ -77,6 +88,7 @@ interface ChainSignalOptions {
   privateKeyEnv: string;
   walletAddress?: string;
   orderId: string;
+  planId: string;
   source: string;
   stage: string;
   signalName: string;
@@ -149,6 +161,8 @@ interface ServeOptions {
   executorTokenEnv: string;
   callbackToken?: string;
   callbackTokenEnv: string;
+  callbackHmacSecret?: string;
+  callbackHmacSecretEnv: string;
   readyJson?: boolean;
 }
 
@@ -392,14 +406,18 @@ export function buildProgram(): Command {
     .option('--executor-token-env <name>', 'env var containing executor dispatch bearer token', DEFAULT_EXECUTOR_TOKEN_ENV)
     .option('--callback-token <token>', 'bearer token for executor callback endpoint')
     .option('--callback-token-env <name>', 'env var containing executor callback bearer token', DEFAULT_CALLBACK_TOKEN_ENV)
+    .option('--callback-hmac-secret <secret>', 'optional shared secret for signing callback bodies')
+    .option('--callback-hmac-secret-env <name>', 'env var containing callback HMAC secret', DEFAULT_CALLBACK_HMAC_SECRET_ENV)
     .option('--ready-json', 'print a ready JSON line after the server starts')
     .action(async (options: ServeOptions) => {
       const config = await loadExecutorConfig(options.config);
+      const callbackHmacSecret = options.callbackHmacSecret ?? process.env[options.callbackHmacSecretEnv];
       const handle = await startExecutorServer({
         executorId: config.executorId,
         handlers: createHandlersFromExecutorConfig(config),
         executorToken: readSecret(options.executorToken, options.executorTokenEnv, 'executor token'),
         callbackToken: readSecret(options.callbackToken, options.callbackTokenEnv, 'callback token'),
+        ...(callbackHmacSecret ? { callbackHmacSecret } : {}),
         host: options.host,
         port: parsePort(options.port),
       });
@@ -444,6 +462,9 @@ export function buildProgram(): Command {
         ...(options.submissionId ? { submissionId: options.submissionId } : {}),
         ...(options.verbose ? { verbose: true } : {}),
       });
+      if (!report.ok) {
+        process.exitCode = 1;
+      }
       console.log(stringifyForTransport(report));
     });
 
@@ -484,7 +505,7 @@ export function buildProgram(): Command {
 
   jobs
     .command('retry <jobId>')
-    .description('retry a failed or callback-pending state-machine watcher job')
+    .description('retry a failed, callback-pending, or confirmed state-machine watcher job (confirmed retries resubmit for reorg recovery)')
     .requiredOption('--jobs-file <path>', 'state-machine watcher jobs JSON file')
     .requiredOption('--rpc-url <url>', 'EVM RPC URL')
     .requiredOption('--state-machine <address>', 'UVPStateMachine contract address')
@@ -497,12 +518,15 @@ export function buildProgram(): Command {
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (jobId: string, options: JobsRetryOptions) => {
-      const watcher = await buildStateMachineWatcherFromCli(options);
+      const { watcher } = await buildStateMachineWatcherFromCli(options);
       const result = await retryStateMachineJob(watcher, jobId, {
         operator: options.operator,
         ...(options.reason ? { reason: options.reason } : {}),
       });
       console.log(stringifyForTransport({ retry: result }));
+      if (executionOutcomeFailed(result)) {
+        process.exitCode = 1;
+      }
     });
 
   jobs
@@ -529,14 +553,24 @@ export function buildProgram(): Command {
     .requiredOption('--config <path>', 'state machine handler config JSON path')
     .option('--wallet-address <address>', 'executor wallet address shown as submitSignal sender in dry-run')
     .option('--private-key-env <name>', 'environment variable containing the callback tx private key', DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV)
-    .option('--from-block <uint>', 'first block to scan')
-    .option('--jobs-file <path>', 'persist watcher jobs to a local JSON file')
+    .option('--from-block <uint>', 'first block to scan; on restart a persisted scan cursor takes precedence')
+    .option('--confirmations <n>', 'finality buffer in blocks: scan only up to head - n (0 restores tip scanning)', '1')
+    .option('--reorg-window <blocks>', 'bounded reorg checkpoint window for the common-ancestor rollback', '64')
+    .option('--max-get-logs-block-span <blocks>', 'max blocks per eth_getLogs request; deeper ranges are chunked', '9999')
+    .option('--jobs-file <path>', 'watcher jobs JSON file (default: <state-dir>/jobs.json)')
+    .option('--state-dir <path>', `watcher state directory holding jobs.json and cursor.json (default: $${WATCHER_STATE_DIR_ENV} or ${DEFAULT_WATCHER_STATE_DIR})`)
+    .option('--job-store <file|memory>', 'watcher job store: file persists jobs and scan cursor across restarts, memory keeps them in-process', 'file')
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainWatchOptions) => {
-      const watcher = await buildStateMachineWatcherFromCli(options);
+      const { watcher, storage } = await buildStateMachineWatcherFromCli(options);
       const poll = await watcher.pollOnce();
-      console.log(stringifyForTransport({ watcher: watcher.describe(), poll }));
+      console.log(stringifyForTransport({ watcher: watcher.describe(), storage, poll }));
+      // Honest exit code: submission errors folded into the poll result (or
+      // failed/dead-lettered jobs) must not masquerade as a successful run.
+      if (chainPollExecutionFailed(poll)) {
+        process.exitCode = 1;
+      }
     });
 
   program
@@ -548,18 +582,33 @@ export function buildProgram(): Command {
     .requiredOption('--config <path>', 'state machine handler config JSON path')
     .option('--wallet-address <address>', 'executor wallet address shown as submitSignal sender in dry-run')
     .option('--private-key-env <name>', 'environment variable containing the callback tx private key', DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV)
-    .option('--from-block <uint>', 'first block to scan')
+    .option('--from-block <uint>', 'first block to scan; on restart a persisted scan cursor takes precedence')
     .option('--poll-interval-ms <ms>', 'polling interval in milliseconds')
-    .option('--jobs-file <path>', 'persist watcher jobs to a local JSON file')
+    .option('--confirmations <n>', 'finality buffer in blocks: scan only up to head - n (0 restores tip scanning)', '1')
+    .option('--reorg-window <blocks>', 'bounded reorg checkpoint window for the common-ancestor rollback', '64')
+    .option('--max-get-logs-block-span <blocks>', 'max blocks per eth_getLogs request; deeper ranges are chunked', '9999')
+    .option('--jobs-file <path>', 'watcher jobs JSON file (default: <state-dir>/jobs.json)')
+    .option('--state-dir <path>', `watcher state directory holding jobs.json and cursor.json (default: $${WATCHER_STATE_DIR_ENV} or ${DEFAULT_WATCHER_STATE_DIR})`)
+    .option('--job-store <file|memory>', 'watcher job store: file persists jobs and scan cursor across restarts, memory keeps them in-process', 'file')
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainWatchOptions) => {
-      const watcher = await buildStateMachineWatcherFromCli(options);
-      console.log(stringifyForTransport({ watcher: watcher.describe() }));
+      const { watcher, storage } = await buildStateMachineWatcherFromCli(options);
+      console.log(stringifyForTransport({ watcher: watcher.describe(), storage }));
       const handle = await watcher.start();
-      await waitForShutdown(async () => {
+      try {
+        // handle.done resolves on stop(); persistent poll failures are
+        // reported through the watcher's onError (stderr) with capped
+        // exponential backoff instead of aborting the loop.
+        await Promise.race([
+          handle.done,
+          waitForShutdown(async () => {
+            await handle.stop();
+          }),
+        ]);
+      } finally {
         await handle.stop();
-      });
+      }
     });
 
   program
@@ -570,17 +619,27 @@ export function buildProgram(): Command {
     .requiredOption('--chain-id <id>', 'expected chain id')
     .option('--wallet-address <address>', 'executor wallet address shown as submitSignal sender in dry-run')
     .requiredOption('--order-id <bytes32>', 'order id')
+    .requiredOption('--plan-id <bytes32>', 'plan id the order belongs to (plan-scoped submitSignal ABI; zero placeholder is rejected)')
     .requiredOption('--source <source>', 'signal source')
     .requiredOption('--stage <stageIdentifier>', 'stage identifier')
     .requiredOption('--signal-name <signalName>', 'signal name')
     .option('--payload-hash <bytes32>', 'off-chain payload hash')
-    .option('--payload-ref <uri>', 'optional off-chain payload reference')
+    .option('--payload-ref <uri>', 'unsupported: rejected because submitSignal cannot carry an off-chain payload reference')
     .option('--ready-event-id <bytes32>', 'HookReady event id')
     .option('--idempotency-key <key>', 'idempotency key')
     .option('--private-key-env <name>', 'environment variable containing the callback tx private key', DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV)
     .option('--dry-run', 'build the submitSignal tx request without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainSignalOptions) => {
+      if (options.payloadRef) {
+        // The frozen UVPStateMachine v0.9 ABI has no payloadRef input, so this
+        // flag would be silently dropped and the operator would walk away with
+        // a "submitted" success that never carried the reference. Fail loudly;
+        // only the 32-byte payloadHash goes on chain.
+        throw new ValidationError(
+          '--payload-ref is not supported by chain-signal: submitSignal(planId, orderId, sourceId, signalId, payloadHash, idempotencyKey) has no reference field, so the flag would be silently dropped. Keep only the 32-byte --payload-hash on chain and record the off-chain payload reference in your own job/evidence store next to it.',
+        );
+      }
       const result = await submitStateMachineSignal({
         rpcUrl: options.rpcUrl,
         stateMachineAddress: options.stateMachine,
@@ -588,14 +647,14 @@ export function buildProgram(): Command {
         ...(options.walletAddress ? { walletAddress: options.walletAddress } : {}),
         privateKeyEnv: options.privateKeyEnv,
         dryRun: options.dryRun ?? false,
-        waitForReceipt: options.waitForReceipt ?? false,
+        ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
       }, {
+        planId: options.planId,
         orderId: options.orderId,
         source: options.source,
         stageIdentifier: options.stage,
         signalName: options.signalName,
         ...(options.payloadHash ? { payloadHash: options.payloadHash } : {}),
-        ...(options.payloadRef ? { payloadRef: options.payloadRef } : {}),
         ...(options.readyEventId ? { readyEventId: options.readyEventId } : {}),
         ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
       });
@@ -651,7 +710,73 @@ async function readPreparedSignalContainerFile(path: string): Promise<PreparedSi
   return parsePreparedSignalContainer(parsed, 'prepared file');
 }
 
-async function buildStateMachineWatcherFromCli(options: ChainWatchOptions) {
+/** Default watcher state directory relative to the process working directory. */
+export const DEFAULT_WATCHER_STATE_DIR = './uvp-watcher-state';
+/** Env var overriding the default watcher state directory (the --state-dir flag wins over it). */
+export const WATCHER_STATE_DIR_ENV = 'UVP_WATCHER_STATE_DIR';
+
+/**
+ * What the CLI builds for watcher state. `file` (default) persists both
+ * the job store and the scan cursor so a restart resumes instead of rescanning;
+ * `memory` keeps jobs and the cursor in process memory.
+ */
+export type WatcherStorageSummary =
+  | { readonly mode: 'memory' }
+  | {
+    readonly mode: 'file';
+    readonly stateDir: string;
+    readonly jobsFile: string;
+    readonly cursorFile: string;
+  };
+
+export interface WatcherStorageResolution {
+  readonly summary: WatcherStorageSummary;
+  readonly jobStore?: StateMachineJobStore;
+  readonly cursorStore?: StateMachineCursorStore;
+}
+
+/**
+ * Resolve where the CLI keeps watcher state.
+ *
+ * - `--job-store memory` opts out of persistence entirely.
+ * - `--jobs-file <path>` pins the exact jobs path; the cursor lives
+ *   beside it as `<dir>/cursor.json` so one directory is one watcher state.
+ * - Otherwise jobs and cursor live in `--state-dir` (flag), then
+ *   UVP_WATCHER_STATE_DIR (env), then `./uvp-watcher-state`.
+ */
+export function resolveWatcherStorage(
+  options: Pick<ChainWatchOptions, 'jobStore' | 'stateDir' | 'jobsFile'>,
+  env: NodeJS.ProcessEnv = process.env,
+): WatcherStorageResolution {
+  const mode = options.jobStore ?? 'file';
+  if (mode !== 'file' && mode !== 'memory') {
+    throw new ValidationError(`--job-store must be "file" or "memory", got ${mode}`);
+  }
+  if (mode === 'memory') {
+    return { summary: { mode: 'memory' } };
+  }
+
+  const stateDir = options.jobsFile
+    ? dirname(resolve(options.jobsFile))
+    : resolve(options.stateDir ?? env[WATCHER_STATE_DIR_ENV] ?? DEFAULT_WATCHER_STATE_DIR);
+  const jobsFile = options.jobsFile ? resolve(options.jobsFile) : join(stateDir, 'jobs.json');
+  const cursorFile = join(stateDir, 'cursor.json');
+  return {
+    summary: {
+      mode: 'file',
+      stateDir,
+      jobsFile,
+      cursorFile,
+    },
+    jobStore: new FileStateMachineJobStore(jobsFile),
+    cursorStore: new FileStateMachineCursorStore(cursorFile),
+  };
+}
+
+async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Promise<{
+  watcher: ReturnType<typeof createStateMachineWatcher>;
+  storage: WatcherStorageSummary;
+}> {
   const config = await loadStateMachineHandlerConfig(options.config);
   const configuredStateMachines = config.stateMachines ?? [];
   const stateMachineAddress = options.stateMachine
@@ -660,7 +785,8 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions) {
   if (!stateMachineAddress) {
     throw new ValidationError('missing state machine address: pass --state-machine or set stateMachines[] in config');
   }
-  return createStateMachineWatcher({
+  const storage = resolveWatcherStorage(options);
+  const watcher = createStateMachineWatcher({
     rpcUrl: options.rpcUrl,
     stateMachineAddress,
     stateMachines: configuredStateMachines.length > 0
@@ -673,11 +799,15 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions) {
     handlers: createStateMachineHandlersFromConfig(config),
     ...(config.artifact ? { artifact: config.artifact } : {}),
     ...(config.retry ? { retry: config.retry } : {}),
-    ...(options.jobsFile ? { jobStore: new FileStateMachineJobStore(options.jobsFile) } : {}),
+    ...(storage.jobStore ? { jobStore: storage.jobStore } : {}),
+    ...(storage.cursorStore ? { cursorStore: storage.cursorStore } : {}),
     dryRun: options.dryRun ?? config.dryRun ?? false,
-    waitForReceipt: options.waitForReceipt ?? false,
+    ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
     ...(options.fromBlock ? { fromBlock: options.fromBlock } : {}),
     ...(options.pollIntervalMs ? { pollIntervalMs: parsePositiveInteger(options.pollIntervalMs, 'pollIntervalMs') } : {}),
+    ...(options.confirmations !== undefined ? { confirmations: parseNonNegativeIntegerOption(options.confirmations, 'confirmations') } : {}),
+    ...(options.reorgWindow !== undefined ? { reorgWindow: parsePositiveInteger(options.reorgWindow, 'reorgWindow') } : {}),
+    ...(options.getLogsBlockSpan !== undefined ? { getLogsBlockSpan: parsePositiveInteger(options.getLogsBlockSpan, 'getLogsBlockSpan') } : {}),
     onPoll: (poll) => {
       console.log(stringifyForTransport({ poll }));
     },
@@ -685,6 +815,7 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions) {
       console.error(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
     },
   });
+  return { watcher, storage: storage.summary };
 }
 
 async function validateConfigFromCli(options: ConfigValidateOptions): Promise<Record<string, unknown>> {
@@ -817,6 +948,18 @@ function parsePort(value: string): number {
   return port;
 }
 
+/** confirmations allows 0 (tip scanning for throwaway local chains). */
+function parseNonNegativeIntegerOption(value: string, fieldName: string): number {
+  if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+    throw new ValidationError(`${fieldName} must be a non-negative integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new ValidationError(`${fieldName} must be a non-negative safe integer`);
+  }
+  return parsed;
+}
+
 function waitForShutdown(close: () => Promise<void>): Promise<void> {
   return new Promise((resolve, reject) => {
     const shutdown = (): void => {
@@ -824,6 +967,45 @@ function waitForShutdown(close: () => Promise<void>): Promise<void> {
     };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
+  });
+}
+
+/**
+ * True when one log-processing outcome carries an error or ended in a terminal
+ * failure state. Used to drive honest process exit codes: a chain-once scan or
+ * jobs retry whose callback submission failed must exit non-zero even though
+ * the result object itself was produced without throwing.
+ */
+export function executionOutcomeFailed(result: {
+  readonly error?: unknown;
+  readonly job?: { readonly status?: string };
+}): boolean {
+  return Boolean(result.error)
+    || result.job?.status === 'failed'
+    || result.job?.status === 'dead_letter';
+}
+
+/**
+ * Outcome error kinds that classify a skip, not a run failure:
+ * `missing_handler` is a foreign HookReady event this executor is not
+ * configured for (a shared chain always carries other suppliers' hooks), and
+ * `duplicate_signal` is the chain's own dedupe fact for an already-delivered
+ * signal. A scan that only met these must exit 0.
+ */
+const BENIGN_SCAN_OUTCOME_ERROR_KINDS = new Set(['missing_handler', 'duplicate_signal']);
+
+export function chainPollExecutionFailed(poll: {
+  readonly results?: readonly {
+    readonly error?: unknown;
+    readonly job?: { readonly status?: string };
+  }[];
+}): boolean {
+  return (poll.results ?? []).some((result) => {
+    if (!executionOutcomeFailed(result)) {
+      return false;
+    }
+    const kind = (result.error as { readonly kind?: string } | undefined)?.kind;
+    return !BENIGN_SCAN_OUTCOME_ERROR_KINDS.has(kind ?? '');
   });
 }
 

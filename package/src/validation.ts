@@ -72,31 +72,3 @@ export function parsePositiveInteger(value: number | string, fieldName: string):
 
   return numberValue;
 }
-
-export function ensureExpectedChainId(chainId: number, expectedChainId?: number): number {
-  if (expectedChainId !== undefined && chainId !== expectedChainId) {
-    throw new ValidationError(`wrong chain id: got ${chainId}, expected ${expectedChainId}`);
-  }
-
-  return chainId;
-}
-
-export function ensureDeadlineNotExpired(deadline: bigint, now: Date | number = Date.now()): void {
-  const nowMs = now instanceof Date ? now.getTime() : now;
-  const nowSeconds = BigInt(Math.floor(nowMs / 1000));
-
-  if (deadline <= nowSeconds) {
-    throw new ValidationError(`deadline is expired: ${deadline.toString()} <= ${nowSeconds.toString()}`);
-  }
-}
-
-export function ensureKnownStageId(stageId: Hex, knownStageIds?: readonly string[]): void {
-  if (!knownStageIds || knownStageIds.length === 0) {
-    return;
-  }
-
-  const normalizedKnown = new Set(knownStageIds.map((id) => normalizeBytes32(id, 'knownStageId')));
-  if (!normalizedKnown.has(stageId)) {
-    throw new ValidationError(`unknown stage id: ${stageId}`);
-  }
-}

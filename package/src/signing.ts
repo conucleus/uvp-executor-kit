@@ -1,5 +1,4 @@
-import { privateKeyToAccount } from 'viem/accounts';
-import type { Address, Hex } from 'viem';
+import type { Hex } from 'viem';
 import { ValidationError } from './validation.js';
 
 export const DEFAULT_SIGNING_KEY_ENV = 'UVP_EXECUTOR_PRIVATE_KEY';
@@ -15,8 +14,4 @@ export function loadPrivateKeyFromEnv(envName = DEFAULT_SIGNING_KEY_ENV): Hex | 
   }
 
   return value as Hex;
-}
-
-export function getSignerAddress(privateKey: Hex): Address {
-  return privateKeyToAccount(privateKey).address;
 }

@@ -21,7 +21,6 @@ equivalent local workspace.
 Relayers and executors may submit transactions, but business actions must remain
 signed by authorized participant keys.
 
-Before repo split, executor-kit follows PRD109 as the non-browser
-signal-container producer boundary. It consumes Product DTO/Product API actions
-and produces signed executor signals through the same prepare/sign/submit/proof
-flow as the browser Order App.
+Executor-kit is the non-browser signal-container producer boundary. It consumes
+Product DTO/Product API actions and produces signed executor signals through
+the same prepare/sign/submit/proof flow as the browser Order App.

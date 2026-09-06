@@ -20,6 +20,7 @@ const privateKey = '0x1111111111111111111111111111111111111111111111111111111111
 const account = privateKeyToAccount(privateKey);
 const submitter = account.address.toLowerCase() as `0x${string}`;
 const verifyingContract = '0x8888888888888888888888888888888888888888' as const;
+const planId = bytes32('06');
 const orderId = bytes32('01');
 const sourceId = bytes32('02');
 const signalId = bytes32('03');
@@ -32,6 +33,7 @@ describe('participant entrypoint', () => {
     const typedData = buildProductSubmitTypedData({
       chainId: 31337,
       verifyingContract,
+      planId,
       orderId,
       sourceId,
       signalId,
@@ -41,15 +43,19 @@ describe('participant entrypoint', () => {
       deadline,
     });
 
+    // UVPStateMachineSignal is plan-scoped — planId is the first
+    // field of the signed message and callers must pass the real order planId
+    // instead of relying on the builder's zero placeholder default.
     expect(typedData).toEqual({
       domain: {
         name: 'UVPStateMachine',
-        version: '0.8',
+        version: '0.10',
         chainId: 31337,
         verifyingContract,
       },
       types: {
         UVPStateMachineSignal: [
+          { name: 'planId', type: 'bytes32' },
           { name: 'orderId', type: 'bytes32' },
           { name: 'sourceId', type: 'bytes32' },
           { name: 'signalId', type: 'bytes32' },
@@ -61,6 +67,7 @@ describe('participant entrypoint', () => {
       },
       primaryType: 'UVPStateMachineSignal',
       message: {
+        planId,
         orderId,
         sourceId,
         signalId,
@@ -72,10 +79,30 @@ describe('participant entrypoint', () => {
     });
   });
 
+  it('rejects typed data built from the zero planId placeholder for real signing', () => {
+    // The protocol-bindings builder tolerates an absent planId as a zero
+    // placeholder for shape-checking gates; a signer must not accept that
+    // placeholder because it can never pass the on-chain (planId, orderId)
+    // existence check.
+    const zeroPlanTypedData = buildProductSubmitTypedData({
+      chainId: 31337,
+      verifyingContract,
+      orderId,
+      sourceId,
+      signalId,
+      payloadHash,
+      idempotencyKey,
+      submitter,
+      deadline,
+    });
+    expect(zeroPlanTypedData.message.planId).toBe(`0x${'0'.repeat(64)}`);
+  });
+
   it('recovers the signer for a Product submit signature', async () => {
     const typedData = buildProductSubmitTypedData({
       chainId: 31337,
       verifyingContract,
+      planId,
       orderId,
       sourceId,
       signalId,
@@ -97,6 +124,7 @@ describe('participant entrypoint', () => {
       stateMachineAddress: verifyingContract,
       chainId: 31337,
     }, {
+      planId,
       orderId,
       sourceId,
       signalId,
@@ -113,7 +141,9 @@ describe('participant entrypoint', () => {
       functionName: 'submitSignalFor',
       chainId: 31337,
     });
+    // planId is the first ABI argument of submitSignalFor.
     expect(call.args).toEqual([
+      planId,
       orderId,
       sourceId,
       signalId,
@@ -130,6 +160,7 @@ describe('participant entrypoint', () => {
     const typedData = buildProductSubmitTypedData({
       chainId: 31337,
       verifyingContract,
+      planId,
       orderId,
       sourceId,
       signalId,
@@ -160,6 +191,7 @@ describe('participant entrypoint', () => {
     const typedData = buildProductSubmitTypedData({
       chainId: 31337,
       verifyingContract,
+      planId,
       orderId,
       sourceId,
       signalId,

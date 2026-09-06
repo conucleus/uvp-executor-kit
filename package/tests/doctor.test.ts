@@ -1,3 +1,4 @@
+import { createServer } from 'node:http';
 import { describe, expect, it } from 'vitest';
 import { main } from '../src/cli.js';
 import { runProductDoctor } from '../src/doctor.js';
@@ -209,6 +210,52 @@ describe('Product API doctor', () => {
     expect(report.ok).toBe(false);
   });
 
+  it('never follows a Product API redirect and never replays the bearer to the redirect target', async () => {
+    // Audit S11 same-class fix: the reachability probe carries the
+    // Authorization bearer from --auth-token-env, and the default
+    // redirect:"follow" policy would replay it to whatever host a 3xx points
+    // at. Redirects are now manual and fail the reachability check.
+    const seen: { path: string; authorization?: string }[] = [];
+    const redirector = createServer((request, response) => {
+      seen.push({
+        path: request.url ?? '',
+        ...(typeof request.headers.authorization === 'string'
+          ? { authorization: request.headers.authorization }
+          : {}),
+      });
+      response.statusCode = 302;
+      response.setHeader('location', '/leak');
+      response.end();
+    });
+    await new Promise<void>((resolve) => redirector.listen(0, '127.0.0.1', resolve));
+    const redirectorAddress = redirector.address();
+    if (!redirectorAddress || typeof redirectorAddress === 'string') {
+      throw new Error('redirect test server did not bind to a TCP address');
+    }
+
+    try {
+      // No injected fetch: the real global fetch must honor the manual policy.
+      const report = await runProductDoctor({
+        chainServicesUrl: `http://127.0.0.1:${redirectorAddress.port}`,
+        headers: { Authorization: 'Bearer secret-doctor-token' },
+      });
+
+      const reachability = report.checks.find((c) => c.label === 'reachability');
+      expect(reachability?.ok).toBe(false);
+      expect(reachability?.detail).toContain('HTTP 302 redirect');
+      expect(reachability?.detail).toContain('redirects are refused');
+      expect(report.ok).toBe(false);
+
+      // The redirect was never followed: the /leak target saw zero requests,
+      // and every observed request carried (only) the original bearer.
+      expect(seen.filter((entry) => entry.path.startsWith('/leak'))).toEqual([]);
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((entry) => entry.authorization === 'Bearer secret-doctor-token')).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => redirector.close(() => resolve()));
+    }
+  });
+
   it('reports task-visibility failure independently of reachability', async () => {
     const fetch: ProductApiFetch = async (url) => {
       if (!url.includes('/product/')) {
@@ -264,7 +311,6 @@ describe('Product API doctor', () => {
           assigneeWallet: submitter,
           stageName: 'Customs release',
           deadline: '2099-01-01T00:00:00.000Z',
-          requiredEvidence: ['customs-docs'],
           canSubmit: true,
           primaryActionLabel: 'Confirm stage',
         },
@@ -287,7 +333,6 @@ describe('Product API doctor', () => {
       canSubmit: true,
       assigneeMatch: true,
       nextAction: 'prepare',
-      requiredEvidence: ['customs-docs'],
     });
     expect(report.taskReadiness?.nextActionLabel).toContain('Ready to prepare');
     expect(report.tasks).toBeUndefined();
@@ -312,7 +357,6 @@ describe('Product API doctor', () => {
           status: 'open',
           assigneeWallet: submitter,
           deadline: '2099-01-01T00:00:00.000Z',
-          requiredEvidence: ['shipping-docs'],
           canSubmit: false,
           blockedReason: 'Required evidence not yet uploaded',
         },
@@ -335,9 +379,54 @@ describe('Product API doctor', () => {
     });
     expect(report.taskReadiness?.nextActionLabel).toContain('Required evidence not yet uploaded');
     expect(report.ok).toBe(false);
+    // The embedded readiness check mirrors the verdict: consumers reading
+    // only the nested check must see the blocked state.
+    expect(report.taskReadiness?.ok).toBe(false);
+    expect(report.taskReadiness?.check.ok).toBe(false);
   });
 
-  it('reports next action as proof for a confirmed task', async () => {
+  it('reports next action as proof for a task completed with the canonical done status', async () => {
+    // Product's frozen completion enum includes `done`; readiness.ok must
+    // count it as complete, otherwise a completed task reports not-ready.
+    const fetch: ProductApiFetch = async (url) => {
+      if (!url.includes('/product/')) {
+        return jsonResponse({ service: 'chain-services' });
+      }
+      return jsonResponse({
+        task: {
+          taskId: 'task_done',
+          orderId: 'order_3b',
+          title: 'Completed inspection',
+          status: 'done',
+          assigneeWallet: submitter,
+          canSubmit: false,
+        },
+      });
+    };
+
+    const report = await runProductDoctor({
+      chainServicesUrl: 'http://chain.local/api',
+      walletAddress: submitter,
+      taskId: 'task_done',
+      fetch,
+    });
+
+    expect(report.taskReadiness).toMatchObject({
+      taskId: 'task_done',
+      status: 'done',
+      nextAction: 'proof',
+    });
+    expect(report.taskReadiness?.ok).toBe(true);
+    expect(report.taskReadiness?.check.ok).toBe(true);
+    expect(report.taskReadiness?.nextActionLabel).toContain('Run product proof');
+    expect(report.ok).toBe(true);
+  });
+
+  it('treats only the canonical done status as complete (no completion aliases)', async () => {
+    // Product's TaskStatus vocabulary is open|submitted|blocked|done. The
+    // historical `confirmed`/`completed` completion aliases were purged, so a
+    // non-canonical status must surface as not-ready instead of being silently
+    // treated as a completed task.
     const fetch: ProductApiFetch = async (url) => {
       if (!url.includes('/product/')) {
         return jsonResponse({ service: 'chain-services' });
@@ -364,10 +453,10 @@ describe('Product API doctor', () => {
     expect(report.taskReadiness).toMatchObject({
       taskId: 'task_confirmed',
       status: 'confirmed',
-      nextAction: 'proof',
+      nextAction: 'wait',
     });
-    expect(report.taskReadiness?.nextActionLabel).toContain('Run product proof');
-    expect(report.ok).toBe(true);
+    expect(report.taskReadiness?.nextActionLabel).not.toContain('Run product proof');
+    expect(report.taskReadiness?.ok).toBe(false);
   });
 
   it('reports per-task readiness without wallet address', async () => {
@@ -383,7 +472,6 @@ describe('Product API doctor', () => {
           status: 'open',
           assigneeWallet: submitter,
           canSubmit: true,
-          requiredEvidence: [],
         },
       });
     };
@@ -419,7 +507,6 @@ describe('Product API doctor', () => {
           status: 'open',
           assigneeWallet: '0x9999999999999999999999999999999999999999',
           canSubmit: true,
-          requiredEvidence: [],
         },
       });
     };
@@ -438,6 +525,29 @@ describe('Product API doctor', () => {
       nextAction: 'blocked',
     });
     expect(report.taskReadiness?.nextActionLabel).toContain('not the task assignee');
+    expect(report.ok).toBe(false);
+  });
+
+  it('omits readiness and raw-task data when the task lookup fails', async () => {
+    const fetch: ProductApiFetch = async (url) => {
+      if (!url.includes('/product/')) {
+        return jsonResponse({ service: 'chain-services' });
+      }
+      return { ok: false, status: 404, text: async () => JSON.stringify({ error: 'task_not_found' }) };
+    };
+
+    const report = await runProductDoctor({
+      chainServicesUrl: 'http://chain.local/api',
+      taskId: 'task_missing',
+      fetch,
+    });
+
+    const taskCheck = report.checks.find((c) => c.label === 'task-readiness');
+    expect(taskCheck?.ok).toBe(false);
+    expect(taskCheck?.detail).toBeTypeOf('string');
+    expect(report.taskReadiness).toBeUndefined();
+    expect(report.rawTaskReadiness).toBeUndefined();
+    expect(JSON.stringify(report)).not.toContain('"status":"unknown"');
     expect(report.ok).toBe(false);
   });
 });
@@ -529,7 +639,6 @@ describe('doctor CLI', () => {
           assigneeWallet: submitter,
           stageName: 'Customs release',
           deadline: '2099-01-01T00:00:00.000Z',
-          requiredEvidence: ['customs-docs'],
           canSubmit: true,
           primaryActionLabel: 'Confirm stage',
         },
@@ -599,7 +708,6 @@ describe('doctor CLI', () => {
           canSubmit: true,
           sourceId: sourceIdHex,
           signalId: bytes32('03'),
-          requiredEvidence: [],
         },
       });
     }) as unknown as typeof globalThis.fetch;
@@ -802,6 +910,44 @@ describe('doctor CLI', () => {
       } else {
         delete (globalThis as { fetch?: unknown }).fetch;
       }
+    }
+  });
+
+  it('sets a non-zero exit code while still printing the report when a doctor check fails', async () => {
+    const previousExitCode = process.exitCode;
+    const logs: string[] = [];
+    const originalLog = console.log;
+    const originalFetch = globalThis.fetch;
+    console.log = (message?: unknown) => {
+      logs.push(String(message));
+    };
+    globalThis.fetch = (async () => jsonResponse({ error: 'unavailable' }, 503)) as unknown as typeof globalThis.fetch;
+
+    try {
+      await main([
+        'node',
+        'uvp-executor',
+        'doctor',
+        '--chain-services-url',
+        'http://chain.local/api',
+      ]);
+      const output = JSON.parse(logs[0] ?? '{}') as {
+        ok?: boolean;
+        checks?: Array<{ ok?: boolean; label?: string; detail?: string }>;
+      };
+      expect(output.ok).toBe(false);
+      expect(output.checks?.[0]).toMatchObject({ ok: false, label: 'reachability', detail: expect.stringContaining('503') });
+      // The printed report is unchanged; only the exit signal is added.
+      expect(logs[0]).toContain('"ok":false');
+      expect(process.exitCode).toBe(1);
+    } finally {
+      console.log = originalLog;
+      if (originalFetch) {
+        globalThis.fetch = originalFetch;
+      } else {
+        delete (globalThis as { fetch?: unknown }).fetch;
+      }
+      process.exitCode = previousExitCode;
     }
   });
 });

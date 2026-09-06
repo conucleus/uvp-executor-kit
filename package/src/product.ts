@@ -2,6 +2,7 @@ import { isHex, type Address, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import {
   PRODUCT_SUBMIT_DOMAIN_VERSION,
+  PRODUCT_SUBMIT_TYPED_DATA_FIELDS,
   type ProductSubmitTypedData,
   type ProductSubmitTypedDataField,
 } from '@uvp-eth/protocol-bindings';
@@ -17,16 +18,49 @@ import {
 
 export type ProductSubmitIntent = 'confirm_stage' | 'reject_stage' | 'raise_dispute' | 'resolve_dispute';
 
+const ZERO_BYTES32 = `0x${'0'.repeat(64)}` as const;
+
+/**
+ * The chain-services API server stamps every response (success and
+ * error) with this header so executor-side results, errors, and logs can be
+ * correlated end to end with server-side request logs.
+ */
+export const PRODUCT_API_REQUEST_ID_HEADER = 'x-request-id';
+
 export interface ProductApiFetchInit {
   readonly method?: string;
   readonly headers?: Readonly<Record<string, string>>;
   readonly body?: string;
+  /**
+   * The transport always sets 'manual': these requests carry the Authorization
+   * bearer injected by `--auth-token-env`, and following a 3xx would replay it
+   * to whatever host the Location header points at.
+   */
+  readonly redirect?: 'manual';
 }
+
+/**
+ * Statuses a manual redirect policy refuses to follow: every 3xx plus the
+ * status-0 `opaqueredirect` response a filtered manual redirect yields. Callers
+ * treat any of these as a request failure so credentials are never replayed.
+ */
+export function isProductApiRedirectStatus(status: number): boolean {
+  return status === 0 || (status >= 300 && status < 400);
+}
+
+/**
+ * Response headers as a plain record (lowercase or any casing) or a fetch-like
+ * object exposing `get(name)`, so both test stubs and real `Response` objects fit.
+ */
+export type ProductApiResponseHeaders =
+  | Readonly<Record<string, string | readonly string[] | undefined>>
+  | { readonly get: (name: string) => string | null | undefined };
 
 export interface ProductApiFetchResponse {
   readonly ok: boolean;
   readonly status: number;
   readonly statusText?: string;
+  readonly headers?: ProductApiResponseHeaders;
   text?(): Promise<string>;
   json?(): Promise<unknown>;
 }
@@ -107,6 +141,8 @@ export interface ProductSignalContainer extends Record<string, unknown> {
   readonly orderId: string;
   readonly title: string;
   readonly status: string;
+  /** x-request-id echoed by the server response that produced this object. */
+  readonly requestId?: string;
 }
 
 export interface ProductSubmitHumanSummary extends Record<string, unknown> {
@@ -130,6 +166,8 @@ export interface PreparedSignalContainer extends Record<string, unknown> {
   readonly humanSummary: ProductSubmitHumanSummary;
   readonly typedData: ProductSubmitTypedData;
   readonly evidence: readonly Record<string, unknown>[];
+  /** x-request-id echoed by the server response that produced this object. */
+  readonly requestId?: string;
 }
 
 export interface SubmittedSignalContainer extends Record<string, unknown> {
@@ -138,6 +176,8 @@ export interface SubmittedSignalContainer extends Record<string, unknown> {
   readonly taskId: string;
   readonly orderId: string;
   readonly status: string;
+  /** x-request-id echoed by the server response that produced this object. */
+  readonly requestId?: string;
 }
 
 export interface ProductTaskSummary {
@@ -153,7 +193,6 @@ export interface ProductTaskSummary {
   readonly stageName?: string;
   readonly deadline?: string;
   readonly fundingImpact?: string;
-  readonly requiredEvidence?: readonly string[];
   readonly canSubmit?: boolean;
   readonly blockedReason?: string;
   readonly performanceSlotId?: string;
@@ -215,8 +254,14 @@ export class ProductApiError extends ExecutorKitError {
   readonly status: number;
   readonly code?: string;
   readonly details?: unknown;
+  /**
+   * request id of the failed call, taken from the x-request-id response
+   * header (falling back to the id the server embeds in error bodies) so the
+   * failure can be matched against server-side logs.
+   */
+  readonly requestId?: string;
 
-  constructor(status: number, code: string | undefined, message: string, details?: unknown) {
+  constructor(status: number, code: string | undefined, message: string, details?: unknown, requestId?: string) {
     super(message);
     this.name = 'ProductApiError';
     this.status = status;
@@ -226,12 +271,15 @@ export class ProductApiError extends ExecutorKitError {
     if (details !== undefined) {
       this.details = details;
     }
+    if (requestId !== undefined) {
+      this.requestId = requestId;
+    }
   }
 }
 
 export async function listSignalContainers(input: ListSignalContainersInput): Promise<readonly ProductSignalContainer[]> {
   const walletAddress = normalizeAddress(input.walletAddress, 'walletAddress');
-  const body = await requestProductApiJson(input, 'GET', '/product/tasks', undefined, {
+  const { body, requestId } = await requestProductApiJson(input, 'GET', '/product/tasks', undefined, {
     assignee: walletAddress,
     ...(input.orderId ? { orderId: input.orderId } : {}),
     ...(input.status ? { status: input.status } : {}),
@@ -241,16 +289,18 @@ export async function listSignalContainers(input: ListSignalContainersInput): Pr
   if (!Array.isArray(tasks)) {
     throw new ValidationError('Product tasks response must contain a tasks array');
   }
-  return tasks.map((task, index) => parseSignalContainer(task, `tasks[${index}]`));
+  // The transport returns a bare array, so every task carries the response's
+  // request id to keep "which request produced this row" answerable.
+  return tasks.map((task, index) => attachResponseRequestId(parseSignalContainer(task, `tasks[${index}]`), requestId));
 }
 
 export async function getSignalContainer(input: GetSignalContainerInput): Promise<ProductSignalContainer> {
   if (input.walletAddress) {
     normalizeAddress(input.walletAddress, 'walletAddress');
   }
-  const body = await requestProductApiJson(input, 'GET', `/product/tasks/${encodeURIComponent(requiredText(input.taskId, 'taskId'))}`);
+  const { body, requestId } = await requestProductApiJson(input, 'GET', `/product/tasks/${encodeURIComponent(requiredText(input.taskId, 'taskId'))}`);
   const record = requireRecord(body, 'Product task response');
-  return parseSignalContainer(record.task, 'task');
+  return attachResponseRequestId(parseSignalContainer(record.task, 'task'), requestId);
 }
 
 export async function hashContainerEvidence(input: HashContainerEvidenceInput): Promise<EvidenceHashResult> {
@@ -259,7 +309,7 @@ export async function hashContainerEvidence(input: HashContainerEvidenceInput): 
 
 export async function prepareSignalContainer(input: PrepareSignalContainerInput): Promise<PreparedSignalContainer> {
   const walletAddress = normalizeAddress(input.walletAddress, 'walletAddress');
-  const body = await requestProductApiJson(
+  const { body, requestId } = await requestProductApiJson(
     input,
     'POST',
     `/product/tasks/${encodeURIComponent(requiredText(input.taskId, 'taskId'))}/prepare-submit`,
@@ -269,7 +319,7 @@ export async function prepareSignalContainer(input: PrepareSignalContainerInput)
       intent: normalizeIntent(input.intent),
     },
   );
-  return parsePreparedSignalContainer(body, 'prepared submission');
+  return attachResponseRequestId(parsePreparedSignalContainer(body, 'prepared submission'), requestId);
 }
 
 export async function signPreparedSignalContainer(
@@ -312,7 +362,7 @@ export async function submitPreparedSignalContainer(
 ): Promise<SubmittedSignalContainer> {
   const signature = normalizeSignature(input.signature);
   const walletAddress = normalizeAddress(input.walletAddress, 'walletAddress');
-  const body = await requestProductApiJson(
+  const { body, requestId } = await requestProductApiJson(
     input,
     'POST',
     `/product/tasks/${encodeURIComponent(requiredText(input.taskId, 'taskId'))}/submit`,
@@ -322,18 +372,18 @@ export async function submitPreparedSignalContainer(
       walletAddress,
     },
   );
-  return parseSubmittedSignalContainer(body, 'submission');
+  return attachResponseRequestId(parseSubmittedSignalContainer(body, 'submission'), requestId);
 }
 
 export async function getSignalContainerProof(
   input: GetSignalContainerProofInput,
 ): Promise<SubmittedSignalContainer> {
-  const body = await requestProductApiJson(
+  const { body, requestId } = await requestProductApiJson(
     input,
     'GET',
     `/product/submissions/${encodeURIComponent(requiredText(input.submissionId, 'submissionId'))}`,
   );
-  return parseSubmittedSignalContainer(body, 'submission');
+  return attachResponseRequestId(parseSubmittedSignalContainer(body, 'submission'), requestId);
 }
 
 export function summarizeSignalContainer(task: ProductSignalContainer | Record<string, unknown>): ProductTaskSummary {
@@ -351,7 +401,6 @@ export function summarizeSignalContainer(task: ProductSignalContainer | Record<s
     ...optionalString(parsed, 'stageName'),
     ...optionalString(parsed, 'deadline'),
     ...optionalString(parsed, 'fundingImpact'),
-    ...optionalStringArray(parsed, 'requiredEvidence'),
     ...optionalBoolean(parsed, 'canSubmit'),
     ...optionalString(parsed, 'blockedReason'),
     ...optionalString(parsed, 'performanceSlotId'),
@@ -514,6 +563,12 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
   if (primaryType !== 'UVPStateMachineSignal') {
     throw new ValidationError(`${label}.primaryType must be UVPStateMachineSignal`);
   }
+  // The typed data is exactly what the participant wallet signs, so any drift
+  // from the frozen canonical shape (extra/missing/renamed fields, type drift)
+  // changes what is signed or how it verifies. Reject all of it instead of
+  // silently dropping unknown keys.
+  requireExactKeys(domain, ['name', 'version', 'chainId', 'verifyingContract'], `${label}.domain`);
+  requireExactKeys(types, ['UVPStateMachineSignal'], `${label}.types`);
   const domainName = requiredString(domain, 'name', `${label}.domain`);
   if (domainName !== 'UVPStateMachine') {
     throw new ValidationError(`${label}.domain.name must be UVPStateMachine`);
@@ -526,6 +581,17 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
   if (typeof chainId !== 'number' || !Number.isSafeInteger(chainId) || chainId <= 0) {
     throw new ValidationError(`${label}.domain.chainId must be a positive safe integer`);
   }
+  const fields = parseTypedDataFields(types.UVPStateMachineSignal, `${label}.types.UVPStateMachineSignal`);
+  requireExactKeys(message, PRODUCT_SUBMIT_TYPED_DATA_FIELDS.map((field) => field.name), `${label}.message`);
+  const planId = normalizeBytes32(requiredString(message, 'planId', `${label}.message`), `${label}.message.planId`);
+  if (planId === ZERO_BYTES32) {
+    // The signature commits to (planId, orderId) and the contract
+    // verifies plan existence, so a zero-planId prepared submission could only
+    // produce a signature that can never land. The protocol-bindings builder's
+    // optional-planId zero default exists solely for shape-checking gates; a
+    // signer must never accept it.
+    throw new ValidationError(`${label}.message.planId must be a non-zero bytes32 plan id: the zero placeholder cannot satisfy the on-chain (planId, orderId) existence check`);
+  }
   return {
     domain: {
       name: domainName,
@@ -537,10 +603,11 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
       ),
     },
     types: {
-      UVPStateMachineSignal: parseTypedDataFields(types.UVPStateMachineSignal, `${label}.types.UVPStateMachineSignal`),
+      UVPStateMachineSignal: fields,
     },
     primaryType,
     message: {
+      planId,
       orderId: normalizeBytes32(requiredString(message, 'orderId', `${label}.message`), `${label}.message.orderId`),
       sourceId: normalizeBytes32(requiredString(message, 'sourceId', `${label}.message`), `${label}.message.sourceId`),
       signalId: normalizeBytes32(requiredString(message, 'signalId', `${label}.message`), `${label}.message.signalId`),
@@ -550,22 +617,87 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
         `${label}.message.idempotencyKey`,
       ),
       submitter: normalizeAddress(requiredString(message, 'submitter', `${label}.message`), `${label}.message.submitter`),
-      deadline: requiredString(message, 'deadline', `${label}.message`),
+      deadline: validateFutureDeadline(requiredString(message, 'deadline', `${label}.message`), `${label}.message.deadline`),
     },
   };
 }
 
+/**
+ * Compare the parsed typed-data field table against the frozen canonical
+ * `PRODUCT_SUBMIT_TYPED_DATA_FIELDS`: same length, same order, same names and
+ * types, and no extra keys per field. Any drift between the prepare response and
+ * the protocol the wallet would sign for is rejected loudly.
+ */
 function parseTypedDataFields(value: unknown, label: string): readonly ProductSubmitTypedDataField[] {
   if (!Array.isArray(value)) {
     throw new ValidationError(`${label} must be an array`);
   }
-  return value.map((field, index) => {
+  const fields = value.map((field, index) => {
     const record = requireRecord(field, `${label}[${index}]`);
+    requireExactKeys(record, ['name', 'type'], `${label}[${index}]`);
     return {
       name: requiredString(record, 'name', `${label}[${index}]`),
       type: requiredString(record, 'type', `${label}[${index}]`),
     };
   });
+  const canonical = PRODUCT_SUBMIT_TYPED_DATA_FIELDS;
+  if (fields.length !== canonical.length) {
+    throw new ValidationError(
+      `${label} must contain exactly ${canonical.length} fields for UVPStateMachineSignal, got ${fields.length}`,
+    );
+  }
+  for (const [index, expected] of canonical.entries()) {
+    const actual = fields[index];
+    if (!actual || actual.name !== expected.name || actual.type !== expected.type) {
+      throw new ValidationError(
+        `${label}[${index}] must be { name: ${expected.name}, type: ${expected.type} } but got { name: ${actual?.name ?? 'missing'}, type: ${actual?.type ?? 'missing'} }`,
+      );
+    }
+  }
+  return fields;
+}
+
+/**
+ * `deadline` is a uint256 unix-seconds timestamp in the signature message.
+ * Reject non-decimal formats and already-expired deadlines so an expired
+ * prepared submission fails at parse/sign time instead of at the chain.
+ */
+function validateFutureDeadline(value: string, label: string): string {
+  if (!/^(0|[1-9][0-9]*)$/u.test(value)) {
+    throw new ValidationError(`${label} must be a base-10 unix-seconds uint string`);
+  }
+  const nowSeconds = BigInt(Math.floor(Date.now() / 1000));
+  if (BigInt(value) <= nowSeconds) {
+    throw new ValidationError(`${label} must be a unix timestamp in the future`);
+  }
+  return value;
+}
+
+function requireExactKeys(
+  record: Record<string, unknown>,
+  expectedKeys: readonly string[],
+  label: string,
+): void {
+  const expected = new Set(expectedKeys);
+  for (const key of Object.keys(record)) {
+    if (!expected.has(key)) {
+      throw new ValidationError(`${label} has unexpected field ${key}`);
+    }
+  }
+  for (const key of expectedKeys) {
+    if (!(key in record)) {
+      throw new ValidationError(`${label} is missing field ${key}`);
+    }
+  }
+}
+
+/**
+ * Internal transport result: the parsed JSON body plus the server's request id
+  * Read from the response headers when present.
+ */
+interface ProductApiJsonResult {
+  readonly body: unknown;
+  readonly requestId?: string | undefined;
 }
 
 async function requestProductApiJson(
@@ -574,7 +706,7 @@ async function requestProductApiJson(
   path: string,
   body?: Record<string, unknown>,
   query?: Readonly<Record<string, string | undefined>>,
-): Promise<unknown> {
+): Promise<ProductApiJsonResult> {
   const fetchFn = resolveProductApiFetch(input.fetch);
   const url = productApiUrl(input.chainServicesUrl, path, query);
   const headers: Record<string, string> = {
@@ -591,13 +723,30 @@ async function requestProductApiJson(
   const response = await fetchFn(url, {
     method,
     headers,
+    // Never let fetch follow a redirect: these headers carry the Authorization
+    // bearer from --auth-token-env, and a 3xx would replay it to whatever host
+    // the Location header points at. A redirect is a request failure, full stop.
+    redirect: 'manual',
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
+  if (isProductApiRedirectStatus(response.status)) {
+    // Covers every 3xx and the status-0 opaqueredirect response a manual
+    // redirect policy yields: the request must fail instead of leaking the
+    // bearer to the redirect target.
+    throw new ProductApiError(
+      response.status,
+      'redirect',
+      `Product API request for ${path} was answered with HTTP ${response.status} instead of a direct response; redirects are refused so the Authorization bearer is never replayed to the redirect target`,
+    );
+  }
   const payload = await readProductApiBody(response);
   if (!response.ok) {
     throw productApiErrorFromResponse(response, payload);
   }
-  return payload;
+  return {
+    body: payload,
+    requestId: productApiResponseRequestId(response),
+  };
 }
 
 export function resolveProductApiFetch(fetchFn?: ProductApiFetch): ProductApiFetch {
@@ -657,7 +806,59 @@ function productApiErrorFromResponse(response: ProductApiFetchResponse, payload:
   const message = typeof record.message === 'string' && record.message.trim().length > 0
     ? record.message
     : `Product API request failed with HTTP ${response.status}`;
-  return new ProductApiError(response.status, code, message, record.details);
+  // The x-request-id response header is authoritative; the id the
+  // server embeds in error bodies is the fallback when headers are unavailable.
+  const requestId = productApiResponseRequestId(response)
+    ?? (typeof record.requestId === 'string' && record.requestId.trim().length > 0 ? record.requestId.trim() : undefined);
+  return new ProductApiError(response.status, code, message, record.details, requestId);
+}
+
+/**
+ * Read the server's request id from the response headers. Supports both
+ * fetch-like header objects (`headers.get(name)`, as returned by real fetch
+ * implementations) and plain records with any key casing.
+ */
+export function productApiResponseRequestId(response: ProductApiFetchResponse): string | undefined {
+  return readResponseHeader(response, PRODUCT_API_REQUEST_ID_HEADER);
+}
+
+function readResponseHeader(response: ProductApiFetchResponse, name: string): string | undefined {
+  const headers = response.headers;
+  if (!headers) {
+    return undefined;
+  }
+  const get = (headers as { get?: unknown }).get;
+  if (typeof get === 'function') {
+    const value = (get as (headerName: string) => string | null | undefined).call(headers, name);
+    const text = typeof value === 'string' ? value.trim() : undefined;
+    return text ? text : undefined;
+  }
+  if (typeof headers !== 'object') {
+    return undefined;
+  }
+  for (const [key, value] of Object.entries(headers as Readonly<Record<string, string | readonly string[] | undefined>>)) {
+    if (key.toLowerCase() !== name) {
+      continue;
+    }
+    const raw = Array.isArray(value) ? value[0] : value;
+    const text = typeof raw === 'string' ? raw.trim() : undefined;
+    if (text) {
+      return text;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Attach the response's request id to a parsed result object without
+ * disturbing shapes when the header was absent (the requestId key is simply
+ * not added).
+ */
+function attachResponseRequestId<T extends Record<string, unknown>>(value: T, requestId: string | undefined): T {
+  if (requestId === undefined) {
+    return value;
+  }
+  return { ...value, requestId };
 }
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {

@@ -1,17 +1,24 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { buildProductSubmitTypedData } from '@uvp-eth/protocol-bindings';
+import {
+  buildProductSubmitTypedData,
+  type ProductSubmitTypedDataField,
+} from '@uvp-eth/protocol-bindings';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { Address } from 'viem';
 import { main } from '../src/cli.js';
 import {
   getSignalContainerProof,
   listSignalContainers,
+  parsePreparedSignalContainer,
   prepareSignalContainer,
+  ProductApiError,
   productApiAuthHeadersFromEnv,
   signPreparedSignalContainer,
+  submitPreparedSignalContainer,
   summarizeSignalContainer,
   type PreparedSignalContainer,
   type ProductApiFetch,
@@ -155,6 +162,52 @@ describe('Product API mode', () => {
     }
   });
 
+  it('never follows a Product API redirect and never replays the bearer to the redirect target', async () => {
+    // Audit S11 same-class fix: --auth-token-env injects an Authorization
+    // bearer into every product fetch (including this one's headers), and the
+    // default redirect:"follow" policy would replay it to whatever host a 3xx
+    // points at. Redirects are now manual and count as request failures.
+    const seen: { path: string; authorization?: string }[] = [];
+    const redirector = createServer((request, response) => {
+      seen.push({
+        path: request.url ?? '',
+        ...(typeof request.headers.authorization === 'string'
+          ? { authorization: request.headers.authorization }
+          : {}),
+      });
+      response.statusCode = 302;
+      response.setHeader('location', '/leak');
+      response.end();
+    });
+    await new Promise<void>((resolve) => redirector.listen(0, '127.0.0.1', resolve));
+    const redirectorAddress = redirector.address();
+    if (!redirectorAddress || typeof redirectorAddress === 'string') {
+      throw new Error('redirect test server did not bind to a TCP address');
+    }
+
+    try {
+      // No injected fetch: the real global fetch must honor the manual policy.
+      const error = await listSignalContainers({
+        chainServicesUrl: `http://127.0.0.1:${redirectorAddress.port}`,
+        walletAddress: submitter,
+        headers: { Authorization: 'Bearer secret-product-token' },
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ProductApiError);
+      expect((error as ProductApiError).status).toBe(302);
+      expect((error as ProductApiError).code).toBe('redirect');
+      expect((error as Error).message).toContain('redirects are refused');
+
+      // The redirect was never followed: the /leak target saw zero requests,
+      // and every observed request carried (only) the original bearer.
+      expect(seen.filter((entry) => entry.path.startsWith('/leak'))).toEqual([]);
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((entry) => entry.authorization === 'Bearer secret-product-token')).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => redirector.close(() => resolve()));
+    }
+  });
+
   it('fails closed on malformed Product API task responses', async () => {
     const fetch: ProductApiFetch = async () => jsonResponse({ task: { taskId: 'wrong_shape' } });
 
@@ -245,7 +298,6 @@ describe('Product API mode', () => {
       capabilityPlugin: {
         pluginKind: 'payment_placeholder',
         source: 'explicit',
-        requiredEvidence: ['guarantee-proof'],
       },
       businessPersonaLabels: ['Guarantor'],
       proofRows: [{ label: 'Event', value: 'SignalSubmitted' }],
@@ -514,14 +566,268 @@ describe('Product API mode', () => {
   });
 });
 
+describe('request id passthrough', () => {
+  it('attaches the server x-request-id header to task, prepare, submit, and proof results', async () => {
+    const fetch: ProductApiFetch = async (url) => {
+      if (url.includes('/product/tasks?')) {
+        return jsonResponseWithHeaders({
+          tasks: [
+            {
+              taskId: 'task_req',
+              orderId: 'order_req',
+              title: 'Request id task',
+              status: 'open',
+            },
+          ],
+        }, { 'x-request-id': 'req-list-1' });
+      }
+      if (url.includes('/prepare-submit')) {
+        return jsonResponseWithHeaders(preparedSubmission(), { 'X-Request-Id': 'req-prepare-1' });
+      }
+      return jsonResponseWithHeaders({
+        submissionId: 'sub_req',
+        prepareId: 'prep_1',
+        taskId: 'task_1',
+        orderId: 'order_1',
+        status: 'submitted',
+      }, { 'x-request-id': 'req-submit-1' });
+    };
+
+    const tasks = await listSignalContainers({
+      chainServicesUrl: 'http://chain.local',
+      walletAddress: submitter,
+      fetch,
+    });
+    expect(tasks[0]?.requestId).toBe('req-list-1');
+
+    const prepared = await prepareSignalContainer({
+      chainServicesUrl: 'http://chain.local',
+      taskId: 'task_1',
+      walletAddress: submitter,
+      evidenceIds: ['ev_1'],
+      intent: 'confirm_stage',
+      fetch,
+    });
+    expect(prepared.requestId).toBe('req-prepare-1');
+
+    const submitted = await submitPreparedSignalContainer({
+      chainServicesUrl: 'http://chain.local',
+      taskId: 'task_1',
+      prepareId: 'prep_1',
+      signature: `0x${'cd'.repeat(65)}`,
+      walletAddress: submitter,
+      fetch,
+    });
+    expect(submitted.requestId).toBe('req-submit-1');
+  });
+
+  it('reads the request id from fetch-style header objects (any key casing)', async () => {
+    const fetch: ProductApiFetch = async () => ({
+      ok: true,
+      status: 200,
+      headers: {
+        get: (name: string) => name === 'x-request-id' ? '  req-header-obj-1\n' : null,
+      },
+      text: async () => JSON.stringify({
+        submissionId: 'sub_hdr',
+        prepareId: 'prep_hdr',
+        taskId: 'task_hdr',
+        orderId: 'order_hdr',
+        status: 'confirmed',
+      }),
+    });
+
+    await expect(getSignalContainerProof({
+      chainServicesUrl: 'http://chain.local',
+      submissionId: 'sub_hdr',
+      fetch,
+    })).resolves.toMatchObject({ submissionId: 'sub_hdr', requestId: 'req-header-obj-1' });
+  });
+
+  it('does not read the request id from unknown request-id headers (only x-request-id is canonical)', async () => {
+    // The server stamps responses exclusively with x-request-id (api/server.ts);
+    // other request-id-shaped headers must never populate requestId.
+    const fetch: ProductApiFetch = async () => ({
+      ok: true,
+      status: 200,
+      headers: {
+        get: (name: string) => name === 'x-uvp-request-id' ? 'req-retired-1' : null,
+      },
+      text: async () => JSON.stringify({
+        submissionId: 'sub_hdr',
+        prepareId: 'prep_hdr',
+        taskId: 'task_hdr',
+        orderId: 'order_hdr',
+        status: 'confirmed',
+      }),
+    });
+
+    const submission = await getSignalContainerProof({
+      chainServicesUrl: 'http://chain.local',
+      submissionId: 'sub_hdr',
+      fetch,
+    });
+    expect(submission.submissionId).toBe('sub_hdr');
+    expect(submission.requestId).toBeUndefined();
+  });
+
+  it('leaves results untouched when the response carries no headers', async () => {
+    const fetch: ProductApiFetch = async () => jsonResponse({
+      submissionId: 'sub_nohdr',
+      prepareId: 'prep_nohdr',
+      taskId: 'task_nohdr',
+      orderId: 'order_nohdr',
+      status: 'confirmed',
+    });
+
+    const submission = await getSignalContainerProof({
+      chainServicesUrl: 'http://chain.local',
+      submissionId: 'sub_nohdr',
+      fetch,
+    });
+    expect(submission.requestId).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(submission, 'requestId')).toBe(false);
+  });
+
+  it('carries the request id on ProductApiError from the response header, falling back to the error body', async () => {
+    const headerFetch: ProductApiFetch = async () => jsonResponseWithHeaders({
+      error: 'forbidden',
+      message: 'not allowed',
+    }, { 'x-request-id': 'req-error-1' }, 403);
+
+    const headerError = await getSignalContainerProof({
+      chainServicesUrl: 'http://chain.local',
+      submissionId: 'sub_err',
+      fetch: headerFetch,
+    }).catch((error: unknown) => error);
+    expect(headerError).toBeInstanceOf(ProductApiError);
+    expect((headerError as ProductApiError).requestId).toBe('req-error-1');
+    expect((headerError as ProductApiError).status).toBe(403);
+
+    const bodyFetch: ProductApiFetch = async () => jsonResponse({
+      error: 'internal_server_error',
+      message: 'boom',
+      requestId: 'req-error-body-1',
+    }, 500);
+
+    const bodyError = await getSignalContainerProof({
+      chainServicesUrl: 'http://chain.local',
+      submissionId: 'sub_err',
+      fetch: bodyFetch,
+    }).catch((error: unknown) => error);
+    expect(bodyError).toBeInstanceOf(ProductApiError);
+    expect((bodyError as ProductApiError).requestId).toBe('req-error-body-1');
+
+    const bareFetch: ProductApiFetch = async () => jsonResponse({
+      error: 'not_found',
+      message: 'missing',
+    }, 404);
+
+    const bareError = await getSignalContainerProof({
+      chainServicesUrl: 'http://chain.local',
+      submissionId: 'sub_err',
+      fetch: bareFetch,
+    }).catch((error: unknown) => error);
+    expect(bareError).toBeInstanceOf(ProductApiError);
+    expect((bareError as ProductApiError).requestId).toBeUndefined();
+  });
+});
+
+describe('frozen typed-data validation', () => {
+  it('rejects extra, missing, renamed, and type-drifted fields against the frozen field table', () => {
+    const base = () => structuredClone(preparedSubmission()) as PreparedSignalContainer;
+
+    const extraField = base();
+    (extraField.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[]) =
+      [...extraField.typedData.types.UVPStateMachineSignal, { name: 'payloadRef', type: 'string' }];
+    expect(() => parsePreparedSignalContainer(extraField))
+      .toThrow('typedData.types.UVPStateMachineSignal must contain exactly 8 fields for UVPStateMachineSignal, got 9');
+
+    const missingField = base();
+    (missingField.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[]) =
+      missingField.typedData.types.UVPStateMachineSignal.filter((field) => field.name !== 'submitter');
+    expect(() => parsePreparedSignalContainer(missingField))
+      .toThrow('must contain exactly 8 fields');
+
+    const renamedField = base();
+    (renamedField.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[])[0] = { name: 'orderHash', type: 'bytes32' };
+    expect(() => parsePreparedSignalContainer(renamedField))
+      .toThrow('typedData.types.UVPStateMachineSignal[0] must be { name: planId, type: bytes32 } but got { name: orderHash, type: bytes32 }');
+
+    const typeDrift = base();
+    (typeDrift.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[])[6] = { name: 'submitter', type: 'bytes32' };
+    expect(() => parsePreparedSignalContainer(typeDrift))
+      .toThrow('typedData.types.UVPStateMachineSignal[6] must be { name: submitter, type: address } but got { name: submitter, type: bytes32 }');
+
+    const extraFieldKey = base();
+    (extraFieldKey.typedData.types.UVPStateMachineSignal as ProductSubmitTypedDataField[])[0] = { name: 'planId', type: 'bytes32', indexed: false };
+    expect(() => parsePreparedSignalContainer(extraFieldKey))
+      .toThrow('typedData.types.UVPStateMachineSignal[0] has unexpected field indexed');
+
+    const extraMessageField = base();
+    (extraMessageField.typedData.message as Record<string, unknown>).payloadRef = 'ipfs://payload';
+    expect(() => parsePreparedSignalContainer(extraMessageField))
+      .toThrow('typedData.message has unexpected field payloadRef');
+
+    const missingMessageField = base();
+    delete (missingMessageField.typedData.message as Record<string, unknown>).payloadHash;
+    expect(() => parsePreparedSignalContainer(missingMessageField))
+      .toThrow('typedData.message is missing field payloadHash');
+  });
+
+  it('rejects a prepared submission whose signature message is missing or zeroing the plan id', () => {
+    // the signature commits to (planId, orderId). A prepared
+    // submission without the plan field, or with the builder's zero placeholder,
+    // could only produce a signature the chain rejects — fail at parse/sign time.
+    const base = () => structuredClone(preparedSubmission()) as PreparedSignalContainer;
+
+    const missingPlanId = base();
+    delete (missingPlanId.typedData.message as Record<string, unknown>).planId;
+    expect(() => parsePreparedSignalContainer(missingPlanId))
+      .toThrow('typedData.message is missing field planId');
+
+    const zeroPlanId = base();
+    (zeroPlanId.typedData.message as Record<string, unknown>).planId = `0x${'0'.repeat(64)}`;
+    expect(() => parsePreparedSignalContainer(zeroPlanId))
+      .toThrow('typedData.message.planId must be a non-zero bytes32 plan id');
+  });
+
+  it('keeps the parsed plan id in the signature message instead of dropping it', () => {
+    // Regression guard: a parser that validates the frozen table but rebuilds
+    // the message without planId would silently strip the plan binding between
+    // parse and sign, changing what the wallet signs.
+    const parsed = parsePreparedSignalContainer(preparedSubmission());
+    expect(parsed.typedData.message.planId).toBe(bytes32('06'));
+  });
+
+  it('rejects malformed or expired deadlines in the signature message', () => {
+    const base = () => structuredClone(preparedSubmission()) as PreparedSignalContainer;
+
+    for (const bad of ['abc', '1.5', '12e9', '-5', '0x10']) {
+      const malformed = base();
+      (malformed.typedData.message as Record<string, unknown>).deadline = bad;
+      expect(() => parsePreparedSignalContainer(malformed))
+        .toThrow('typedData.message.deadline must be a base-10 unix-seconds uint string');
+    }
+
+    const expired = base();
+    (expired.typedData.message as Record<string, unknown>).deadline = '1000000000';
+    expect(() => parsePreparedSignalContainer(expired))
+      .toThrow('typedData.message.deadline must be a unix timestamp in the future');
+  });
+});
+
 function preparedSubmission(options: { readonly submitter?: Address } = {}): PreparedSignalContainer {
   const preparedSubmitter = options.submitter ?? submitter;
+  const planId = bytes32('06');
   const orderId = bytes32('01');
   const sourceId = bytes32('02');
   const signalId = bytes32('03');
   const payloadHash = bytes32('04');
   const idempotencyKey = bytes32('05');
-  const deadline = '1777777777';
+  // Deadlines are validated to be a decimal uint in the future, so the fixture
+  // computes one instead of pinning a date that ages into the past.
+  const deadline = String(Math.floor(Date.now() / 1000) + 3600);
   return {
     prepareId: 'prep_1',
     taskId: 'task_1',
@@ -556,6 +862,7 @@ function preparedSubmission(options: { readonly submitter?: Address } = {}): Pre
     typedData: buildProductSubmitTypedData({
       chainId: 31337,
       verifyingContract,
+      planId,
       orderId,
       sourceId,
       signalId,
@@ -583,6 +890,17 @@ function jsonResponse(body: unknown, status = 200): ProductApiFetchResponse {
     ok: status >= 200 && status < 300,
     status,
     text: async () => JSON.stringify(body),
+  };
+}
+
+function jsonResponseWithHeaders(
+  body: unknown,
+  headers: Readonly<Record<string, string>>,
+  status = 200,
+): ProductApiFetchResponse {
+  return {
+    ...jsonResponse(body, status),
+    headers,
   };
 }
 

@@ -2,11 +2,22 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import type { RuntimeExecutorHandler } from '../src/runtime.js';
 import {
+  assertCallbackUrlAllowed,
   createHandlersFromExecutorConfig,
+  createWebhookReplayGuard,
+  DEFAULT_CALLBACK_MAX_ATTEMPTS,
+  DEFAULT_CALLBACK_RETRY_BASE_DELAY_MS,
   loadExecutorConfig,
+  parseCallbackHostAllowlist,
+  signWebhookBody,
   startExecutorServer,
+  verifyWebhookSignature,
+  WEBHOOK_NONCE_HEADER,
+  WEBHOOK_SIGNATURE_HEADER,
+  WEBHOOK_TIMESTAMP_HEADER,
   type ExecutorJob,
 } from '../src/server.js';
 
@@ -23,6 +34,39 @@ const effect = {
 } as const;
 
 describe('executor HTTP server', () => {
+  it('verifies timestamped nonce-bound webhook HMACs and rejects replays of captured requests', () => {
+    const body = '{"signal":{"orderId":"order-1"}}';
+    const nowMs = () => 1_800_000_000_000;
+    const fields = { timestamp: '1800000000', nonce: 'a'.repeat(32) };
+    const signature = signWebhookBody(callbackToken, body, fields);
+    const verify = (overrides: Partial<Parameters<typeof verifyWebhookSignature>[3]> = {}) =>
+      verifyWebhookSignature(body, signature, callbackToken, { ...fields, nowMs, ...overrides });
+
+    expect(verify()).toBe(true);
+    expect(verify({ nonce: 'b'.repeat(32) })).toBe(false);
+    expect(verify({ timestamp: '1799000000' })).toBe(false);
+    // A captured (body, signature) pair without timestamp+nonce no longer
+    // verifies: the bare-body HMAC was permanently replayable.
+    expect(verifyWebhookSignature(body, signature, callbackToken)).toBe(false);
+    // Outside the acceptance window the signature is stale even when intact.
+    expect(verify({ nowMs: () => 1_800_000_000_000 + 5 * 60_000 + 1 })).toBe(false);
+    expect(verifyWebhookSignature(body, signWebhookBody(callbackToken, body, fields).replace(/.$/, '0'), callbackToken, { ...fields, nowMs })).toBe(false);
+    expect(verifyWebhookSignature(body, undefined, callbackToken, { ...fields, nowMs })).toBe(false);
+    expect(verifyWebhookSignature(`${body} `, signature, callbackToken, { ...fields, nowMs })).toBe(false);
+    expect(verifyWebhookSignature(body, signWebhookBody('wrong-secret', body, fields), callbackToken, { ...fields, nowMs })).toBe(false);
+  });
+
+  it('burns each webhook nonce once inside the acceptance window', () => {
+    const guard = createWebhookReplayGuard();
+    const at = 1_800_000_000_000;
+    expect(guard.observe('c'.repeat(32), at, at)).toBe(true);
+    expect(guard.observe('c'.repeat(32), at, at + 1000)).toBe(false);
+    expect(guard.observe('d'.repeat(32), at, at + 1000)).toBe(true);
+    // The first nonce is only burned for the window; after it expires the
+    // entry is stale and a (pathological) reuse is treated as fresh.
+    expect(guard.observe('c'.repeat(32), at, at + 5 * 60_000 + 1)).toBe(true);
+  });
+
   it('accepts dispatches and posts callback signals to a webhook endpoint', async () => {
     const callbackBodies: unknown[] = [];
     const callbackEndpoint = createServer((request, response) => {
@@ -94,6 +138,68 @@ describe('executor HTTP server', () => {
     } finally {
       await executor.close();
       await new Promise<void>((resolve) => callbackEndpoint.close(() => resolve()));
+    }
+  });
+
+  it('signs dispatched callback bodies with timestamp+nonce headers a receiver can verify', async () => {
+    const hmacSecret = 'callback-hmac-secret';
+    const captured: { readonly body: string; readonly headers: Record<string, string | string[] | undefined> }[] = [];
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      callbackHmacSecret: hmacSecret,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+      fetchImpl: async (_input, init) => {
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        captured.push({ body: String(init?.body ?? ''), headers });
+        return new Response('ok', { status: 200 });
+      },
+    });
+
+    try {
+      const response = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-signed', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' }),
+      });
+      expect(response.status).toBe(202);
+      await eventually(async () => {
+        const jobs = await getJobs(executor.url);
+        expect(jobs[0]?.status).toBe('callback_succeeded');
+      });
+
+      expect(captured).toHaveLength(1);
+      const delivery = captured[0]!;
+      const timestamp = delivery.headers[WEBHOOK_TIMESTAMP_HEADER];
+      const nonce = delivery.headers[WEBHOOK_NONCE_HEADER];
+      expect(typeof timestamp).toBe('string');
+      expect(typeof nonce).toBe('string');
+      expect(verifyWebhookSignature(delivery.body, delivery.headers[WEBHOOK_SIGNATURE_HEADER] as string, hmacSecret, {
+        timestamp: typeof timestamp === 'string' ? timestamp : undefined,
+        nonce: typeof nonce === 'string' ? nonce : undefined,
+      })).toBe(true);
+      // The MAC covers timestamp+nonce: replaying the same signature against a
+      // different nonce must fail.
+      expect(verifyWebhookSignature(delivery.body, delivery.headers[WEBHOOK_SIGNATURE_HEADER] as string, hmacSecret, {
+        timestamp: typeof timestamp === 'string' ? timestamp : undefined,
+        nonce: 'e'.repeat(32),
+      })).toBe(false);
+    } finally {
+      await executor.close();
     }
   });
 
@@ -172,7 +278,9 @@ describe('executor HTTP server', () => {
       }),
       port: 0,
       fetchImpl: async () => new Response('callback rejected', { status: 500 }),
+      callbackRetry: { maxAttempts: DEFAULT_CALLBACK_MAX_ATTEMPTS, baseDelayMs: 0 },
     });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
       const response = await fetch(`${callbackFailure.url}/v0/dispatches`, {
         method: 'POST',
@@ -186,11 +294,487 @@ describe('executor HTTP server', () => {
       await eventually(async () => {
         const jobs = await getJobs(callbackFailure.url);
         expect(jobs[0]?.status).toBe('callback_failed');
+        // Bounded retries were exhausted before the terminal failure was recorded.
+        expect(jobs[0]?.callbacks?.[0]).toMatchObject({
+          signalIndex: 0,
+          delivered: false,
+          attempts: DEFAULT_CALLBACK_MAX_ATTEMPTS,
+        });
         expect(jobs[0]?.lastError).toContain('callback endpoint failed with 500');
       });
+      // The exhausted delivery is reported through an error log.
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('callback delivery failed for signal 0 after 3 attempt(s)'));
     } finally {
+      errorSpy.mockRestore();
       await callbackFailure.close();
     }
+  });
+
+  it('retries a failing callback POST with backoff before reporting success', async () => {
+    let attempt = 0;
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+      // Default retry policy: bounded attempts with a real base delay.
+      fetchImpl: async () => {
+        attempt += 1;
+        return attempt < DEFAULT_CALLBACK_MAX_ATTEMPTS
+          ? new Response('flaky endpoint', { status: 503 })
+          : new Response('ok', { status: 200 });
+      },
+    });
+    try {
+      const startedAt = Date.now();
+      const response = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-callback-retry', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' }),
+      });
+      expect(response.status).toBe(202);
+      await eventually(async () => {
+        const jobs = await getJobs(executor.url);
+        expect(jobs[0]?.status).toBe('callback_succeeded');
+        expect(jobs[0]?.callbacks?.[0]).toEqual({
+          signalIndex: 0,
+          delivered: true,
+          attempts: DEFAULT_CALLBACK_MAX_ATTEMPTS,
+        });
+      });
+      expect(attempt).toBe(DEFAULT_CALLBACK_MAX_ATTEMPTS);
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(DEFAULT_CALLBACK_RETRY_BASE_DELAY_MS);
+    } finally {
+      await executor.close();
+    }
+  });
+
+  it('records per-signal delivery truthfully when only some signals are delivered', async () => {
+    const twoSignalHandler: RuntimeExecutorHandler = (dispatchEffect) => ({
+      status: 'succeeded',
+      signals: [
+        {
+          zhixuId: dispatchEffect.zhixuId,
+          orderId: dispatchEffect.orderId,
+          source: 'buyer',
+          stageIdentifier: dispatchEffect.stageIdentifier,
+          signalName: `${dispatchEffect.stageIdentifier}.cmp`,
+          senderId: 'exec-executor',
+        },
+        {
+          zhixuId: dispatchEffect.zhixuId,
+          orderId: dispatchEffect.orderId,
+          source: 'buyer',
+          stageIdentifier: dispatchEffect.stageIdentifier,
+          signalName: `${dispatchEffect.stageIdentifier}.done`,
+          senderId: 'exec-executor',
+        },
+      ],
+    });
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: { 'exec.main#START': twoSignalHandler },
+      port: 0,
+      // The first signal (.cmp) is accepted; every delivery of the second one
+      // (.done) fails so the job must end callback_failed while truthfully
+      // recording that signal 0 was delivered.
+      fetchImpl: async (_input, init) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { signal?: { signalName?: string } };
+        if (body.signal?.signalName === 'exec.main.cmp') {
+          return new Response('ok', { status: 200 });
+        }
+        return new Response('callback rejected', { status: 500 });
+      },
+      callbackRetry: { baseDelayMs: 0 },
+    });
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const response = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-partial-callback', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' }),
+      });
+      expect(response.status).toBe(202);
+      await eventually(async () => {
+        const jobs = await getJobs(executor.url);
+        expect(jobs[0]?.status).toBe('callback_failed');
+        expect(jobs[0]?.callbacks).toHaveLength(2);
+      });
+      const jobs = await getJobs(executor.url);
+      const job = jobs[0];
+      // The delivered signal stays recorded as delivered; the failure must not
+      // mask the fact that the first signal went out.
+      expect(job?.callbacks?.[0]).toMatchObject({ signalIndex: 0, delivered: true, attempts: 1 });
+      expect(job?.callbacks?.[1]?.delivered).toBe(false);
+      expect(job?.callbacks?.[1]?.error).toContain('callback endpoint failed with 500');
+      expect(job?.lastError).toContain('1/2 signal(s)');
+      expect(job?.lastError).toContain('were delivered');
+    } finally {
+      errorSpy.mockRestore();
+      await executor.close();
+    }
+  });
+
+  it('rejects a duplicate dispatch job id instead of overwriting the existing job', async () => {
+    let outboundCalls = 0;
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+      fetchImpl: async () => {
+        outboundCalls += 1;
+        return new Response('ok', { status: 200 });
+      },
+    });
+    try {
+      const first = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-conflict', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' }),
+      });
+      expect(first.status).toBe(202);
+
+      const second = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-conflict', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' }),
+      });
+      expect(second.status).toBe(409);
+      expect(await second.json()).toMatchObject({
+        error: 'job_already_exists',
+        jobId: 'dispatch-conflict',
+      });
+
+      const jobs = await getJobs(executor.url);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]?.id).toBe('dispatch-conflict');
+    } finally {
+      await executor.close();
+    }
+  });
+
+  it('resolves concurrent duplicate dispatches to exactly one accepted job', async () => {
+    // Dispatch idempotency requires a conditional store create: a
+    // read-then-create pair would let two racing dispatches both pass the
+    // existence check.
+    let outboundCalls = 0;
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+      fetchImpl: async () => {
+        outboundCalls += 1;
+        return new Response('ok', { status: 200 });
+      },
+    });
+    try {
+      const dispatch = () => fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-race', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' }),
+      });
+      const [first, second] = await Promise.all([dispatch(), dispatch()]);
+
+      expect([first.status, second.status].sort()).toEqual([202, 409]);
+      const jobs = await getJobs(executor.url);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]?.id).toBe('dispatch-race');
+      expect(outboundCalls).toBeLessThanOrEqual(1);
+    } finally {
+      await executor.close();
+    }
+  });
+
+  it('never follows a callback redirect and never replays the bearer to the redirect target', async () => {
+    // The callback fetch must not follow redirects: following a 3xx answer
+    // would replay the Authorization bearer to whatever host the
+    // redirect pointed at. Redirects are manual and count as failures.
+    const seen: { path: string; authorization?: string }[] = [];
+    const redirector = createServer((request, response) => {
+      seen.push({
+        path: request.url ?? '',
+        ...(typeof request.headers.authorization === 'string'
+          ? { authorization: request.headers.authorization }
+          : {}),
+      });
+      if ((request.url ?? '').startsWith('/v0/signals')) {
+        response.statusCode = 302;
+        response.setHeader('location', '/leak');
+        response.end();
+        return;
+      }
+      response.statusCode = 200;
+      response.end('redirect-target');
+    });
+    await new Promise<void>((resolve) => redirector.listen(0, '127.0.0.1', resolve));
+    const redirectorAddress = redirector.address();
+    if (!redirectorAddress || typeof redirectorAddress === 'string') {
+      throw new Error('redirect test server did not bind to a TCP address');
+    }
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+    });
+
+    try {
+      const callbackUrl = `http://127.0.0.1:${redirectorAddress.port}/v0/signals`;
+      const accepted = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ dispatchId: 'dispatch-redirect', effect, callbackUrl }),
+      });
+      expect(accepted.status).toBe(202);
+
+      await eventually(async () => {
+        const jobs = await getJobs(executor.url);
+        expect(jobs[0]?.status).toBe('callback_failed');
+        expect(jobs[0]?.lastError).toContain('callback endpoint failed with 302');
+      });
+
+      // The redirect was never followed: only the callback endpoint itself was
+      // hit (once per bounded retry), never the /leak target.
+      expect(seen.filter((entry) => entry.path === '/leak')).toEqual([]);
+      expect(seen.length).toBeGreaterThan(0);
+      expect(seen.every((entry) => entry.authorization === `Bearer ${callbackToken}`)).toBe(true);
+    } finally {
+      await executor.close();
+      await new Promise<void>((resolve) => redirector.close(() => resolve()));
+    }
+  });
+
+  it('rejects dispatches without a dispatchId instead of synthesizing a timestamped job id', async () => {
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: {},
+      port: 0,
+    });
+    try {
+      for (const body of [
+        { effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' },
+        { dispatchId: '', effect, callbackUrl: 'http://127.0.0.1:1/v0/signals' },
+      ]) {
+        const response = await fetch(`${executor.url}/v0/dispatches`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${executorToken}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify(body),
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({
+          error: 'bad_request',
+          message: expect.stringContaining('dispatchId'),
+        });
+      }
+      expect(await getJobs(executor.url)).toHaveLength(0);
+    } finally {
+      await executor.close();
+    }
+  });
+
+  it('rejects non-loopback callback URLs before enqueuing and never sends the callback token', async () => {
+    let outboundCalls = 0;
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+      fetchImpl: async () => {
+        outboundCalls += 1;
+        return new Response('ok', { status: 200 });
+      },
+    });
+    try {
+      for (const callbackUrl of [
+        'http://169.254.169.254/latest/meta-data/',
+        'https://example.invalid/v0/signals',
+        'file:///etc/passwd',
+      ]) {
+        const response = await fetch(`${executor.url}/v0/dispatches`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${executorToken}`,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ dispatchId: `dispatch-ssrf-${outboundCalls}`, effect, callbackUrl }),
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ error: 'bad_request' });
+      }
+
+      expect(outboundCalls).toBe(0);
+      expect(await getJobs(executor.url)).toHaveLength(0);
+    } finally {
+      await executor.close();
+    }
+  });
+
+  it('sends the callback bearer token to non-loopback hosts only when allowlisted', async () => {
+    const outbound: { url: string; authorization?: string }[] = [];
+    const executor = await startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: createHandlersFromExecutorConfig({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }),
+      port: 0,
+      fetchImpl: async (input, init) => {
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        outbound.push({
+          url: String(input),
+          ...(typeof headers.authorization === 'string' ? { authorization: headers.authorization } : {}),
+        });
+        return new Response('ok', { status: 200 });
+      },
+      callbackHostAllowlist: ['callbacks.internal'],
+    });
+
+    try {
+      const response = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          dispatchId: 'dispatch-allowlisted',
+          effect,
+          callbackUrl: 'http://callbacks.internal/v0/signals',
+        }),
+      });
+      expect(response.status).toBe(202);
+      await eventually(async () => {
+        const jobs = await getJobs(executor.url);
+        expect(jobs[0]?.status).toBe('callback_succeeded');
+      });
+      expect(outbound).toEqual([
+        {
+          url: 'http://callbacks.internal/v0/signals',
+          authorization: `Bearer ${callbackToken}`,
+        },
+      ]);
+
+      const blocked = await fetch(`${executor.url}/v0/dispatches`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${executorToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          dispatchId: 'dispatch-not-allowlisted',
+          effect,
+          callbackUrl: 'http://other.internal/v0/signals',
+        }),
+      });
+      expect(blocked.status).toBe(400);
+      expect(outbound).toHaveLength(1);
+    } finally {
+      await executor.close();
+    }
+  });
+
+  it('parses the callback host allowlist env format and validates scheme/host', () => {
+    expect(parseCallbackHostAllowlist(undefined)).toEqual([]);
+    expect(parseCallbackHostAllowlist('')).toEqual([]);
+    expect(parseCallbackHostAllowlist('callbacks.internal:8443, 10.0.0.7 , [::2]')).toEqual([
+      'callbacks.internal:8443',
+      '10.0.0.7',
+      '::2',
+    ]);
+
+    expect(() => assertCallbackUrlAllowed('http://127.0.0.1:9/v0/signals', [])).not.toThrow();
+    expect(() => assertCallbackUrlAllowed('http://localhost/v0/signals', [])).not.toThrow();
+    expect(() => assertCallbackUrlAllowed('http://[::1]/v0/signals', [])).not.toThrow();
+    expect(() => assertCallbackUrlAllowed('http://internal.example/v0/signals', ['internal.example'])).not.toThrow();
+
+    expect(() => assertCallbackUrlAllowed('ftp://127.0.0.1/v0/signals', [])).toThrow(/scheme/);
+    expect(() => assertCallbackUrlAllowed('http://169.254.169.254/', [])).toThrow(/not allowed/);
+    expect(() => assertCallbackUrlAllowed('not a url', [])).toThrow(/valid URL/);
   });
 
   it('loads static handler config from JSON', async () => {
