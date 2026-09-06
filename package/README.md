@@ -313,9 +313,14 @@ Watcher job semantics:
   429). Transient (retryable) failures retry inside the run and land in
   `failed` when exhausted, which `jobs retry` still accepts; deterministic
   non-retryable failures and unrecognized errors dead-letter for human
-  triage via `jobs dead-letter`. A duplicate-signal fact (`SignalAlreadyExists`,
-  e.g. on restart replay of an already-committed signal) is not a failure:
-  the job is ignored.
+  triage via `jobs dead-letter`. A duplicate-signal fact
+  (`SignalAlreadyExists`) is not a failure, and where it surfaces decides the
+  job state: a handler that itself throws the duplicate classification ends
+  the job as terminal `ignored`, while a duplicate answered by the chain
+  during `submitSignal` is recorded as a delivered dedupe fact and leaves the
+  job in the non-terminal `submitted` state (the signal is on chain but this
+  process never observed its receipt, so a later scan or retry can still
+  check the real outcome).
 - HookReady-topic logs that fail to decode (e.g. from a mixed-version
   deployment) never crash the watcher: the scan skips them, records an
   `ignored` job with the raw log preserved, counts them in poll results and
