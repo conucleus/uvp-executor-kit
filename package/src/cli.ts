@@ -455,6 +455,12 @@ export function buildProgram(): Command {
     .option('--auth-token-env <ENV_NAME>', 'env var containing Product API bearer token')
     .option('--verbose', 'include raw Product API payloads in checks')
     .action(async (options: DoctorOptions) => {
+      if (options.taskId && !options.walletAddress) {
+        // The option help says --wallet-address is required with --task-id, and
+        // the readiness verdict is a lie without it: assignee ownership cannot
+        // be checked at all. Enforce instead of printing "Ready to prepare".
+        throw new ValidationError('--task-id requires --wallet-address so per-task readiness can verify assignee ownership');
+      }
       const report = await runProductDoctor({
         ...productClientOptions(options),
         ...(options.walletAddress ? { walletAddress: options.walletAddress } : {}),
@@ -505,10 +511,10 @@ export function buildProgram(): Command {
 
   jobs
     .command('retry <jobId>')
-    .description('retry a failed, callback-pending, or confirmed state-machine watcher job (confirmed retries resubmit for reorg recovery)')
+    .description('retry a detected, failed, callback-pending, submitted, or confirmed state-machine watcher job (confirmed retries resubmit for reorg recovery)')
     .requiredOption('--jobs-file <path>', 'state-machine watcher jobs JSON file')
     .requiredOption('--rpc-url <url>', 'EVM RPC URL')
-    .requiredOption('--state-machine <address>', 'UVPStateMachine contract address')
+    .option('--state-machine <address>', 'UVPStateMachine contract address; optional when config stateMachines[] is set')
     .requiredOption('--chain-id <id>', 'expected chain id')
     .requiredOption('--config <path>', 'state machine handler config JSON path')
     .requiredOption('--operator <id>', 'operator id recorded in the job audit trail')
@@ -632,7 +638,7 @@ export function buildProgram(): Command {
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainSignalOptions) => {
       if (options.payloadRef) {
-        // The frozen UVPStateMachine v0.9 ABI has no payloadRef input, so this
+        // The frozen UVPStateMachine v0.10 ABI has no payloadRef input, so this
         // flag would be silently dropped and the operator would walk away with
         // a "submitted" success that never carried the reference. Fail loudly;
         // only the 32-byte payloadHash goes on chain.
@@ -779,6 +785,16 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Prom
 }> {
   const config = await loadStateMachineHandlerConfig(options.config);
   const configuredStateMachines = config.stateMachines ?? [];
+  if (options.stateMachine && configuredStateMachines.length > 0) {
+    // Coexistence used to let config stateMachines[] silently override the
+    // flag for the scan set: the operator believed machine A was watched
+    // while only the config set was scanned. Refuse and make the operator
+    // pick one source of truth instead of guessing.
+    throw new ValidationError(
+      `--state-machine ${options.stateMachine} conflicts with stateMachines[] in ${options.config}`
+      + ' (the flag would be silently ignored by the scan set); configure the scanned state machines in exactly one place',
+    );
+  }
   const stateMachineAddress = options.stateMachine
     ? normalizeAddress(options.stateMachine, 'stateMachine')
     : config.stateMachineAddress ?? configuredStateMachines[0]?.stateMachineAddress;

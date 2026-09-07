@@ -41,6 +41,8 @@ export interface TaskReadinessResult {
   readonly canSubmit: boolean;
   readonly blockedReason?: string;
   readonly assigneeMatch: boolean;
+  /** True when no wallet address was supplied, so assignee ownership was not (and cannot be) verified. */
+  readonly assigneeUnverified?: boolean;
   readonly configuredWallet: string;
   readonly taskAssignee?: string;
   readonly stageName?: string;
@@ -268,12 +270,21 @@ async function checkTaskReadiness(
     const summary = summarizeSignalContainer(rawTask);
     const latencyMs = Date.now() - started;
 
-    const assigneeMatch = walletAddress && summary.assigneeWallet
+    // assigneeMatch is a verdict about evidence, not a default: true only when
+    // a wallet was supplied AND it matches the task assignee. Without a
+    // wallet, ownership was simply not checked — surfaced through
+    // assigneeUnverified instead of silently claiming a match.
+    const assigneeUnverified = walletAddress === undefined;
+    const assigneeMatch = walletAddress !== undefined && summary.assigneeWallet !== undefined
       ? normalizeAddress(summary.assigneeWallet, 'task.assigneeWallet') === normalizeAddress(walletAddress, 'walletAddress')
-      : walletAddress ? false : true;
+      : false;
     const now = new Date();
-    const deadlineExpired = summary.deadline ? new Date(summary.deadline).getTime() <= now.getTime() : undefined;
-    const canSubmit = summary.canSubmit === true && !deadlineExpired && (assigneeMatch || !walletAddress);
+    const deadlineMs = parseTaskDeadlineMs(summary.deadline);
+    const deadlineExpired = deadlineMs !== undefined ? deadlineMs <= now.getTime() : undefined;
+    // The server's canSubmit is the authoritative verdict. The locally
+    // computed deadline (and local clock) is display-only: a skew or timezone
+    // slip on this machine must not overturn the server's conclusion.
+    const canSubmit = summary.canSubmit === true && (assigneeMatch || assigneeUnverified);
     const blockedReason = summary.canSubmit === false ? (summary.blockedReason ?? 'Submission not available') : undefined;
 
     let nextAction: TaskReadinessResult['nextAction'] = 'blocked';
@@ -291,7 +302,9 @@ async function checkTaskReadiness(
       nextActionLabel = 'Task is complete. Run product proof to verify on-chain confirmation.';
     } else if (canSubmit) {
       nextAction = 'prepare';
-      nextActionLabel = 'Ready to prepare. Run product prepare to build the signal container.';
+      nextActionLabel = assigneeUnverified
+        ? 'Ready to prepare, but assignee ownership was NOT verified (no wallet address configured). Run product prepare to build the signal container.'
+        : 'Ready to prepare. Run product prepare to build the signal container.';
     } else if (summary.status === 'closed' || summary.status === 'cancelled') {
       nextAction = 'blocked';
       nextActionLabel = `Task is ${summary.status} and cannot be acted on.`;
@@ -331,6 +344,7 @@ async function checkTaskReadiness(
         canSubmit,
         ...(blockedReason ? { blockedReason } : {}),
         assigneeMatch,
+        ...(assigneeUnverified ? { assigneeUnverified: true } : {}),
         configuredWallet: walletAddress ?? '',
         ...(summary.assigneeWallet ? { taskAssignee: summary.assigneeWallet } : {}),
         ...(summary.stageName ? { stageName: summary.stageName } : {}),
@@ -358,4 +372,20 @@ async function checkTaskReadiness(
 
 function stripTrailingSlash(url: string): string {
   return url.endsWith('/') ? url.slice(0, -1) : url;
+}
+
+/**
+ * Deadline timestamp in ms. Naive strings (no offset designator) are parsed as
+ * UTC: a local-timezone parse made the displayed expiry depend on the
+ * operator's machine. An unparseable value yields undefined (unknown) instead
+ * of fabricating a verdict from NaN comparisons.
+ */
+function parseTaskDeadlineMs(value: string | undefined): number | undefined {
+  if (!value || value.trim().length === 0) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  const withZone = /[Zz]$|[+-]\d{2}:?\d{2}$/.test(trimmed) ? trimmed : `${trimmed}Z`;
+  const parsed = Date.parse(withZone);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }

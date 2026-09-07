@@ -260,6 +260,35 @@ describe('executor CLI', () => {
 });
 
 describe('honest execution exit codes', () => {
+  it('rejects --state-machine alongside config stateMachines[] instead of silently ignoring the flag', async () => {
+    // L15: with both present, config stateMachines[] silently overrode the
+    // flag for the scan set — the operator believed machine A was watched
+    // while only the config set was scanned. Coexistence is now a hard error.
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-cli-flag-conflict-'));
+    const configPath = join(dir, 'executor.json');
+    try {
+      await writeFile(configPath, JSON.stringify({
+        walletAddress: RETRY_WALLET,
+        chainId: 31_337,
+        stateMachines: [{ stateMachineAddress: RETRY_STATE_MACHINE }],
+        handlers: {
+          '*': { signals: [{ source: 'buyer', stageIdentifier: 'exec.main', signalName: 'cmp' }] },
+        },
+      }));
+
+      await expect(main([
+        'node', 'uvp-executor', 'chain-once',
+        '--rpc-url', 'http://127.0.0.1:8545',
+        '--state-machine', RETRY_STATE_MACHINE,
+        '--chain-id', '31337',
+        '--config', configPath,
+        '--dry-run',
+      ])).rejects.toThrow(/conflicts with stateMachines\[\]/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('flags poll outcomes that carry errors or terminal failure states', () => {
     expect(chainPollExecutionFailed({ results: [{ status: 'handled', submissions: [] }] })).toBe(false);
     // A foreign HookReady event (another supplier's hook on a shared chain) is

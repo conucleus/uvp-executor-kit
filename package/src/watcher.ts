@@ -422,6 +422,12 @@ export interface StateMachineJobSubmission {
   readonly attempt: number;
   readonly dryRun?: boolean;
   readonly txHash?: Hex;
+  /**
+   * Persisted receipt outcome of a real broadcast. Absent means the outcome
+   * was never observed (waitForReceipt:false, or the receipt wait failed) —
+   * not "delivered": later scans resolve it by re-checking the receipt.
+   */
+  readonly confirmed?: boolean;
   readonly request?: SubmitStateMachineSignalCall;
   readonly error?: ClassifiedExecutorKitError;
 }
@@ -908,8 +914,16 @@ export class StateMachineWatcher {
 
     if (fromBlock > toBlock) {
       // The finalized head has not caught up with the cursor yet — normal
-      // finality lag, nothing to scan this round.
-      return { fromBlock, toBlock, scannedLogs: 0, results: [], decodeFailures: 0 };
+      // finality lag, nothing to scan this round. Open jobs behind the cursor
+      // still get their later-scan recheck: receipts do not wait for new blocks.
+      const revisitResults = await this.revisitOpenJobs(fromBlock);
+      return {
+        fromBlock,
+        toBlock,
+        scannedLogs: 0,
+        results: revisitResults,
+        decodeFailures: revisitResults.filter((result) => result.decodeFailure).length,
+      };
     }
 
     // Chunk deep ranges: one unbounded eth_getLogs over a large gap is exactly
@@ -946,22 +960,31 @@ export class StateMachineWatcher {
     const nextBlock = toBlock + 1n;
     // Remember canonical hashes for the scanned range (dense near the tip,
     // exponentially sparser deeper) so a later reorg can locate the common
-    // ancestor instead of falling back to a full rescan.
+    // ancestor instead of falling back to a full rescan. A failed read of the
+    // toBlock hash is "no evidence", not a reorg: keeping the previous round's
+    // hash against the new height would make the next round's continuity check
+    // mismatch by construction and roll back forever (a false-reorg loop).
+    let roundCursorBlockHash: string | undefined;
     for (const anchorHeight of checkpointAnchorHeights(fromBlock, toBlock, this.config.reorgWindow)) {
       const anchorHash = await tryGetBlockHash(client, anchorHeight);
       if (anchorHash !== undefined) {
         this.recordCheckpoint(anchorHeight, anchorHash);
         if (anchorHeight === toBlock) {
-          this.cursorBlockHash = anchorHash;
+          roundCursorBlockHash = anchorHash;
         }
       }
     }
+    this.cursorBlockHash = roundCursorBlockHash;
+    // Later-scan pass over open jobs behind the cursor (detected leftovers,
+    // unconfirmed broadcasts). It runs before the cursor advances so a crash
+    // mid-pass leaves the range (and the recheck) to the next round.
+    results.push(...await this.revisitOpenJobs(fromBlock));
     if (this.config.cursorStore) {
       await this.config.cursorStore.save(
         {
           nextBlock,
           ...(this.cursorBlockHash !== undefined ? { blockHash: this.cursorBlockHash } : {}),
-          ...(this.checkpoints.length > 0 ? { checkpoints: this.trimmedCheckpoints() } : {}),
+          ...(this.checkpoints.length > 0 ? { checkpoints: this.checkpoints } : {}),
         },
         this.cursorContext(),
       );
@@ -1064,7 +1087,7 @@ export class StateMachineWatcher {
     const submitSignalWithJobRetry = async (
       signal: StateMachineSignal,
       signalIndex: number,
-    ): Promise<SubmitStateMachineSignalResult> => {
+    ): Promise<SubmitStateMachineSignalResult | DeferredBroadcastOutcome> => {
       let lastError: ClassifiedExecutorKitError | undefined;
       for (let attemptForSignal = 1; attemptForSignal <= this.config.retry.maxAttempts; attemptForSignal += 1) {
         try {
@@ -1103,9 +1126,12 @@ export class StateMachineWatcher {
           });
           // Replay guard: when the failed attempt already broadcast a tx, the
           // blind retry below would put a second transaction on chain for the
-          // same signal. Consult the receipt first and only rebroadcast when
-          // the broadcast is provably absent.
-          if (classified.retryable && broadcastTxHash !== undefined && attemptForSignal < this.config.retry.maxAttempts) {
+          // same signal. Consult the receipt first; a receipt that cannot be
+          // obtained is NOT provable absence, so the run defers the signal to
+          // later scans (receipt recheck + resend backoff) instead of
+          // rebroadcasting on unknown evidence — regardless of the remaining
+          // in-run budget, an unknown outcome is never settled by retrying.
+          if (classified.retryable && broadcastTxHash !== undefined) {
             const recovered = await this.recoverBroadcastSubmission(eventSubmitConfig, signal, broadcastTxHash);
             if (recovered) {
               jobSubmissions.push(toJobSubmission(signalIndex, attemptForSignal, recovered));
@@ -1116,6 +1142,7 @@ export class StateMachineWatcher {
               });
               return recovered;
             }
+            return { deferredBroadcast: true };
           }
           if (!classified.retryable || attemptForSignal >= this.config.retry.maxAttempts) {
             throw new ClassifiedStateMachineError(classified);
@@ -1127,12 +1154,44 @@ export class StateMachineWatcher {
       throw new ClassifiedStateMachineError(lastError ?? classifyExecutorKitError(new Error('submission failed')));
     };
 
+    // Context-channel submissions share the job audit trail with the
+    // returned-signals path (README: already-broadcast transactions are never
+    // dropped from it). signalIndex -1, -2, ... keeps context submissions from
+    // aliasing returned-signal indexes in the resume/backoff machinery.
+    let contextSubmissionCount = 0;
     const context: StateMachineHookReadyHandlerContext = {
       matchedKey: resolved.key,
-      submitSignal: (signal, overrides) => submitStateMachineSignal({
-        ...eventSubmitConfig,
-        ...overrides,
-      }, signal),
+      submitSignal: async (signal, overrides) => {
+        const signalIndex = -1 - contextSubmissionCount;
+        contextSubmissionCount += 1;
+        const attempt = contextSubmissionCount;
+        try {
+          const result = await submitStateMachineSignal({ ...eventSubmitConfig, ...overrides }, signal);
+          jobSubmissions.push(toJobSubmission(signalIndex, attempt, result));
+          currentJob = await this.updateJob(job.id, {
+            updatedAt: this.config.now(),
+            ...(result.dryRun ? {} : { lastSignalAttemptAt: this.config.now() }),
+            submissions: jobSubmissions,
+          });
+          return result;
+        } catch (error) {
+          const classified = classifyExecutorKitError(error);
+          const broadcastTxHash = broadcastTxHashFromError(error);
+          jobSubmissions.push({
+            signalIndex,
+            attempt,
+            ...(broadcastTxHash ? { txHash: broadcastTxHash } : {}),
+            error: classified,
+          });
+          currentJob = await this.updateJob(job.id, {
+            updatedAt: this.config.now(),
+            lastSignalAttemptAt: this.config.now(),
+            submissions: jobSubmissions,
+            lastError: classified,
+          });
+          throw error;
+        }
+      },
     };
     let handlerResult: StateMachineHookReadyHandlerResult = undefined;
     for (let attemptForHandler = 1; attemptForHandler <= this.config.retry.maxAttempts; attemptForHandler += 1) {
@@ -1198,12 +1257,13 @@ export class StateMachineWatcher {
       }
     }
     const fallbackPlanId = jobPlanId;
-    // Resume support: a signal with a prior real (non-dry-run) broadcast or a
-    // duplicate_signal dedupe fact is already delivered on chain. Re-running
-    // the job — manual `jobs retry` or a rescan of an open job — must continue
-    // with the next pending signal instead of replaying delivered ones;
-    // replaying them would dead-lock multi-signal jobs in `ignored` on the
-    // first duplicate.
+    // Resume support: a signal whose delivery is evidenced (receipt-confirmed
+    // submission or duplicate_signal dedupe fact) is already on chain.
+    // Re-running the job — manual `jobs retry` or a later scan of an open
+    // job — must continue with the next pending signal instead of replaying
+    // delivered ones; replaying them would dead-lock multi-signal jobs in
+    // `ignored` on the first duplicate. Unconfirmed broadcasts are NOT here:
+    // the loop below re-checks their receipts first.
     const deliveredSignalIndexes = options?.resubmitDelivered
       ? new Set<number>()
       : deliveredSignalIndexesFromSubmissions(currentJob.submissions);
@@ -1212,31 +1272,56 @@ export class StateMachineWatcher {
       if (deliveredSignalIndexes.has(index)) {
         continue;
       }
-      // O13 resend backoff: a signal with prior unconfirmed broadcasts gets a
-      // growing (capped) wait before the next rebroadcast, so a rescan does
-      // not put the same transaction on chain once per poll round. Behavior
-      // otherwise unchanged — the chain's idempotency key stays the dedupe
-      // anchor — this only stops the per-round gas burn.
-      const priorUnconfirmedBroadcasts = !options?.bypassResendBackoff
-        ? unconfirmedBroadcastCount(currentJob.submissions, index)
-        : 0;
-      if (priorUnconfirmedBroadcasts > 0) {
-        const requiredDelayMs = resendBackoffDelayMs(this.config.resendBackoff, priorUnconfirmedBroadcasts);
-        const lastAttemptAtMs = Date.parse(currentJob.lastSignalAttemptAt ?? currentJob.updatedAt);
-        // A missing/unparseable anchor loses the clock: fall through to the
-        // resend (chain idempotency stays the dedupe anchor) instead of
-        // deferring forever.
-        if (Number.isFinite(lastAttemptAtMs) && this.config.nowMs() - lastAttemptAtMs < requiredDelayMs) {
-          deferredResend = true;
-          continue;
-        }
-      }
       try {
-        const result = await submitSignalWithJobRetry({
+        const resolvedSignal: StateMachineSignal = {
           ...signal,
           ...(signal.planId === undefined && fallbackPlanId !== undefined ? { planId: fallbackPlanId } : {}),
           readyEventId: signal.readyEventId ?? event.eventId,
-        }, index);
+        };
+        const priorUnconfirmedBroadcasts = unconfirmedBroadcastCount(currentJob.submissions, index);
+        if (priorUnconfirmedBroadcasts > 0) {
+          // Later-scan receipt recheck: an unconfirmed broadcast is settled by
+          // evidence first. Only a receipt that cannot be obtained falls
+          // through, and then the O13 resend backoff throttles the next
+          // rebroadcast (growing, capped wait anchored to
+          // lastSignalAttemptAt) so a rescan does not put the same
+          // transaction on chain once per poll round — the chain's
+          // idempotency key stays the dedupe anchor.
+          const latestTxHash = latestUnconfirmedBroadcastTxHash(currentJob.submissions, index);
+          const recovered = latestTxHash !== undefined
+            ? await this.recoverBroadcastSubmission(eventSubmitConfig, resolvedSignal, latestTxHash)
+            : undefined;
+          if (recovered) {
+            jobSubmissions.push(toJobSubmission(index, priorUnconfirmedBroadcasts + 1, recovered));
+            currentJob = await this.updateJob(job.id, {
+              updatedAt: this.config.now(),
+              lastSignalAttemptAt: this.config.now(),
+              submissions: jobSubmissions,
+              clearLastError: true,
+            });
+            submissions.push(recovered);
+            deliveredSignalIndexes.add(index);
+            continue;
+          }
+          if (options?.bypassResendBackoff !== true) {
+            const requiredDelayMs = resendBackoffDelayMs(this.config.resendBackoff, priorUnconfirmedBroadcasts);
+            const lastAttemptAtMs = Date.parse(currentJob.lastSignalAttemptAt ?? currentJob.updatedAt);
+            // A missing/unparseable anchor loses the clock: fall through to the
+            // resend (chain idempotency stays the dedupe anchor) instead of
+            // deferring forever.
+            if (Number.isFinite(lastAttemptAtMs) && this.config.nowMs() - lastAttemptAtMs < requiredDelayMs) {
+              deferredResend = true;
+              continue;
+            }
+          }
+        }
+        const result = await submitSignalWithJobRetry(resolvedSignal, index);
+        if ('deferredBroadcast' in result) {
+          // The in-run replay guard deferred this signal (broadcast outcome
+          // unknown, receipt unavailable): keep the job open for later scans.
+          deferredResend = true;
+          continue;
+        }
         submissions.push(result);
         if (!result.dryRun) {
           deliveredSignalIndexes.add(index);
@@ -1376,9 +1461,11 @@ export class StateMachineWatcher {
    * - receipt mined with a non-success status: the broadcast definitively
    *   reverted, so rebroadcasting is pointless — throws the same
    *   non-retryable receipt error as the direct receipt path;
-   * - no receipt (not mined yet, or the lookup itself failed, or the client
-   *   cannot look receipts up): returns undefined and the caller falls back to
-   *   its normal retry decision.
+   * - receipt unavailable (lookup threw, client cannot look receipts up, or
+   *   the tx is not mined yet): returns undefined. "Unavailable" is not
+   *   provable absence, so callers must NOT rebroadcast on it — the in-run
+   *   retry defers the signal and later scans re-check this receipt (under
+   *   the resend backoff) until it resolves.
    */
   private async recoverBroadcastSubmission(
     config: NormalizedSubmitConfig,
@@ -1443,7 +1530,7 @@ export class StateMachineWatcher {
       return fromBlock;
     }
 
-    const candidates = this.trimmedCheckpoints()
+    const candidates = this.checkpoints
       .filter((checkpoint) => checkpoint.blockNumber < fromBlock)
       .sort((left, right) => (left.blockNumber > right.blockNumber ? -1 : left.blockNumber < right.blockNumber ? 1 : 0));
     for (const candidate of candidates) {
@@ -1469,14 +1556,56 @@ export class StateMachineWatcher {
     return rescanFloor;
   }
 
+  /**
+   * Later-scan pass over open jobs whose blocks are already behind the scan
+   * cursor: `detected` jobs stranded by a crash between detection and
+   * processing, and `submitted` jobs whose broadcast was never confirmed.
+   * README watcher semantics promise these are replayed/rechecked on later
+   * scans; without this pass the cursor moving past their block made that
+   * promise unreachable (handleLog only ever ran for logs inside the current
+   * poll window or via manual retry). Cost is bounded: handleLog resolves the
+   * receipt of an unconfirmed broadcast before anything else and the resend
+   * backoff throttles rebroadcasts.
+   */
+  private async revisitOpenJobs(fromBlock: bigint): Promise<readonly StateMachineLogProcessResult[]> {
+    const jobs = await this.config.jobStore.list();
+    const watched = new Set(this.config.stateMachines.map((deployment) => deployment.stateMachineAddress.toLowerCase()));
+    const open = jobs.filter((job) => {
+      if (job.status !== 'detected' && job.status !== 'submitted') {
+        return false;
+      }
+      if (!job.raw) {
+        return false;
+      }
+      if (job.raw.blockNumber !== undefined && job.raw.blockNumber !== null && job.raw.blockNumber >= fromBlock) {
+        // Inside (or ahead of) this round's window: the scan loop itself owns
+        // it this round, so the pass must not double-process it.
+        return false;
+      }
+      if (job.stateMachineAddress && !watched.has(job.stateMachineAddress.toLowerCase())) {
+        // Belongs to a state machine this watcher no longer scans; its signals
+        // are not this deployment's to submit.
+        return false;
+      }
+      return true;
+    });
+    const results: StateMachineLogProcessResult[] = [];
+    for (const job of open) {
+      const raw = job.raw;
+      if (raw) {
+        results.push(await this.handleLog(raw));
+      }
+    }
+    return results;
+  }
+
   private recordCheckpoint(blockNumber: bigint, blockHash: string): void {
     this.checkpoints = this.checkpoints.filter((checkpoint) => checkpoint.blockNumber !== blockNumber);
     this.checkpoints.push({ blockNumber, blockHash });
     this.checkpoints.sort((left, right) => (left.blockNumber < right.blockNumber ? -1 : left.blockNumber > right.blockNumber ? 1 : 0));
-  }
-
-  private trimmedCheckpoints(): readonly StateMachineCursorCheckpoint[] {
-    return this.checkpoints.slice(-this.config.reorgWindow);
+    // Trim the stored body, not just a read view: every round used to re-sort
+    // and re-persist the full anchor history (~150k/day), unbounded.
+    this.checkpoints = this.checkpoints.slice(-this.config.reorgWindow);
   }
 
   /**
@@ -1985,7 +2114,13 @@ export function createStateMachineHandlersFromConfig(
         // here is the producer's explicit declaration of an empty payload.
         payloadHash: signal.payloadHash ?? ZERO_BYTES32,
         readyEventId: signal.readyEventId ?? event.eventId,
-        idempotencyKey: signal.idempotencyKey ?? `${event.orderId}:${event.hookId}:${signal.signalName ?? signal.signalId}`,
+        // No key-level default here: the config-only shape
+        // orderId:hookId:signalName collapsed a re-emitted HookReady for the
+        // same (order, hook) and distinct sources behind the same signalName
+        // onto one chain idempotency key. Omitting the field lets the SDK
+        // default (orderId:sourceId:signalId:readyEventId) apply — the same
+        // caliber for config and SDK producers, with the event and signal
+        // dimensions included.
       })),
     ]),
   );
@@ -2400,6 +2535,9 @@ function toJobSubmission(
     dryRun: result.dryRun,
     request: result.request,
     ...(!result.dryRun ? { txHash: result.txHash } : {}),
+    // Persist the receipt outcome so a later scan can tell an observed success
+    // from a broadcast whose outcome was never known.
+    ...(!result.dryRun && result.confirmed ? { confirmed: true } : {}),
   };
 }
 
@@ -2458,8 +2596,11 @@ function statusForCompletedRun(
 
 /**
  * Signal indexes that must not be (re)submitted: each has a prior real
- * (non-dry-run) submission that returned without error, or a duplicate_signal
- * response proving the chain already carries the signal. Dry-run submissions
+ * (non-dry-run) submission whose delivery is evidenced — a duplicate_signal
+ * response proving the chain already carries the signal, or a broadcast whose
+ * receipt was observed as success. A broadcast without an observed receipt
+ * (waitForReceipt:false) and a reverted receipt do NOT count: they are exactly
+ * the facts later scans must re-check instead of trusting. Dry-run submissions
  * never count — flipping dry-run off must still broadcast everything.
  */
 function deliveredSignalIndexesFromSubmissions(
@@ -2467,29 +2608,48 @@ function deliveredSignalIndexesFromSubmissions(
 ): Set<number> {
   const delivered = new Set<number>();
   for (const submission of submissions) {
-    if (submission.error?.kind === 'duplicate_signal' || (!submission.error && submission.dryRun === false)) {
+    if (submission.error?.kind === 'duplicate_signal'
+      || (!submission.error && submission.dryRun === false && submission.confirmed === true)) {
       delivered.add(submission.signalIndex);
     }
   }
   return delivered;
 }
 
+/** A real broadcast of this signal whose outcome is still unknown. */
+function isUnconfirmedBroadcast(submission: StateMachineJobSubmission, signalIndex: number): boolean {
+  return submission.signalIndex === signalIndex
+    && submission.dryRun !== true
+    && submission.txHash !== undefined
+    && submission.error?.kind !== 'duplicate_signal'
+    && submission.confirmed !== true;
+}
+
 /**
- * Broadcast-but-unconfirmed attempts for one signal: the exact re-send
- * candidates the resend backoff throttles. Successful and dry-run submissions
- * never count.
+ * Broadcast-but-unconfirmed attempts for one signal — both attempts that
+ * failed after broadcasting (receipt wait threw) and attempts that returned
+ * without a receipt (waitForReceipt:false). These are the recheck/resend
+ * candidates: resolved by the receipt first, rebroadcast under backoff second.
  */
 function unconfirmedBroadcastCount(
   submissions: readonly StateMachineJobSubmission[],
   signalIndex: number,
 ): number {
-  return submissions.filter((submission) =>
-    submission.signalIndex === signalIndex
-    && submission.dryRun !== true
-    && submission.txHash !== undefined
-    && submission.error !== undefined
-    && submission.error.kind !== 'duplicate_signal',
-  ).length;
+  return submissions.filter((submission) => isUnconfirmedBroadcast(submission, signalIndex)).length;
+}
+
+/** Newest unconfirmed broadcast tx for one signal, for the receipt recheck. */
+function latestUnconfirmedBroadcastTxHash(
+  submissions: readonly StateMachineJobSubmission[],
+  signalIndex: number,
+): Hex | undefined {
+  for (let index = submissions.length - 1; index >= 0; index -= 1) {
+    const submission = submissions[index];
+    if (submission && isUnconfirmedBroadcast(submission, signalIndex)) {
+      return submission.txHash;
+    }
+  }
+  return undefined;
 }
 
 /** Exponential resend delay capped at maxDelayMs. */
@@ -2542,7 +2702,15 @@ function isRetriableStateMachineJobStatus(status: StateMachineJobStatus): boolea
   // a confirmation off the canonical chain while the job stays terminal
   // forever otherwise. The retry resubmits and the on-chain idempotency key
   // absorbs a duplicate when the signal actually survived.
-  return status === 'failed' || status === 'matched' || status === 'submitted' || status === 'confirmed';
+  // `detected` is the crash-recovery channel: a process death between
+  // upsertDetected and processing left the job with no run at all — refusing
+  // it here (and only the later-scan pass being able to revive it) made a
+  // stranded detected job unreachable even for a manual retry.
+  return status === 'detected'
+    || status === 'failed'
+    || status === 'matched'
+    || status === 'submitted'
+    || status === 'confirmed';
 }
 
 function stateMachineJobStatusToExecutorStatus(status: StateMachineJobStatus): ExecutorJobStatusDTO {
@@ -2852,6 +3020,15 @@ function delay(ms: number): Promise<void> {
 function cloneJob(job: StateMachineWatcherJob): StateMachineWatcherJob {
   return structuredClone(job) as StateMachineWatcherJob;
 }
+
+/**
+ * A retryable failure already put a transaction on chain, but its receipt
+ * could not be obtained (lookup fault, client without receipt support, or not
+ * mined yet). That is "outcome unknown", not provable absence — the run must
+ * not blind-rebroadcast. The signal stays open and later scans re-check the
+ * receipt, rebroadcasting only under the resend backoff.
+ */
+type DeferredBroadcastOutcome = { readonly deferredBroadcast: true };
 
 class ClassifiedStateMachineError extends Error {
   readonly classified: ClassifiedExecutorKitError;

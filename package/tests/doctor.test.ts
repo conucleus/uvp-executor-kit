@@ -459,7 +459,12 @@ describe('Product API doctor', () => {
     expect(report.taskReadiness?.ok).toBe(false);
   });
 
-  it('reports per-task readiness without wallet address', async () => {
+  it('reports per-task readiness without wallet address as explicitly unverified', async () => {
+    // Without a wallet the assignee check cannot run at all. The readiness
+    // must not claim a match it never made (assigneeMatch used to be
+    // unconditionally true here, printing an unverified "Ready to prepare");
+    // the SDK reports assigneeUnverified instead, and the CLI refuses
+    // --task-id without --wallet-address entirely.
     const fetch: ProductApiFetch = async (url) => {
       if (!url.includes('/product/')) {
         return jsonResponse({ service: 'chain-services' });
@@ -486,9 +491,11 @@ describe('Product API doctor', () => {
       taskId: 'task_nowallet',
       status: 'open',
       canSubmit: true,
-      assigneeMatch: true,
+      assigneeMatch: false,
+      assigneeUnverified: true,
       configuredWallet: '',
     });
+    expect(report.taskReadiness?.nextActionLabel).toContain('NOT verified');
     // no tasks list when task-id is provided
     expect(report.tasks).toBeUndefined();
     expect(report.walletAddress).toBeUndefined();
@@ -528,6 +535,49 @@ describe('Product API doctor', () => {
     expect(report.ok).toBe(false);
   });
 
+  it('keeps the server canSubmit authoritative over the locally computed deadline', async () => {
+    // M7: the local clock used to veto canSubmit when it computed the
+    // deadline as expired, and naive deadline strings were parsed in the
+    // operator's local timezone. The deadline is display-only now (parsed as
+    // UTC), and the server's verdict wins even when the local computation
+    // says expired.
+    const fetch: ProductApiFetch = async (url) => {
+      if (!url.includes('/product/')) {
+        return jsonResponse({ service: 'chain-services' });
+      }
+      return jsonResponse({
+        task: {
+          taskId: 'task_deadline',
+          orderId: 'order_deadline',
+          title: 'Skewed clock task',
+          status: 'open',
+          assigneeWallet: submitter,
+          // Naive (no offset) past timestamp: displayed as expired, but the
+          // server said canSubmit=true and that conclusion is authoritative.
+          deadline: '2020-01-01T00:00:00.000',
+          canSubmit: true,
+        },
+      });
+    };
+
+    const report = await runProductDoctor({
+      chainServicesUrl: 'http://chain.local/api',
+      walletAddress: submitter,
+      taskId: 'task_deadline',
+      fetch,
+    });
+
+    expect(report.taskReadiness).toMatchObject({
+      taskId: 'task_deadline',
+      canSubmit: true,
+      assigneeMatch: true,
+      deadlineExpired: true,
+      nextAction: 'prepare',
+    });
+    expect(report.taskReadiness?.nextActionLabel).toContain('Ready to prepare');
+    expect(report.ok).toBe(true);
+  });
+
   it('omits readiness and raw-task data when the task lookup fails', async () => {
     const fetch: ProductApiFetch = async (url) => {
       if (!url.includes('/product/')) {
@@ -553,6 +603,21 @@ describe('Product API doctor', () => {
 });
 
 describe('doctor CLI', () => {
+  it('refuses --task-id without --wallet-address instead of printing unverified readiness', async () => {
+    // B-25: without a wallet, assignee ownership cannot be checked at all —
+    // the readiness verdict used to print "Ready to prepare" anyway. The CLI
+    // now enforces what its option help always claimed.
+    await expect(main([
+      'node',
+      'uvp-executor',
+      'doctor',
+      '--chain-services-url',
+      'http://chain.local/api',
+      '--task-id',
+      'task_no_wallet',
+    ])).rejects.toThrow(/--task-id requires --wallet-address/);
+  });
+
   it('passes Product API auth token env headers and reports only redacted auth status', async () => {
     const logs: string[] = [];
     const envName = 'UVP_DOCTOR_PRODUCT_API_TOKEN';

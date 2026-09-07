@@ -51,7 +51,6 @@ Scan once for `HookReady` logs and dry-run callback transactions:
 ```bash
 uvp-executor chain-once \
   --rpc-url http://127.0.0.1:8545 \
-  --state-machine 0x0000000000000000000000000000000000000001 \
   --chain-id 31337 \
   --config uvp-executor-kit/package/fixtures/state-machine-executor.config.json \
   --wallet-address 0x0000000000000000000000000000000000000002 \
@@ -63,11 +62,15 @@ Run the continuous watcher:
 ```bash
 uvp-executor chain-watch \
   --rpc-url http://127.0.0.1:8545 \
-  --state-machine 0x0000000000000000000000000000000000000001 \
   --chain-id 31337 \
   --config uvp-executor-kit/package/fixtures/state-machine-executor.config.json \
   --dry-run
 ```
+
+The fixture config declares its own `stateMachines[]` scan set. An explicit
+`--state-machine` flag together with a config `stateMachines[]` is rejected —
+the flag would otherwise be silently ignored by the scan set. Pass
+`--state-machine` only when the config declares no `stateMachines[]`.
 
 By default the chain commands persist watcher state to files so a restart
 resumes where the previous process stopped instead of rescanning from
@@ -110,11 +113,18 @@ configurable parameters (`--confirmations`, `--reorg-window`,
   failures are reported through the error channel and the poll cadence backs
   off exponentially (capped at 8x the interval), returning to the configured
   cadence on the first successful round.
-- **Resend backoff**: a signal whose prior broadcast was never confirmed is
-  rebroadcast with exponential backoff (30s base, 10min cap) anchored to the
-  job's `lastSignalAttemptAt`, instead of once per poll round. The chain's
-  `idempotencyKey` remains the dedupe anchor; the backoff only stops the
-  per-round gas burn. Manual `jobs retry` bypasses the throttle.
+- **Resend backoff and later scans**: open jobs behind the cursor — `detected`
+  leftovers from a crash between detection and processing, and `submitted`
+  jobs with an unconfirmed broadcast — are revisited on later scans. A signal
+  whose prior broadcast was never confirmed is settled by evidence first: the
+  scan re-checks the receipt and adopts a mined success without rebroadcasting
+  (a mined revert ends the job as a visible failure instead of silently
+  counting as delivered). Only when the receipt cannot be obtained does a
+  rebroadcast happen, with exponential backoff (30s base, 10min cap) anchored
+  to the job's `lastSignalAttemptAt`, instead of once per poll round — and an
+  in-run retry never blind-rebroadcasts a transaction whose outcome is simply
+  unknown. The chain's `idempotencyKey` remains the dedupe anchor; the backoff
+  only stops the per-round gas burn. Manual `jobs retry` bypasses the throttle.
 
 Build or submit one state-machine signal:
 
@@ -220,7 +230,12 @@ uvp-executor doctor \
 The doctor command needs no private key. It reports reachability, task visibility,
 proof-endpoint shape, and per-task readiness (assignee match, canSubmit,
 blockedReason, deadline status, required evidence, and a concrete
-`nextAction` label: `prepare`, `wait`, `proof`, or `blocked`). Normal output
+`nextAction` label: `prepare`, `wait`, `proof`, or `blocked`). Per-task
+readiness (`--task-id`) requires `--wallet-address`: without a wallet, assignee
+ownership cannot be checked, and the CLI refuses instead of printing an
+unverified "Ready to prepare". The server's `canSubmit` is the authoritative
+verdict — the locally computed deadline status (naive timestamps parsed as
+UTC) is display context and never overturns it. Normal output
 omits protocol fields and bearer token values; pass `--verbose` for raw API
 payloads.
 
@@ -320,7 +335,6 @@ uvp-executor jobs get <jobId> --jobs-file .uvp-executor-jobs.json
 uvp-executor jobs retry <jobId> \
   --jobs-file .uvp-executor-jobs.json \
   --rpc-url http://127.0.0.1:8545 \
-  --state-machine 0x0000000000000000000000000000000000000001 \
   --chain-id 31337 \
   --config uvp-executor-kit/package/fixtures/state-machine-executor.config.json \
   --operator ops@example.com \
@@ -337,10 +351,14 @@ Watcher job semantics:
   defaults to `true`). A job whose transaction was broadcast but not yet
   receipted stays in the non-terminal `submitted` state, so later scans or
   manual retries can observe the real on-chain outcome instead of trusting
-  the broadcast. When the receipt step itself fails after a successful
-  broadcast (reverted receipt, or waiting for the receipt throws), the error
-  carries the broadcast `txHash` and the job's `submissions` record keeps it,
-  so "already broadcast" transactions are never dropped from the audit trail.
+  the broadcast — a broadcast without an observed receipt is never recorded
+  as delivered (not even with `waitForReceipt: false`; the later scan
+  re-checks the receipt and adopts or refutes it). When the receipt step
+  itself fails after a successful broadcast (reverted receipt, or waiting
+  for the receipt throws), the error carries the broadcast `txHash` and the
+  job's `submissions` record keeps it, so "already broadcast" transactions
+  are never dropped from the audit trail — including signals submitted
+  through the handler-context `submitSignal` channel.
 - Failures are classified from explicit machine-readable error codes first,
   then from well-known real-world error texts and contract revert data
   (for example `SignalAlreadyExists()`, `AccessControlUnauthorizedAccount`,
@@ -355,10 +373,12 @@ Watcher job semantics:
   during `submitSignal` is recorded as a delivered dedupe fact and leaves the
   job in the non-terminal `submitted` state (the signal is on chain but this
   process never observed its receipt, so a later scan or retry can still
-  check the real outcome). `jobs retry` also accepts `confirmed` jobs: the
-  retry resubmits every signal, which is the manual recovery channel when a
-  reorg flipped a confirmation off the canonical chain (the on-chain
-  idempotency key absorbs the duplicate when the signal actually survived).
+  check the real outcome). `jobs retry` also accepts `detected` jobs (crash
+  recovery: detection was persisted but the job never got a run) and
+  `confirmed` jobs: the retry resubmits every signal, which is the manual
+  recovery channel when a reorg flipped a confirmation off the canonical
+  chain (the on-chain idempotency key absorbs the duplicate when the signal
+  actually survived).
 - HookReady-topic logs that fail to decode (e.g. from a mixed-version
   deployment) never crash the watcher: the scan skips them, records an
   `ignored` job with the raw log preserved, counts them in poll results and
@@ -428,9 +448,9 @@ order-level authorization, participant wallet signatures, and contract checks.
 
 ## ABI Boundary
 
-`createStateMachineWatcher` uses the fixed `UVPStateMachine v0.9` compact-hook
+`createStateMachineWatcher` uses the fixed `UVPStateMachine v0.10` compact-hook
 ABI recorded in
-`uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.9.json`:
+`uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.10.json`:
 
 - `HookReady(bytes32 planId, bytes32 orderId, bytes32 hookId, bytes32 stageId, bytes32 hookName)`;
 - `submitSignal(bytes32 planId, bytes32 orderId, bytes32 sourceId, bytes32 signalId, bytes32 payloadHash, bytes32 idempotencyKey)`.
