@@ -1,8 +1,9 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { encodeAbiParameters, keccak256, stringToBytes, type Hex } from 'viem';
+import { buildProductSubmitTypedData } from '@uvp-eth/protocol-bindings';
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_WATCHER_STATE_DIR,
@@ -12,7 +13,7 @@ import {
   resolveWatcherStorage,
   WATCHER_STATE_DIR_ENV,
 } from '../src/cli.js';
-import { FileStateMachineCursorStore, FileStateMachineJobStore } from '../src/watcher.js';
+import { FileStateMachineCursorStore, FileStateMachineJobStore, loadStateMachineHandlerConfig } from '../src/watcher.js';
 import { ValidationError } from '../src/validation.js';
 
 const RETRY_STATE_MACHINE = '0x0000000000000000000000000000000000000001';
@@ -705,6 +706,142 @@ describe('watcher state storage', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('ships a bundled demo config that loads, defaults to real execution, and can actually match', async () => {
+    // F182/F191: the fixture used to pin dryRun:true (silently overriding the
+    // documented real-execution default) and keyed its handler by
+    // stage#hookName text, which never matches without an artifact index —
+    // the demo could never submit anything.
+    const config = await loadStateMachineHandlerConfig(
+      new URL('../fixtures/state-machine-executor.config.json', import.meta.url).pathname,
+    );
+    expect(config.dryRun).toBeUndefined();
+    expect(Object.keys(config.handlers)).toEqual(['*']);
+  });
+
+  it('warns when a config-level dryRun silently overrides the real-execution default', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-cli-dryrun-warn-'));
+    const stateDir = join(dir, 'state');
+    const configPath = join(dir, 'executor.json');
+    const originalLog = console.log;
+    const originalError = console.error;
+    const previousExitCode = process.exitCode;
+    const logs: string[] = [];
+    const errors: string[] = [];
+    process.exitCode = undefined;
+    console.log = (message?: unknown) => {
+      logs.push(String(message));
+    };
+    console.error = (message?: unknown) => {
+      errors.push(String(message));
+    };
+    const stub = await startChainStub();
+    try {
+      await writeFile(configPath, JSON.stringify({
+        supplierId: 'logistics-provider-a',
+        walletAddress: RETRY_WALLET,
+        chainId: 31_337,
+        stateMachineAddress: RETRY_STATE_MACHINE,
+        dryRun: true,
+        handlers: {
+          '*': {
+            signals: [{ source: 'buyer', stageIdentifier: 'exec.main', signalName: 'cmp' }],
+          },
+        },
+      }));
+      const argv = (extra: readonly string[]) => [
+        'node', 'uvp-executor', 'chain-once',
+        '--rpc-url', stub.url,
+        '--state-machine', RETRY_STATE_MACHINE,
+        '--chain-id', '31337',
+        '--config', configPath,
+        '--wallet-address', RETRY_WALLET,
+        '--from-block', '10',
+        '--state-dir', stateDir,
+        ...extra,
+      ];
+
+      // Omitting the flag leaves the config dry-run active — but visibly.
+      // Head 11 keeps the 10..10 scan inside the chain (no overshoot noise).
+      stub.setHeadBlock('0xb');
+      await main(argv([]));
+      expect(errors.some((line) => line.includes('dryRun:true in') && line.includes('nothing is broadcast')))
+        .toBe(true);
+      const described = JSON.parse(logs[0] ?? '{}') as { watcher?: { dryRun?: boolean } };
+      expect(described.watcher?.dryRun).toBe(true);
+
+      // An explicit --dry-run is the operator's own choice: no warning.
+      errors.length = 0;
+      logs.length = 0;
+      await main(argv(['--dry-run']));
+      expect(errors).toHaveLength(0);
+    } finally {
+      stub.close();
+      console.log = originalLog;
+      console.error = originalError;
+      process.exitCode = previousExitCode;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reads serve secrets only from named env vars, never from the command line', async () => {
+    // F188: value flags were visible to every process listing command lines
+    // (ps); the serve command now accepts env var names only.
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-cli-serve-'));
+    const configPath = join(dir, 'executor.json');
+    const envName = 'UVP_EXECUTOR_TOKEN';
+    const previous = process.env[envName];
+    delete process.env[envName];
+    try {
+      await writeFile(configPath, JSON.stringify({
+        executorId: 'exec-executor',
+        handlers: {
+          'exec.main#START': {
+            source: 'buyer',
+            stageIdentifier: 'exec.main',
+            signalName: 'exec.main.cmp',
+          },
+        },
+      }));
+      await expect(main(['node', 'uvp-executor', 'serve', '--config', configPath]))
+        .rejects.toThrow(`missing executor token: set ${envName}`);
+    } finally {
+      if (previous !== undefined) {
+        process.env[envName] = previous;
+      }
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('re-asserts owner-only permissions when overwriting a prepared file', async () => {
+    // F189: writeFile's mode only applies at creation, so overwriting a
+    // world-readable prepared file kept the loose permissions.
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-cli-prepare-'));
+    const preparedPath = join(dir, 'prepared.json');
+    const originalLog = console.log;
+    const originalFetch = globalThis.fetch;
+    console.log = () => undefined;
+    globalThis.fetch = (async () => jsonResponse(preparedProductResponse())) as typeof fetch;
+    try {
+      await writeFile(preparedPath, '{}\n', { mode: 0o644 });
+      await main([
+        'node', 'uvp-executor', 'product', 'prepare', 'task_1',
+        '--chain-services-url', 'http://chain.local/api',
+        '--wallet-address', '0x0000000000000000000000000000000000000002',
+        '--intent', 'confirm_stage',
+        '--prepared-file', preparedPath,
+      ]);
+      expect((await stat(preparedPath)).mode & 0o777).toBe(0o600);
+    } finally {
+      console.log = originalLog;
+      if (originalFetch) {
+        globalThis.fetch = originalFetch;
+      } else {
+        delete (globalThis as { fetch?: unknown }).fetch;
+      }
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 /**
@@ -785,4 +922,82 @@ function hookReadyRpcLog() {
     logIndex: '0x7',
     removed: false,
   };
+}
+
+const PRODUCT_VERIFYING_CONTRACT = '0x8888888888888888888888888888888888888888' as const;
+
+function productBytes32(suffix: string): `0x${string}` {
+  return `0x${suffix.padStart(64, '0')}`;
+}
+
+/** Valid prepare-submit response for the product CLI tests. */
+function preparedProductResponse() {
+  const planId = productBytes32('06');
+  const sourceId = productBytes32('02');
+  const signalId = productBytes32('03');
+  const payloadHash = productBytes32('04');
+  const idempotencyKey = productBytes32('05');
+  const deadline = String(Math.floor(Date.now() / 1000) + 3600);
+  return {
+    prepareId: 'prep_1',
+    taskId: 'task_1',
+    orderId: 'order_1',
+    onchainOrderId: productBytes32('01'),
+    stageIdentifier: 'export.customs',
+    signalName: 'confirm_stage',
+    sourceId,
+    signalId,
+    intent: 'confirm_stage',
+    payloadHash,
+    payloadRef: 'ipfs://payload',
+    idempotencyKey,
+    submitter: '0x0000000000000000000000000000000000000002',
+    nonce: '7',
+    deadline,
+    expiresAt: '2026-05-01T00:05:00.000Z',
+    status: 'prepared',
+    humanSummary: {
+      purpose: 'Submit task evidence',
+      orderId: 'order_1',
+      taskTitle: 'Confirm customs release',
+      stage: 'Customs release',
+      action: 'Confirm stage',
+      payloadHash,
+      payloadRef: 'ipfs://payload',
+      submitter: '0x0000000000000000000000000000000000000002',
+      validUntil: '2026-05-01T00:05:00.000Z',
+      chainId: 31337,
+      verifyingContract: PRODUCT_VERIFYING_CONTRACT,
+    },
+    typedData: buildProductSubmitTypedData({
+      chainId: 31337,
+      verifyingContract: PRODUCT_VERIFYING_CONTRACT,
+      planId,
+      orderId: productBytes32('01'),
+      sourceId,
+      signalId,
+      payloadHash,
+      idempotencyKey,
+      submitter: '0x0000000000000000000000000000000000000002',
+      deadline,
+    }),
+    evidence: [
+      {
+        evidenceId: 'ev_1',
+        payloadHash,
+        payloadRef: 'ipfs://evidence',
+        verificationStatus: 'usable',
+      },
+    ],
+    authorization: {
+      source: 'allowlist',
+    },
+  };
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
 }

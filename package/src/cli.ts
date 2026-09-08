@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFile, writeFile } from 'node:fs/promises';
+import { chmod, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Command } from 'commander';
@@ -157,11 +157,8 @@ interface ServeOptions {
   config: string;
   host: string;
   port: string;
-  executorToken?: string;
   executorTokenEnv: string;
-  callbackToken?: string;
   callbackTokenEnv: string;
-  callbackHmacSecret?: string;
   callbackHmacSecretEnv: string;
   readyJson?: boolean;
 }
@@ -402,22 +399,22 @@ export function buildProgram(): Command {
     .requiredOption('--config <path>', 'executor config JSON path')
     .option('--host <host>', 'host to bind', '127.0.0.1')
     .option('--port <port>', 'port to bind', '0')
-    .option('--executor-token <token>', 'bearer token for executor dispatch API')
     .option('--executor-token-env <name>', 'env var containing executor dispatch bearer token', DEFAULT_EXECUTOR_TOKEN_ENV)
-    .option('--callback-token <token>', 'bearer token for executor callback endpoint')
     .option('--callback-token-env <name>', 'env var containing executor callback bearer token', DEFAULT_CALLBACK_TOKEN_ENV)
-    .option('--callback-hmac-secret <secret>', 'optional shared secret for signing callback bodies')
     .option('--callback-hmac-secret-env <name>', 'env var containing callback HMAC secret', DEFAULT_CALLBACK_HMAC_SECRET_ENV)
     .option('--ready-json', 'print a ready JSON line after the server starts')
     .action(async (options: ServeOptions) => {
       const config = await loadExecutorConfig(options.config);
-      const callbackHmacSecret = options.callbackHmacSecret ?? process.env[options.callbackHmacSecretEnv];
+      // Secrets come only from named env vars: a value passed as a flag is
+      // visible to every process listing command lines (ps).
       const handle = await startExecutorServer({
         executorId: config.executorId,
         handlers: createHandlersFromExecutorConfig(config),
-        executorToken: readSecret(options.executorToken, options.executorTokenEnv, 'executor token'),
-        callbackToken: readSecret(options.callbackToken, options.callbackTokenEnv, 'callback token'),
-        ...(callbackHmacSecret ? { callbackHmacSecret } : {}),
+        executorToken: readSecretFromEnv(options.executorTokenEnv, 'executor token'),
+        callbackToken: readSecretFromEnv(options.callbackTokenEnv, 'callback token'),
+        ...(process.env[options.callbackHmacSecretEnv]?.trim()
+          ? { callbackHmacSecret: process.env[options.callbackHmacSecretEnv]!.trim() }
+          : {}),
         host: options.host,
         port: parsePort(options.port),
       });
@@ -697,6 +694,10 @@ function collectRepeatedOption(value: string, previous: string[] = []): string[]
 
 async function writePreparedSignalContainerFile(path: string, prepared: PreparedSignalContainer): Promise<void> {
   await writeFile(path, `${stringifyForTransport({ prepared })}\n`, { mode: 0o600 });
+  // writeFile's `mode` only applies to files it creates: overwriting an
+  // existing (possibly looser) prepared file must re-assert the owner-only
+  // mode, matching wallet.ts.
+  await chmod(path, 0o600);
 }
 
 async function readPreparedSignalContainerFile(path: string): Promise<PreparedSignalContainer> {
@@ -802,6 +803,15 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Prom
     throw new ValidationError('missing state machine address: pass --state-machine or set stateMachines[] in config');
   }
   const storage = resolveWatcherStorage(options);
+  const effectiveDryRun = options.dryRun ?? config.dryRun ?? false;
+  if (options.dryRun === undefined && config.dryRun === true) {
+    // The config-level dryRun silently overrides the documented "real
+    // execution is the default" contract for every invocation that omits the
+    // flag; make the effective mode visible instead.
+    console.error(
+      `warning: dryRun:true in ${options.config} is active; nothing is broadcast until it is removed or --dry-run is passed explicitly`,
+    );
+  }
   const watcher = createStateMachineWatcher({
     rpcUrl: options.rpcUrl,
     stateMachineAddress,
@@ -817,7 +827,7 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Prom
     ...(config.retry ? { retry: config.retry } : {}),
     ...(storage.jobStore ? { jobStore: storage.jobStore } : {}),
     ...(storage.cursorStore ? { cursorStore: storage.cursorStore } : {}),
-    dryRun: options.dryRun ?? config.dryRun ?? false,
+    dryRun: effectiveDryRun,
     ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
     ...(options.fromBlock ? { fromBlock: options.fromBlock } : {}),
     ...(options.pollIntervalMs ? { pollIntervalMs: parsePositiveInteger(options.pollIntervalMs, 'pollIntervalMs') } : {}),
@@ -945,10 +955,10 @@ function summarizeHttpExecutorConfig(config: Awaited<ReturnType<typeof loadExecu
   };
 }
 
-function readSecret(value: string | undefined, envName: string, label: string): string {
-  const secret = value ?? process.env[envName];
+function readSecretFromEnv(envName: string, label: string): string {
+  const secret = process.env[envName];
   if (!secret || secret.trim().length === 0) {
-    throw new ValidationError(`missing ${label}: pass --${label.replaceAll(' ', '-')} or set ${envName}`);
+    throw new ValidationError(`missing ${label}: set ${envName}`);
   }
   return secret;
 }
