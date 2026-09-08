@@ -202,7 +202,7 @@ describe('executor-kit classification completeness against the taxonomy', () => 
   });
 
   it('keeps public 0x-prefixed identifiers in classified messages while redacting bare key material', () => {
-    // F191: the redactor swept every 66-char 0x-prefixed value — including
+    // the redactor swept every 66-char 0x-prefixed value — including
     // tx hashes operators need for correlation — into [redacted]; only bare
     // 64-hex key material (the shape of raw key echoes) is redacted now.
     const receiptError = classifyExecutorKitError(new SubmitSignalReceiptError(

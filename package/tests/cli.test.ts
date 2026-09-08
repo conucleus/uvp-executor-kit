@@ -708,7 +708,7 @@ describe('watcher state storage', () => {
   });
 
   it('ships a bundled demo config that loads, defaults to real execution, and can actually match', async () => {
-    // F182/F191: the fixture used to pin dryRun:true (silently overriding the
+    // the fixture used to pin dryRun:true (silently overriding the
     // documented real-execution default) and keyed its handler by
     // stage#hookName text, which never matches without an artifact index —
     // the demo could never submit anything.
@@ -785,7 +785,7 @@ describe('watcher state storage', () => {
   });
 
   it('reads serve secrets only from named env vars, never from the command line', async () => {
-    // F188: value flags were visible to every process listing command lines
+    // value flags were visible to every process listing command lines
     // (ps); the serve command now accepts env var names only.
     const dir = await mkdtemp(join(tmpdir(), 'uvp-cli-serve-'));
     const configPath = join(dir, 'executor.json');
@@ -814,7 +814,7 @@ describe('watcher state storage', () => {
   });
 
   it('re-asserts owner-only permissions when overwriting a prepared file', async () => {
-    // F189: writeFile's mode only applies at creation, so overwriting a
+    // writeFile's mode only applies at creation, so overwriting a
     // world-readable prepared file kept the loose permissions.
     const dir = await mkdtemp(join(tmpdir(), 'uvp-cli-prepare-'));
     const preparedPath = join(dir, 'prepared.json');

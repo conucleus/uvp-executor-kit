@@ -604,7 +604,7 @@ describe('Product API doctor', () => {
 
 describe('doctor CLI', () => {
   it('refuses --task-id without --wallet-address instead of printing unverified readiness', async () => {
-    // B-25: without a wallet, assignee ownership cannot be checked at all —
+    // without a wallet, assignee ownership cannot be checked at all —
     // the readiness verdict used to print "Ready to prepare" anyway. The CLI
     // now enforces what its option help always claimed.
     await expect(main([

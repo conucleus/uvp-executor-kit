@@ -1440,7 +1440,7 @@ export class StateMachineWatcher {
         };
         const priorUnconfirmedBroadcasts = unconfirmedBroadcastCount(currentJob.submissions, index);
         if (priorUnconfirmedBroadcasts > 0 && options?.bypassResendBackoff !== true) {
-          // O13 resend backoff: a rescan must not put the same transaction on
+          // resend backoff: a rescan must not put the same transaction on
           // chain once per poll round — a growing, capped wait anchored to
           // lastSignalAttemptAt throttles the rebroadcast. A missing or
           // unparseable anchor loses the clock: the resend goes out

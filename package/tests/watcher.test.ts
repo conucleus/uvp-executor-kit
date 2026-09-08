@@ -1441,7 +1441,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('throttles rebroadcasts of unconfirmed signals with capped exponential backoff', async () => {
-    // O13: the rescan keeps meeting the open job every poll round; without a
+    // the rescan keeps meeting the open job every poll round; without a
     // backoff the same unconfirmed signal was rebroadcast once per round. The
     // chain idempotency key stays the dedupe anchor (accepted stance) — this
     // only stops the per-round gas burn.
@@ -1907,7 +1907,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('derives distinct default idempotency keys for distinct sources and stable keys across re-emitted events', async () => {
-    // B-25/F187: the config-driven default key used to be orderId:hookId:signalName,
+    // the config-driven default key used to be orderId:hookId:signalName,
     // so different sources behind one signalName were judged the same fact. The
     // default now carries the source dimension, and it deliberately does NOT
     // carry the event dimension: the key mirrors the contract's
@@ -1955,7 +1955,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('converges a replayed dry-run job instead of replaying the handler and growing the audit trail', async () => {
-    // F181: a finished dry-run pass used to stay non-terminal forever, so every
+    // a finished dry-run pass used to stay non-terminal forever, so every
     // rescan re-ran the handler (replaying its side effects) and appended the
     // full simulated submission set again — jobs.json grew without bound.
     let handlerRuns = 0;
@@ -2046,7 +2046,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('resolves the planId per signal so a sibling pin never leaks into unpinned signals', async () => {
-    // F179: the first explicit signal planId used to become the whole job's
+    // the first explicit signal planId used to become the whole job's
     // fallback, so an unpinned sibling was broadcast with a planId the event
     // never carried — a guaranteed on-chain revert that dead-lettered the job.
     const pinnedPlanId = `0x${'99'.repeat(32)}` as Hex;
@@ -2075,7 +2075,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('refutes a reverted handler-context broadcast on a later scan instead of leaving it open forever', async () => {
-    // F180: the handler-context submitSignal channel did not participate in
+    // the handler-context submitSignal channel did not participate in
     // the receipt recheck or the terminal-state computation, so a
     // waitForReceipt:false context broadcast that actually reverted could never
     // be refuted.
@@ -2198,7 +2198,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('keeps a job with unresolved broadcasts in the open lane when the handler stops emitting signals', async () => {
-    // F193: an empty handler result used to flip a job with an unconfirmed
+    // an empty handler result used to flip a job with an unconfirmed
     // broadcast down to `matched`, taking it out of the revisit lane exactly
     // when its broadcast still needed the automatic receipt recheck.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
@@ -2255,7 +2255,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('resends immediately when the backoff anchor is missing instead of starving the signal', async () => {
-    // F184: the anchor fell back to updatedAt, which is rewritten on unrelated
+    // the anchor fell back to updatedAt, which is rewritten on unrelated
     // bookkeeping every round — jobs persisted before lastSignalAttemptAt
     // existed deferred their rebroadcast forever.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
@@ -2308,7 +2308,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('retries the cursor restore on the next poll after a transient store failure', async () => {
-    // F183: one failed cursor read permanently abandoned the persisted
+    // one failed cursor read permanently abandoned the persisted
     // position; the next successful round then saved a fresh cursor over
     // anchors that were never read.
     const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-cursor-load-fail-'));
@@ -2380,7 +2380,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('does not commit in-memory cursor anchors when persistence fails', async () => {
-    // F183: checkpoints and the cursor hash used to be updated in memory
+    // checkpoints and the cursor hash used to be updated in memory
     // before the save, so a failed save made the next round's continuity check
     // mismatch by construction — a false reorg rolling the whole range back.
     const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-cursor-save-fail-'));
@@ -2456,7 +2456,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('clears stale adopted anchors when the overshoot correction rewinds to fromBlock', async () => {
-    // F183: the overshoot fallback kept checkpoints from beyond the chain
+    // the overshoot fallback kept checkpoints from beyond the chain
     // head, so the next round's continuity check mismatched by construction
     // and fired a false reorg rollback.
     const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-overshoot-'));
@@ -2523,7 +2523,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('serializes concurrent file-store writers so no update is silently lost', async () => {
-    // F185: the jobs file read-modify-write had no cross-process exclusion;
+    // the jobs file read-modify-write had no cross-process exclusion;
     // two concurrent writers (e.g. `jobs retry` against a running watcher)
     // dropped each other's updates.
     const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-jobs-lock-'));
@@ -2559,7 +2559,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('rejects a signal without source attribution instead of hashing the empty string', async () => {
-    // F186: keccak("") minted one constant pseudo sourceId for every
+    // keccak("") minted one constant pseudo sourceId for every
     // unattributed signal, collapsing the chain's (…, sourceId, signalId)
     // identity across producers. The CLI already requires --source; the SDK
     // path must refuse just as loudly.
