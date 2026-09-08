@@ -109,12 +109,6 @@ export interface StateMachineSignal {
   readonly payloadHash?: Hex | string;
   /** Off-chain metadata only: the frozen submitSignal ABI cannot carry it on chain. */
   readonly payloadRef?: string;
-  /**
-   * Off-chain correlation metadata (the emitting HookReady event id). Not part
-   * of the chain identity: the default idempotency key mirrors the contract's
-   * SignalAlreadyExists tuple so a re-emitted event must not mint a new key.
-   */
-  readonly readyEventId?: Hex | string;
   readonly idempotencyKey?: string;
 }
 
@@ -303,7 +297,6 @@ export interface StateMachineStaticSignalDefinition {
   readonly sourceId?: Hex | string;
   readonly signalId?: Hex | string;
   readonly payloadHash?: Hex | string;
-  readonly readyEventId?: Hex | string;
   readonly idempotencyKey?: string;
   /**
    * Optional explicit planId for the signal's order. When omitted (the normal
@@ -1436,7 +1429,6 @@ export class StateMachineWatcher {
         const resolvedSignal: StateMachineSignal = {
           ...signal,
           ...(signal.planId === undefined && fallbackPlanId !== undefined ? { planId: fallbackPlanId } : {}),
-          readyEventId: signal.readyEventId ?? event.eventId,
         };
         const priorUnconfirmedBroadcasts = unconfirmedBroadcastCount(currentJob.submissions, index);
         if (priorUnconfirmedBroadcasts > 0 && options?.bypassResendBackoff !== true) {
@@ -2261,7 +2253,6 @@ export function createStateMachineHandlersFromConfig(
         // treats bytes32(0) as the legal "no payload" value. Omitting payloadHash
         // here is the producer's explicit declaration of an empty payload.
         payloadHash: signal.payloadHash ?? ZERO_BYTES32,
-        readyEventId: signal.readyEventId ?? event.eventId,
         // No key-level default here: the config-only shape
         // orderId:hookId:signalName collapsed a re-emitted HookReady for the
         // same (order, hook) and distinct sources behind the same signalName
@@ -2496,11 +2487,14 @@ function normalizeStateMachineSignal(signal: StateMachineSignal): StateMachineSi
     // same key even when its HookReady event is re-emitted in a new
     // transaction after a deep reorg, so the chain's dedupe sees one identity
     // instead of a fresh key per event anchor (which put a guaranteed-reverting
-    // duplicate broadcast on chain). `readyEventId` stays off-chain
-    // correlation metadata, never part of the chain identity.
+    // duplicate broadcast on chain).
     idempotencyKey: signal.idempotencyKey
       ? hashText(signal.idempotencyKey, 'idempotencyKey')
       : hashText(`${planId}:${orderId}:${sourceId}:${signalId}`, 'idempotencyKey'),
+    // The emitting HookReady event anchor is off-chain correlation context
+    // only. It is deliberately absent from both the call args and the default
+    // key: the contract never sees it, and off-chain metadata must not
+    // participate in the idempotency verdict (EXEC kit ruling #21).
   };
 }
 
@@ -2605,7 +2599,6 @@ function normalizeStaticSignalDefinition(value: unknown, path: string): StateMac
     ...(typeof value.sourceId === 'string' ? { sourceId: normalizeBytes32(value.sourceId, `${path}.sourceId`) } : {}),
     ...(typeof value.signalId === 'string' ? { signalId: normalizeBytes32(value.signalId, `${path}.signalId`) } : {}),
     ...(typeof value.payloadHash === 'string' ? { payloadHash: normalizeBytes32(value.payloadHash, `${path}.payloadHash`) } : {}),
-    ...(typeof value.readyEventId === 'string' ? { readyEventId: normalizeBytes32(value.readyEventId, `${path}.readyEventId`) } : {}),
     ...(typeof value.idempotencyKey === 'string' ? { idempotencyKey: value.idempotencyKey } : {}),
     ...(typeof value.planId === 'string' ? { planId: normalizeBytes32(value.planId, `${path}.planId`) } : {}),
   };

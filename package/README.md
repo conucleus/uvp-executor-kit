@@ -414,6 +414,13 @@ Watcher job semantics:
   acceptance window (5 minutes by default), and `createWebhookReplayGuard`
   burns each nonce once inside the window — a captured `(body, signature)`
   pair can no longer be replayed forever.
+- The `serve` HTTP server's callback host whitelist is LOCAL HARNESS
+  positioning. It ships loopback hosts (`localhost`, `127.0.0.1`, `::1`) plus
+  the `UVP_EXECUTOR_CALLBACK_HOST_ALLOWLIST` env var so local tests can
+  dispatch to a co-located receiver; it is an anti-footgun for the reference
+  harness, not an egress policy. A production callback dispatcher (real
+  network policy, credential handling, audit) is a separately designed and
+  deployed component — do not harden this whitelist into one.
 
 ## SDK Surface
 
@@ -483,7 +490,11 @@ On-chain dedupe is the contract's `SignalAlreadyExists` check on the
 argument. The kit's default key therefore hashes exactly that tuple, so the
 same logical signal keeps the same key even when its `HookReady` event is
 re-emitted in a new transaction after a deep reorg; a producer may still
-supply an explicit `idempotencyKey` for its own correlation needs.
+supply an explicit `idempotencyKey` for its own correlation needs. Off-chain
+metadata never participates in the verdict: the emitting `HookReady` event
+anchor (or any other off-chain correlation context) is not an input to the
+default key, and the kit deliberately exposes no `readyEventId` input surface
+on the CLI, the handler config, or the SDK signal type.
 
 There is no payload-reference input in this ABI, and the contract is frozen:
 `chain-signal --payload-ref` is rejected up front instead of silently dropping

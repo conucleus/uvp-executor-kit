@@ -94,7 +94,6 @@ interface ChainSignalOptions {
   signalName: string;
   payloadHash?: string;
   payloadRef?: string;
-  readyEventId?: string;
   idempotencyKey?: string;
   dryRun?: boolean;
   waitForReceipt?: boolean;
@@ -628,7 +627,6 @@ export function buildProgram(): Command {
     .requiredOption('--signal-name <signalName>', 'signal name')
     .option('--payload-hash <bytes32>', 'off-chain payload hash')
     .option('--payload-ref <uri>', 'unsupported: rejected because submitSignal cannot carry an off-chain payload reference')
-    .option('--ready-event-id <bytes32>', 'HookReady event id')
     .option('--idempotency-key <key>', 'idempotency key')
     .option('--private-key-env <name>', 'environment variable containing the callback tx private key', DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV)
     .option('--dry-run', 'build the submitSignal tx request without broadcasting')
@@ -658,7 +656,6 @@ export function buildProgram(): Command {
         stageIdentifier: options.stage,
         signalName: options.signalName,
         ...(options.payloadHash ? { payloadHash: options.payloadHash } : {}),
-        ...(options.readyEventId ? { readyEventId: options.readyEventId } : {}),
         ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
       });
       console.log(stringifyForTransport({ stateMachineSignal: result }));

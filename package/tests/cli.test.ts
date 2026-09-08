@@ -258,6 +258,41 @@ describe('executor CLI', () => {
       '--dry-run',
     ])).rejects.toThrow(/--payload-ref is not supported by chain-signal/);
   });
+
+  it('no longer exposes --ready-event-id on chain-signal', async () => {
+    // The readyEventId explicit input surface is deleted (audit ruling #10):
+    // the off-chain HookReady anchor never participated in the chain identity
+    // or the default idempotency key, so the flag was dead input. Commander
+    // now treats it as an unknown option and exits 1 (the CLI harness turns
+    // process.exit into a rejection) instead of accepting and silently
+    // dropping it.
+    await expect(main([
+      'node',
+      'uvp-executor',
+      'chain-signal',
+      '--rpc-url',
+      'http://127.0.0.1:8545',
+      '--state-machine',
+      RETRY_STATE_MACHINE,
+      '--chain-id',
+      '31337',
+      '--order-id',
+      RETRY_ORDER_ID,
+      '--plan-id',
+      RETRY_PLAN_ID,
+      '--source',
+      'buyer',
+      '--stage',
+      'exec.main',
+      '--signal-name',
+      'cmp',
+      '--ready-event-id',
+      RETRY_HOOK_ID,
+      '--wallet-address',
+      RETRY_WALLET,
+      '--dry-run',
+    ])).rejects.toThrow(/process\.exit unexpectedly called|unknown option/i);
+  });
 });
 
 describe('honest execution exit codes', () => {

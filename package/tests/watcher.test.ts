@@ -2706,7 +2706,6 @@ describe('state machine callback tx helper', () => {
       source: 'seller',
       signalName: 'ship.pickup.done',
       payloadHash: PAYLOAD_HASH,
-      readyEventId: HOOK_ID,
       idempotencyKey: 'order-1:pickup:done',
     });
 

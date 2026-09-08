@@ -308,15 +308,25 @@ async function checkTaskReadiness(
     } else if (summary.status === 'closed' || summary.status === 'cancelled') {
       nextAction = 'blocked';
       nextActionLabel = `Task is ${summary.status} and cannot be acted on.`;
+    } else if (blockedReason) {
+      // The server's own blockedReason wins the action guidance. The locally
+      // computed deadline is display context only (deadlineExpired above): a
+      // skewed local clock must not mask the server's stated conclusion with
+      // a fabricated "deadline expired" verdict.
+      nextAction = 'wait';
+      nextActionLabel = blockedReason;
     } else if (deadlineExpired) {
       nextAction = 'blocked';
-      nextActionLabel = 'Deadline has expired. This task cannot be submitted.';
+      // Display-only framing: no server verdict exists to contradict, so the
+      // local expiry may guide the operator, but the copy says where it came
+      // from (the local clock) instead of asserting it as an authority.
+      nextActionLabel = 'Local clock shows the deadline has passed (display-only; no server verdict was provided).';
     } else if (walletAddress && !assigneeMatch) {
       nextAction = 'blocked';
       nextActionLabel = `Configured wallet ${walletAddress} is not the task assignee.`;
     } else {
       nextAction = 'wait';
-      nextActionLabel = blockedReason ?? 'Task is not yet ready for submission. Check the blocked reason.';
+      nextActionLabel = 'Task is not yet ready for submission. Check the blocked reason.';
     }
 
     // One readiness verdict drives both the outer check and the embedded

@@ -578,6 +578,49 @@ describe('Product API doctor', () => {
     expect(report.ok).toBe(true);
   });
 
+  it('keeps the server blockedReason displayed even when the local clock computes the deadline as expired', async () => {
+    // Audit ruling #26 (residual): the local expiry computation used to win
+    // the nextAction label over the server's own blockedReason, masking the
+    // server's stated conclusion with a clock-derived verdict. The local
+    // deadline stays display-only (deadlineExpired) and never rewrites the
+    // action guidance when the server gave a reason.
+    const fetch: ProductApiFetch = async (url) => {
+      if (!url.includes('/product/')) {
+        return jsonResponse({ service: 'chain-services' });
+      }
+      return jsonResponse({
+        task: {
+          taskId: 'task_blocked_skew',
+          orderId: 'order_blocked_skew',
+          title: 'Blocked with skewed clock',
+          status: 'open',
+          assigneeWallet: submitter,
+          deadline: '2020-01-01T00:00:00.000Z',
+          canSubmit: false,
+          blockedReason: 'Required evidence not yet uploaded',
+        },
+      });
+    };
+
+    const report = await runProductDoctor({
+      chainServicesUrl: 'http://chain.local/api',
+      walletAddress: submitter,
+      taskId: 'task_blocked_skew',
+      fetch,
+    });
+
+    expect(report.taskReadiness).toMatchObject({
+      taskId: 'task_blocked_skew',
+      canSubmit: false,
+      blockedReason: 'Required evidence not yet uploaded',
+      // Local computation is still reported, as display context only.
+      deadlineExpired: true,
+      nextAction: 'wait',
+    });
+    expect(report.taskReadiness?.nextActionLabel).toContain('Required evidence not yet uploaded');
+    expect(report.taskReadiness?.nextActionLabel).not.toContain('deadline has passed');
+  });
+
   it('omits readiness and raw-task data when the task lookup fails', async () => {
     const fetch: ProductApiFetch = async (url) => {
       if (!url.includes('/product/')) {
