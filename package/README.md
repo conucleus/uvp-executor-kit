@@ -30,6 +30,12 @@ pnpm --filter @uvp-eth/executor-kit typecheck
 pnpm --filter @uvp-eth/executor-kit build
 ```
 
+`dist/` is a local, gitignored build output — the `bin` entry
+(`dist/cli.js`) only exists after `pnpm --filter @uvp-eth/executor-kit build`,
+and nothing republishes it automatically when `src/` changes: run the build
+before invoking the installed `uvp-executor` bin. Workspace consumers import
+the TypeScript sources through the package `exports` and never need `dist`.
+
 ## CLI
 
 Create or inspect a local wallet env file:
@@ -88,7 +94,11 @@ the same chain id is caught by the genesis hash, not silently adopted).
 State files are written atomically (temp file + rename). A crash-truncated or
 structurally invalid `jobs.json`/`cursor.json` is moved aside to
 `<file>.corrupt-<timestamp>` for inspection and recreated from scratch instead
-of aborting every later read.
+of aborting every later read. Writers to one jobs file serialize through a
+lock file beside it (`<jobs-file>.lock`, broken by age when a holder crashes);
+still, one watcher (or one CLI operation such as `jobs retry`) per jobs file
+is the intended operating mode — the lock only prevents silent lost updates,
+not the confusion of two operators racing the same job.
 
 ### Reorg and Outage Defenses
 
@@ -123,8 +133,9 @@ configurable parameters (`--confirmations`, `--reorg-window`,
   rebroadcast happen, with exponential backoff (30s base, 10min cap) anchored
   to the job's `lastSignalAttemptAt`, instead of once per poll round — and an
   in-run retry never blind-rebroadcasts a transaction whose outcome is simply
-  unknown. The chain's `idempotencyKey` remains the dedupe anchor; the backoff
-  only stops the per-round gas burn. Manual `jobs retry` bypasses the throttle.
+  unknown. Dedupe on chain is the contract's `SignalAlreadyExists` check on
+  the `(planId, orderId, sourceId, signalId)` tuple; the backoff only stops
+  the per-round gas burn. Manual `jobs retry` bypasses the throttle.
 
 Build or submit one state-machine signal:
 
@@ -353,12 +364,15 @@ Watcher job semantics:
   manual retries can observe the real on-chain outcome instead of trusting
   the broadcast — a broadcast without an observed receipt is never recorded
   as delivered (not even with `waitForReceipt: false`; the later scan
-  re-checks the receipt and adopts or refutes it). When the receipt step
-  itself fails after a successful broadcast (reverted receipt, or waiting
-  for the receipt throws), the error carries the broadcast `txHash` and the
-  job's `submissions` record keeps it, so "already broadcast" transactions
-  are never dropped from the audit trail — including signals submitted
-  through the handler-context `submitSignal` channel.
+  re-checks the receipt and adopts or refutes it). The receipt recheck, the
+  resend backoff, and the terminal-state computation cover BOTH submission
+  channels: signals returned by the handler and signals submitted through the
+  handler-context `submitSignal` channel (a `waitForReceipt:false` revert on
+  either channel refutes the job on the next scan instead of staying open
+  forever). When the receipt step itself fails after a successful broadcast
+  (reverted receipt, or waiting for the receipt throws), the error carries
+  the broadcast `txHash` and the job's `submissions` record keeps it, so
+  "already broadcast" transactions are never dropped from the audit trail.
 - Failures are classified from explicit machine-readable error codes first,
   then from well-known real-world error texts and contract revert data
   (for example `SignalAlreadyExists()`, `AccessControlUnauthorizedAccount`,
@@ -377,8 +391,9 @@ Watcher job semantics:
   recovery: detection was persisted but the job never got a run) and
   `confirmed` jobs: the retry resubmits every signal, which is the manual
   recovery channel when a reorg flipped a confirmation off the canonical
-  chain (the on-chain idempotency key absorbs the duplicate when the signal
-  actually survived).
+  chain (the contract's `SignalAlreadyExists` dedupe on
+  `(planId, orderId, sourceId, signalId)` absorbs the duplicate when the
+  signal actually survived).
 - HookReady-topic logs that fail to decode (e.g. from a mixed-version
   deployment) never crash the watcher: the scan skips them, records an
   `ignored` job with the raw log preserved, counts them in poll results and
@@ -458,9 +473,17 @@ ABI recorded in
 `planId` is part of the event and submit boundary. It must be retained with the
 watcher job and never inferred from a bare `orderId`; the same state machine can
 contain the same order id under different plans. The watcher persists the
-planId decoded from each `HookReady` event on the job and uses it as the default
-for every signal that does not declare one; a handler-config signal may pin an
-explicit `planId` (`handlers.<key>.signals[].planId`) when it must diverge.
+planId decoded from each `HookReady` event on the job and uses it as the
+per-signal default; a handler-config signal may pin an explicit `planId`
+(`handlers.<key>.signals[].planId`) when it must diverge — one signal's pin
+never becomes the fallback for its siblings.
+
+On-chain dedupe is the contract's `SignalAlreadyExists` check on the
+`(planId, orderId, sourceId, signalId)` tuple, not the `idempotencyKey`
+argument. The kit's default key therefore hashes exactly that tuple, so the
+same logical signal keeps the same key even when its `HookReady` event is
+re-emitted in a new transaction after a deep reorg; a producer may still
+supply an explicit `idempotencyKey` for its own correlation needs.
 
 There is no payload-reference input in this ABI, and the contract is frozen:
 `chain-signal --payload-ref` is rejected up front instead of silently dropping
