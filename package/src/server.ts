@@ -192,7 +192,12 @@ export function createHandlersFromExecutorConfig(config: ExecutorConfig): Readon
         stageIdentifier: handler.stageIdentifier,
         signalName: handler.signalName,
         senderId: handler.senderId ?? config.executorId,
-        idempotencyKey: handler.idempotencyKey ?? ((effect) => `${effect.orderId}:${effect.hookId}:${handler.signalName}`),
+        // Same caliber as the watcher's SDK default: the key carries the
+        // source and ready-event dimensions. The old orderId:hookId:signalName
+        // shape collapsed a re-emitted HookReady for the same (order, hook)
+        // and distinct sources behind one key.
+        idempotencyKey: handler.idempotencyKey
+          ?? ((effect) => `${effect.orderId}:${handler.source}:${handler.signalName}:${effect.eventId}`),
         ...(handler.traceId ? { traceId: handler.traceId } : {}),
         ...(handler.payloadRef ? { payloadRef: handler.payloadRef } : {}),
         ...(handler.receivedAt ? { receivedAt: handler.receivedAt } : {}),

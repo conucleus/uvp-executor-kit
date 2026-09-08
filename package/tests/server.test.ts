@@ -130,7 +130,10 @@ describe('executor HTTP server', () => {
             stageIdentifier: 'exec.main',
             signalName: 'exec.main.cmp',
             senderId: 'exec-executor',
-            idempotencyKey: 'order-1:exec.main#START:exec.main.cmp',
+            // Default key caliber matches the watcher SDK: order, source,
+            // signal, and the ready-event dimension — distinct sources behind
+            // one signalName are distinct facts.
+            idempotencyKey: 'order-1:buyer:exec.main.cmp:event-1',
             receivedAt: '2026-04-27T00:00:03.000Z',
           },
         },
