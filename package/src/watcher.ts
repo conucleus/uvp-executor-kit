@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import {
@@ -109,6 +109,11 @@ export interface StateMachineSignal {
   readonly payloadHash?: Hex | string;
   /** Off-chain metadata only: the frozen submitSignal ABI cannot carry it on chain. */
   readonly payloadRef?: string;
+  /**
+   * Off-chain correlation metadata (the emitting HookReady event id). Not part
+   * of the chain identity: the default idempotency key mirrors the contract's
+   * SignalAlreadyExists tuple so a re-emitted event must not mint a new key.
+   */
   readonly readyEventId?: Hex | string;
   readonly idempotencyKey?: string;
 }
@@ -572,6 +577,60 @@ export class InMemoryStateMachineJobStore implements StateMachineJobStore {
   }
 }
 
+/**
+ * Cross-process exclusion for the jobs-file read-modify-write cycle. The whole
+ * file is the store, so two processes (or two concurrent CLI invocations, e.g.
+ * `jobs retry` against a running watcher) reading the same base and writing
+ * their own view silently dropped each other's updates — including broadcasts
+ * the audit trail then no longer carried. The lock is an O_EXCL marker file
+ * broken by age (a crashed holder must not block the store forever).
+ */
+const JOBS_FILE_LOCK_STALE_MS = 10_000;
+const JOBS_FILE_LOCK_POLL_MS = 25;
+const JOBS_FILE_LOCK_TIMEOUT_MS = 5_000;
+
+async function withJobsFileLock<T>(filePath: string, operation: () => Promise<T>): Promise<T> {
+  const lockPath = `${filePath}.lock`;
+  // The jobs file may not exist yet on a first write; its directory must exist
+  // before the lock marker can be created beside it.
+  await mkdir(dirname(filePath), { recursive: true });
+  const deadline = Date.now() + JOBS_FILE_LOCK_TIMEOUT_MS;
+  for (;;) {
+    try {
+      await writeFile(lockPath, `${process.pid}\n`, { flag: 'wx' });
+      break;
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== 'EEXIST') {
+        throw error;
+      }
+      if (await isStaleJobsFileLock(lockPath)) {
+        await rm(lockPath, { force: true }).catch(() => undefined);
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new ExecutorKitError(
+          `timed out acquiring the jobs file lock ${lockPath}: another process holds it; concurrent writers must serialize on one jobs file`,
+        );
+      }
+      await delay(JOBS_FILE_LOCK_POLL_MS);
+    }
+  }
+  try {
+    return await operation();
+  } finally {
+    await rm(lockPath, { force: true }).catch(() => undefined);
+  }
+}
+
+async function isStaleJobsFileLock(lockPath: string): Promise<boolean> {
+  try {
+    const info = await stat(lockPath);
+    return Date.now() - info.mtimeMs > JOBS_FILE_LOCK_STALE_MS;
+  } catch {
+    return false;
+  }
+}
+
 export class FileStateMachineJobStore implements StateMachineJobStore {
   readonly kind = 'file';
   readonly filePath: string;
@@ -588,63 +647,67 @@ export class FileStateMachineJobStore implements StateMachineJobStore {
     readonly maxAttempts: number;
     readonly supplierId?: string;
   }): Promise<StateMachineWatcherJob> {
-    const jobs = await readStateMachineJobsFile(this.filePath);
-    const id = stateMachineJobId(event);
-    const existing = jobs.get(id);
-    if (existing) {
-      return cloneJob(existing);
-    }
+    return withJobsFileLock(this.filePath, async () => {
+      const jobs = await readStateMachineJobsFile(this.filePath);
+      const id = stateMachineJobId(event);
+      const existing = jobs.get(id);
+      if (existing) {
+        return cloneJob(existing);
+      }
 
-    const job: StateMachineWatcherJob = {
-      id,
-      eventId: event.eventId,
-      ...(event.stateMachineAddress ? { stateMachineAddress: event.stateMachineAddress } : {}),
-      orderId: event.orderId,
-      // See the in-memory store: the event planId must be persisted at detection
-      // so retries can resubmit the plan-scoped submitSignal ABI.
-      ...(event.planId && event.planId !== ZERO_BYTES32 ? { planId: event.planId } : {}),
-      hookId: event.hookId,
-      stageId: event.stageId,
-      ...(event.stageIdentifier ? { stageIdentifier: event.stageIdentifier } : {}),
-      ...(event.hookName ? { hookName: event.hookName } : {}),
-      ...(options.supplierId ? { supplierId: options.supplierId } : {}),
-      status: 'detected',
-      attempts: 0,
-      maxAttempts: options.maxAttempts,
-      detectedAt: options.now,
-      updatedAt: options.now,
-      submissions: [],
-      ...(event.raw ? { raw: event.raw } : {}),
-    };
-    jobs.set(id, cloneJob(job));
-    await writeStateMachineJobsFile(this.filePath, jobs);
-    return job;
+      const job: StateMachineWatcherJob = {
+        id,
+        eventId: event.eventId,
+        ...(event.stateMachineAddress ? { stateMachineAddress: event.stateMachineAddress } : {}),
+        orderId: event.orderId,
+        // See the in-memory store: the event planId must be persisted at detection
+        // so retries can resubmit the plan-scoped submitSignal ABI.
+        ...(event.planId && event.planId !== ZERO_BYTES32 ? { planId: event.planId } : {}),
+        hookId: event.hookId,
+        stageId: event.stageId,
+        ...(event.stageIdentifier ? { stageIdentifier: event.stageIdentifier } : {}),
+        ...(event.hookName ? { hookName: event.hookName } : {}),
+        ...(options.supplierId ? { supplierId: options.supplierId } : {}),
+        status: 'detected',
+        attempts: 0,
+        maxAttempts: options.maxAttempts,
+        detectedAt: options.now,
+        updatedAt: options.now,
+        submissions: [],
+        ...(event.raw ? { raw: event.raw } : {}),
+      };
+      jobs.set(id, cloneJob(job));
+      await writeStateMachineJobsFile(this.filePath, jobs);
+      return job;
+    });
   }
 
   async update(jobId: Hex, patch: StateMachineJobPatch): Promise<StateMachineWatcherJob | undefined> {
-    const jobs = await readStateMachineJobsFile(this.filePath);
-    const current = jobs.get(jobId);
-    if (!current) {
-      return undefined;
-    }
+    return withJobsFileLock(this.filePath, async () => {
+      const jobs = await readStateMachineJobsFile(this.filePath);
+      const current = jobs.get(jobId);
+      if (!current) {
+        return undefined;
+      }
 
-    const { lastError: currentLastError, ...currentWithoutLastError } = current;
-    const next: StateMachineWatcherJob = {
-      ...currentWithoutLastError,
-      ...(patch.status ? { status: patch.status } : {}),
-      updatedAt: patch.updatedAt,
-      ...(patch.attempts !== undefined ? { attempts: patch.attempts } : {}),
-      ...(patch.matchedKey !== undefined ? { matchedKey: patch.matchedKey } : {}),
-      ...(patch.planId !== undefined ? { planId: patch.planId } : {}),
-      ...(patch.submissions ? { submissions: patch.submissions } : {}),
-      ...(patch.clearLastError ? {} : currentLastError ? { lastError: currentLastError } : {}),
-      ...(patch.lastError ? { lastError: patch.lastError } : {}),
-      ...(patch.lastSignalAttemptAt !== undefined ? { lastSignalAttemptAt: patch.lastSignalAttemptAt } : {}),
-      ...(patch.manualActions ? { manualActions: patch.manualActions } : {}),
-    };
-    jobs.set(jobId, cloneJob(next));
-    await writeStateMachineJobsFile(this.filePath, jobs);
-    return next;
+      const { lastError: currentLastError, ...currentWithoutLastError } = current;
+      const next: StateMachineWatcherJob = {
+        ...currentWithoutLastError,
+        ...(patch.status ? { status: patch.status } : {}),
+        updatedAt: patch.updatedAt,
+        ...(patch.attempts !== undefined ? { attempts: patch.attempts } : {}),
+        ...(patch.matchedKey !== undefined ? { matchedKey: patch.matchedKey } : {}),
+        ...(patch.planId !== undefined ? { planId: patch.planId } : {}),
+        ...(patch.submissions ? { submissions: patch.submissions } : {}),
+        ...(patch.clearLastError ? {} : currentLastError ? { lastError: currentLastError } : {}),
+        ...(patch.lastError ? { lastError: patch.lastError } : {}),
+        ...(patch.lastSignalAttemptAt !== undefined ? { lastSignalAttemptAt: patch.lastSignalAttemptAt } : {}),
+        ...(patch.manualActions ? { manualActions: patch.manualActions } : {}),
+      };
+      jobs.set(jobId, cloneJob(next));
+      await writeStateMachineJobsFile(this.filePath, jobs);
+      return next;
+    });
   }
 
   async get(jobId: Hex): Promise<StateMachineWatcherJob | undefined> {
@@ -853,13 +916,20 @@ export class StateMachineWatcher {
     if (this.cursorRestored) {
       return;
     }
-    this.cursorRestored = true;
-    this.genesisHash = client ? await tryGetBlockHash(client, 0n) : undefined;
     const store = this.config.cursorStore;
     if (!store) {
+      // Nothing to restore; the latch only guards the store interaction.
+      this.cursorRestored = true;
       return;
     }
+    this.genesisHash = client ? await tryGetBlockHash(client, 0n) : undefined;
     const result = await store.load(this.cursorContext());
+    // Latch only after the store reached a decision: a transient load failure
+    // (EACCES, EMFILE, a full disk) must retry on the next poll instead of
+    // permanently abandoning the persisted position — the next successful
+    // round would otherwise save a fresh cursor over anchors that were never
+    // read, silently discarding the old position and its checkpoints.
+    this.cursorRestored = true;
     if (result.status === 'foreign') {
       const cause = result.reason === 'genesis'
         ? 'the chain genesis hash changed (chain reset or replacement chain at the same chain id)'
@@ -905,6 +975,12 @@ export class StateMachineWatcher {
       if (this.adoptedStoredCursor && this.config.fromBlock !== undefined && this.config.fromBlock <= toBlock) {
         fromBlock = this.config.fromBlock;
         this.adoptedStoredCursor = false;
+        // The adopted anchors sit at or beyond the stale cursor height: kept
+        // against the corrected floor, the next continuity check mismatches by
+        // construction and forces a false-reorg rollback to anchors the live
+        // chain no longer supports.
+        this.checkpoints = [];
+        this.cursorBlockHash = undefined;
       } else {
         return { fromBlock, toBlock, scannedLogs: 0, results: [], decodeFailures: 0 };
       }
@@ -958,6 +1034,12 @@ export class StateMachineWatcher {
     // holding an unpersisted skip interval — combined with a crash, blocks were
     // silently never rescanned by this or any restarted instance.
     const nextBlock = toBlock + 1n;
+    // Stage this round's cursor evidence off to the side: persistence happens
+    // first and the in-memory anchors are committed only after the save
+    // succeeds. A save failure with the memory already updated left the next
+    // round's continuity check comparing the new height against hashes the
+    // persisted cursor never got — a false reorg that rolled the range back.
+    const stagedCheckpoints = [...this.checkpoints];
     // Remember canonical hashes for the scanned range (dense near the tip,
     // exponentially sparser deeper) so a later reorg can locate the common
     // ancestor instead of falling back to a full rescan. A failed read of the
@@ -968,13 +1050,12 @@ export class StateMachineWatcher {
     for (const anchorHeight of checkpointAnchorHeights(fromBlock, toBlock, this.config.reorgWindow)) {
       const anchorHash = await tryGetBlockHash(client, anchorHeight);
       if (anchorHash !== undefined) {
-        this.recordCheckpoint(anchorHeight, anchorHash);
+        recordCheckpoint(stagedCheckpoints, anchorHeight, anchorHash, this.config.reorgWindow);
         if (anchorHeight === toBlock) {
           roundCursorBlockHash = anchorHash;
         }
       }
     }
-    this.cursorBlockHash = roundCursorBlockHash;
     // Later-scan pass over open jobs behind the cursor (detected leftovers,
     // unconfirmed broadcasts). It runs before the cursor advances so a crash
     // mid-pass leaves the range (and the recheck) to the next round.
@@ -983,13 +1064,15 @@ export class StateMachineWatcher {
       await this.config.cursorStore.save(
         {
           nextBlock,
-          ...(this.cursorBlockHash !== undefined ? { blockHash: this.cursorBlockHash } : {}),
-          ...(this.checkpoints.length > 0 ? { checkpoints: this.checkpoints } : {}),
+          ...(roundCursorBlockHash !== undefined ? { blockHash: roundCursorBlockHash } : {}),
+          ...(stagedCheckpoints.length > 0 ? { checkpoints: stagedCheckpoints } : {}),
         },
         this.cursorContext(),
       );
     }
     this.nextBlock = nextBlock;
+    this.checkpoints = stagedCheckpoints;
+    this.cursorBlockHash = roundCursorBlockHash;
 
     const decodeFailures = results.filter((result) => result.decodeFailure).length;
     return {
@@ -1049,6 +1132,22 @@ export class StateMachineWatcher {
         job,
       };
     }
+    // A finished dry-run pass is converged: re-running its handler would replay
+    // handler side effects and pile simulated submissions onto the audit trail
+    // on every rescan. Flipping dry-run off, or a manual retry (which re-opens
+    // the job as `detected`), still re-runs the job for real.
+    if (
+      this.config.dryRun
+      && job.status === 'matched'
+      && job.submissions.some((submission) => submission.dryRun === true)
+    ) {
+      return {
+        status: 'ignored',
+        event,
+        submissions: [],
+        job,
+      };
+    }
 
     const resolved = resolveStateMachineHandler(this.config.handlers, event);
     if (!resolved) {
@@ -1092,7 +1191,7 @@ export class StateMachineWatcher {
       for (let attemptForSignal = 1; attemptForSignal <= this.config.retry.maxAttempts; attemptForSignal += 1) {
         try {
           const result = await submitStateMachineSignal(eventSubmitConfig, signal);
-          jobSubmissions.push(toJobSubmission(signalIndex, attemptForSignal, result));
+          appendJobSubmission(jobSubmissions, toJobSubmission(signalIndex, attemptForSignal, result));
           currentJob = await this.updateJob(job.id, {
             updatedAt: this.config.now(),
             lastSignalAttemptAt: this.config.now(),
@@ -1134,7 +1233,7 @@ export class StateMachineWatcher {
           if (classified.retryable && broadcastTxHash !== undefined) {
             const recovered = await this.recoverBroadcastSubmission(eventSubmitConfig, signal, broadcastTxHash);
             if (recovered) {
-              jobSubmissions.push(toJobSubmission(signalIndex, attemptForSignal, recovered));
+              appendJobSubmission(jobSubmissions, toJobSubmission(signalIndex, attemptForSignal, recovered));
               currentJob = await this.updateJob(job.id, {
                 updatedAt: this.config.now(),
                 submissions: jobSubmissions,
@@ -1167,7 +1266,7 @@ export class StateMachineWatcher {
         const attempt = contextSubmissionCount;
         try {
           const result = await submitStateMachineSignal({ ...eventSubmitConfig, ...overrides }, signal);
-          jobSubmissions.push(toJobSubmission(signalIndex, attempt, result));
+          appendJobSubmission(jobSubmissions, toJobSubmission(signalIndex, attempt, result));
           currentJob = await this.updateJob(job.id, {
             updatedAt: this.config.now(),
             ...(result.dryRun ? {} : { lastSignalAttemptAt: this.config.now() }),
@@ -1234,39 +1333,100 @@ export class StateMachineWatcher {
       }
     }
 
-    const submissions = [];
+    const submissions: SubmitStateMachineSignalResult[] = [];
     const signals = normalizeHandlerResult(handlerResult);
-    // The plan-scoped submitSignal ABI requires the order
-    // planId. Resolution order: an explicit per-signal planId (handler-supplied
-    // or the new config `signals[].planId` field) wins; otherwise the planId
-    // decoded from the HookReady event itself (the event is the authoritative
-    // carrier, so it outranks any job-persisted value from older runs); the
-    // persisted job planId is the last resort. A handler-derived planId is
-    // persisted so manual retries can resubmit.
+    // Records appended from this point on are "this run"; the offset separates
+    // them from prior-run history for the terminal-status computation.
+    const priorSubmissionCount = jobSubmissions.length;
+    // The plan-scoped submitSignal ABI requires the order planId, resolved per
+    // signal: an explicit pin (handler-supplied or the config
+    // `signals[].planId` field) wins; otherwise the planId decoded from the
+    // HookReady event itself (the authoritative carrier, so it outranks any
+    // job-persisted value from older runs); the persisted job planId is the
+    // last resort. A sibling signal's explicit pin is deliberately NOT a
+    // fallback: multi-signal handlers may mix pinned and unpinned signals, and
+    // borrowing one signal's pin for its siblings broadcast a planId the event
+    // never carried — an on-chain revert that dead-lettered the whole job.
     const eventPlanId = event.planId !== ZERO_BYTES32 ? event.planId : undefined;
-    const jobPlanId = signals.map((signal) => signal.planId).find((value) => value !== undefined)
-      ?? eventPlanId
-      ?? job.planId;
-    if (jobPlanId !== undefined && job.planId === undefined) {
+    const fallbackPlanId = eventPlanId ?? job.planId;
+    if (eventPlanId !== undefined && job.planId === undefined) {
       const withPlanId = await this.updateJob(job.id, {
         updatedAt: this.config.now(),
-        planId: normalizeBytes32(jobPlanId, 'job.planId'),
+        planId: normalizeBytes32(eventPlanId, 'job.planId'),
       });
       if (withPlanId) {
         job = withPlanId;
       }
     }
-    const fallbackPlanId = jobPlanId;
     // Resume support: a signal whose delivery is evidenced (receipt-confirmed
     // submission or duplicate_signal dedupe fact) is already on chain.
     // Re-running the job — manual `jobs retry` or a later scan of an open
     // job — must continue with the next pending signal instead of replaying
     // delivered ones; replaying them would dead-lock multi-signal jobs in
     // `ignored` on the first duplicate. Unconfirmed broadcasts are NOT here:
-    // the loop below re-checks their receipts first.
+    // the recheck below resolves them by receipt first.
     const deliveredSignalIndexes = options?.resubmitDelivered
       ? new Set<number>()
       : deliveredSignalIndexesFromSubmissions(currentJob.submissions);
+    // Receipt recheck for every broadcast whose outcome is still unknown — the
+    // returned-signal lane, the handler-context `submitSignal` lane, and
+    // indexes the handler no longer emits. A mined success settles the signal
+    // without a rebroadcast; a mined revert refutes the job whichever channel
+    // put the tx on chain (a `waitForReceipt:false` revert must not stay open
+    // forever); a receipt that cannot be obtained leaves the signal open for
+    // the next scan under the resend backoff.
+    for (const submission of [...currentJob.submissions]) {
+      if (submission.txHash === undefined || !isUnconfirmedBroadcast(submission, submission.signalIndex)) {
+        continue;
+      }
+      let receiptStatus: 'success' | 'reverted' | undefined;
+      try {
+        receiptStatus = await this.lookupBroadcastReceipt(eventSubmitConfig, submission.txHash);
+      } catch (error) {
+        const classified = classifyExecutorKitError(error);
+        attempts += 1;
+        const failed = await this.updateJob(job.id, {
+          status: jobStatusForError(classified),
+          updatedAt: this.config.now(),
+          attempts,
+          submissions: jobSubmissions,
+          lastError: classified,
+        });
+        return {
+          status: 'handled',
+          event,
+          matchedKey: resolved.key,
+          submissions,
+          job: failed,
+          error: classified,
+        };
+      }
+      if (receiptStatus === undefined) {
+        continue;
+      }
+      appendJobSubmission(jobSubmissions, {
+        signalIndex: submission.signalIndex,
+        attempt: nextSubmissionAttempt(jobSubmissions, submission.signalIndex),
+        dryRun: false,
+        ...(submission.request ? { request: submission.request } : {}),
+        txHash: submission.txHash,
+        confirmed: receiptStatus === 'success',
+      });
+      if (submission.request) {
+        submissions.push({
+          dryRun: false,
+          request: submission.request,
+          txHash: submission.txHash,
+          confirmed: receiptStatus === 'success',
+        });
+      }
+      deliveredSignalIndexes.add(submission.signalIndex);
+      currentJob = await this.updateJob(job.id, {
+        updatedAt: this.config.now(),
+        submissions: jobSubmissions,
+        clearLastError: true,
+      });
+    }
     let deferredResend = false;
     for (const [index, signal] of signals.entries()) {
       if (deliveredSignalIndexes.has(index)) {
@@ -1279,40 +1439,19 @@ export class StateMachineWatcher {
           readyEventId: signal.readyEventId ?? event.eventId,
         };
         const priorUnconfirmedBroadcasts = unconfirmedBroadcastCount(currentJob.submissions, index);
-        if (priorUnconfirmedBroadcasts > 0) {
-          // Later-scan receipt recheck: an unconfirmed broadcast is settled by
-          // evidence first. Only a receipt that cannot be obtained falls
-          // through, and then the O13 resend backoff throttles the next
-          // rebroadcast (growing, capped wait anchored to
-          // lastSignalAttemptAt) so a rescan does not put the same
-          // transaction on chain once per poll round — the chain's
-          // idempotency key stays the dedupe anchor.
-          const latestTxHash = latestUnconfirmedBroadcastTxHash(currentJob.submissions, index);
-          const recovered = latestTxHash !== undefined
-            ? await this.recoverBroadcastSubmission(eventSubmitConfig, resolvedSignal, latestTxHash)
-            : undefined;
-          if (recovered) {
-            jobSubmissions.push(toJobSubmission(index, priorUnconfirmedBroadcasts + 1, recovered));
-            currentJob = await this.updateJob(job.id, {
-              updatedAt: this.config.now(),
-              lastSignalAttemptAt: this.config.now(),
-              submissions: jobSubmissions,
-              clearLastError: true,
-            });
-            submissions.push(recovered);
-            deliveredSignalIndexes.add(index);
+        if (priorUnconfirmedBroadcasts > 0 && options?.bypassResendBackoff !== true) {
+          // O13 resend backoff: a rescan must not put the same transaction on
+          // chain once per poll round — a growing, capped wait anchored to
+          // lastSignalAttemptAt throttles the rebroadcast. A missing or
+          // unparseable anchor loses the clock: the resend goes out
+          // immediately instead of deferring forever on an anchor that never
+          // existed (updatedAt is no substitute — it moves on unrelated
+          // bookkeeping every round).
+          const requiredDelayMs = resendBackoffDelayMs(this.config.resendBackoff, priorUnconfirmedBroadcasts);
+          const lastAttemptAtMs = Date.parse(currentJob.lastSignalAttemptAt ?? '');
+          if (Number.isFinite(lastAttemptAtMs) && this.config.nowMs() - lastAttemptAtMs < requiredDelayMs) {
+            deferredResend = true;
             continue;
-          }
-          if (options?.bypassResendBackoff !== true) {
-            const requiredDelayMs = resendBackoffDelayMs(this.config.resendBackoff, priorUnconfirmedBroadcasts);
-            const lastAttemptAtMs = Date.parse(currentJob.lastSignalAttemptAt ?? currentJob.updatedAt);
-            // A missing/unparseable anchor loses the clock: fall through to the
-            // resend (chain idempotency stays the dedupe anchor) instead of
-            // deferring forever.
-            if (Number.isFinite(lastAttemptAtMs) && this.config.nowMs() - lastAttemptAtMs < requiredDelayMs) {
-              deferredResend = true;
-              continue;
-            }
           }
         }
         const result = await submitSignalWithJobRetry(resolvedSignal, index);
@@ -1355,12 +1494,13 @@ export class StateMachineWatcher {
       }
     }
 
-    const finalStatus = statusForCompletedRun(
-      submissions,
-      deliveredSignalIndexes.size,
-      signals.length,
-      this.config.dryRun,
-    );
+    const finalStatus = statusForCompletedRun({
+      dryRun: this.config.dryRun,
+      deliveredSignalIndexes,
+      signals,
+      jobSubmissions,
+      thisRunSubmissions: jobSubmissions.slice(priorSubmissionCount),
+    });
     if (deferredResend) {
       // A deferred signal keeps the job open. Preserve updatedAt: rewriting
       // now() would restart the backoff clock on every deferred round.
@@ -1453,25 +1593,16 @@ export class StateMachineWatcher {
   }
 
   /**
-   * Replay guard for retryable broadcast failures: consult the receipt of the
-   * already-broadcast transaction before any rebroadcast.
-   *
-   * - receipt mined with status success: returns a confirmed submission result
-   *   built from the recovered tx, so no second transaction is sent;
-   * - receipt mined with a non-success status: the broadcast definitively
-   *   reverted, so rebroadcasting is pointless — throws the same
-   *   non-retryable receipt error as the direct receipt path;
-   * - receipt unavailable (lookup threw, client cannot look receipts up, or
-   *   the tx is not mined yet): returns undefined. "Unavailable" is not
-   *   provable absence, so callers must NOT rebroadcast on it — the in-run
-   *   retry defers the signal and later scans re-check this receipt (under
-   *   the resend backoff) until it resolves.
+   * Direct receipt lookup shared by both recheck lanes. Resolves 'success' or
+   * 'reverted' for a mined transaction, and undefined when the receipt cannot
+   * be obtained (lookup threw, client cannot look receipts up, or the tx is not
+   * mined yet) — "unavailable" is not provable absence, so callers must NOT
+   * rebroadcast on it.
    */
-  private async recoverBroadcastSubmission(
+  private async lookupBroadcastReceipt(
     config: NormalizedSubmitConfig,
-    signal: StateMachineSignal,
     txHash: Hex,
-  ): Promise<SubmitStateMachineSignalResult | undefined> {
+  ): Promise<'success' | 'reverted' | undefined> {
     const client = getPublicClient(config);
     if (!client.getTransactionReceipt) {
       return undefined;
@@ -1488,11 +1619,37 @@ export class StateMachineWatcher {
     if (receipt.status && receipt.status !== 'success') {
       throw new SubmitSignalReceiptError(txHash, `submitSignal transaction receipt status ${receipt.status}`);
     }
+    return receipt.status === 'success' ? 'success' : undefined;
+  }
+
+  /**
+   * Replay guard for retryable broadcast failures: consult the receipt of the
+   * already-broadcast transaction before any rebroadcast.
+   *
+   * - receipt mined with status success: returns a confirmed submission result
+   *   built from the recovered tx, so no second transaction is sent;
+   * - receipt mined with a non-success status: the broadcast definitively
+   *   reverted, so rebroadcasting is pointless — throws the same
+   *   non-retryable receipt error as the direct receipt path;
+   * - receipt unavailable: returns undefined. "Unavailable" is not provable
+   *   absence, so callers must NOT rebroadcast on it — the in-run retry defers
+   *   the signal and later scans re-check this receipt (under the resend
+   *   backoff) until it resolves.
+   */
+  private async recoverBroadcastSubmission(
+    config: NormalizedSubmitConfig,
+    signal: StateMachineSignal,
+    txHash: Hex,
+  ): Promise<SubmitStateMachineSignalResult | undefined> {
+    const receiptStatus = await this.lookupBroadcastReceipt(config, txHash);
+    if (receiptStatus === undefined) {
+      return undefined;
+    }
     return {
       dryRun: false,
       request: buildSubmitStateMachineSignalCall(config, signal, config.walletAddress),
       txHash,
-      confirmed: receipt.status === 'success',
+      confirmed: receiptStatus === 'success',
     };
   }
 
@@ -1597,15 +1754,6 @@ export class StateMachineWatcher {
       }
     }
     return results;
-  }
-
-  private recordCheckpoint(blockNumber: bigint, blockHash: string): void {
-    this.checkpoints = this.checkpoints.filter((checkpoint) => checkpoint.blockNumber !== blockNumber);
-    this.checkpoints.push({ blockNumber, blockHash });
-    this.checkpoints.sort((left, right) => (left.blockNumber < right.blockNumber ? -1 : left.blockNumber > right.blockNumber ? 1 : 0));
-    // Trim the stored body, not just a read view: every round used to re-sort
-    // and re-persist the full anchor history (~150k/day), unbounded.
-    this.checkpoints = this.checkpoints.slice(-this.config.reorgWindow);
   }
 
   /**
@@ -2118,9 +2266,9 @@ export function createStateMachineHandlersFromConfig(
         // orderId:hookId:signalName collapsed a re-emitted HookReady for the
         // same (order, hook) and distinct sources behind the same signalName
         // onto one chain idempotency key. Omitting the field lets the SDK
-        // default (orderId:sourceId:signalId:readyEventId) apply — the same
-        // caliber for config and SDK producers, with the event and signal
-        // dimensions included.
+        // default apply — the logical (planId, orderId, sourceId, signalId)
+        // tuple the contract itself dedupes on, the same caliber for config
+        // and SDK producers.
       })),
     ]),
   );
@@ -2319,9 +2467,17 @@ function normalizeStateMachineSignal(signal: StateMachineSignal): StateMachineSi
   // ABI, bytes32(0) is the legitimate encoding of "no payload" (see EXEC-3 ruling).
   // A producer omitting payloadHash is asserting an empty payload on chain.
   const payloadHash = signal.payloadHash ? normalizeBytes32(signal.payloadHash, 'payloadHash') : ZERO_BYTES32;
+  // Signal attribution is mandatory: hashing the empty string here minted one
+  // constant pseudo sourceId shared by every unattributed signal, silently
+  // collapsing the chain's (…, sourceId, signalId) identity across producers.
+  if (signal.sourceId === undefined && (signal.source ?? '').trim().length === 0) {
+    throw new ValidationError(
+      'signal.source (or signal.sourceId) is required to submit a state machine signal: without an explicit source the sourceId would be a constant keccak("") shared by every unattributed signal',
+    );
+  }
   const sourceId = signal.sourceId
     ? normalizeBytes32(signal.sourceId, 'sourceId')
-    : hashText(signal.source ?? '', 'source');
+    : hashText(signal.source!, 'source');
   const signalName = signal.signalName && signal.stageIdentifier && !signal.signalName.includes('.')
     ? `${signal.stageIdentifier}.${signal.signalName}`
     : signal.signalName;
@@ -2335,9 +2491,16 @@ function normalizeStateMachineSignal(signal: StateMachineSignal): StateMachineSi
     sourceId,
     signalId,
     payloadHash,
+    // Default keyed to the contract's SignalAlreadyExists tuple
+    // (planId, orderId, sourceId, signalId): the same logical signal keeps the
+    // same key even when its HookReady event is re-emitted in a new
+    // transaction after a deep reorg, so the chain's dedupe sees one identity
+    // instead of a fresh key per event anchor (which put a guaranteed-reverting
+    // duplicate broadcast on chain). `readyEventId` stays off-chain
+    // correlation metadata, never part of the chain identity.
     idempotencyKey: signal.idempotencyKey
       ? hashText(signal.idempotencyKey, 'idempotencyKey')
-      : hashText(`${orderId}:${sourceId}:${signalId}:${signal.readyEventId ?? ZERO_BYTES32}`, 'idempotencyKey'),
+      : hashText(`${planId}:${orderId}:${sourceId}:${signalId}`, 'idempotencyKey'),
   };
 }
 
@@ -2566,29 +2729,53 @@ function* walkSubmissionErrorChain(error: unknown): Generator<Error> {
 }
 
 /**
- * Terminal status for a run that submitted (or resumed) every signal without a
- * failure: `confirmed` only when the whole signal set is delivered and every
- * this-run submission observed a successful receipt; `submitted` when at least
- * one real broadcast happened but confirmation is incomplete (including fully
- * resumed runs that had nothing new to send); `matched` for dry-runs and
- * handler-only runs with nothing to broadcast.
+ * Terminal status for a run that processed (or resumed) its signals, over both
+ * submission lanes:
+ *
+ * - `confirmed`: every signal — returned and handler-context — is delivered,
+ *   every successful this-run submission (broadcast or receipt-recovered)
+ *   observed a successful receipt, and no broadcast is left unresolved;
+ * - `submitted`: any real broadcast happened or remains unresolved — including
+ *   a handler that stopped emitting signals an earlier run had already
+ *   broadcast (an unresolved broadcast keeps the job in the revisit lane
+ *   whatever the handler now returns) and fully resumed runs with nothing new
+ *   to send;
+ * - `matched`: dry-runs and handler-only runs with nothing to broadcast.
  */
-function statusForCompletedRun(
-  submissions: readonly SubmitStateMachineSignalResult[],
-  deliveredSignalCount: number,
-  totalSignals: number,
-  dryRun: boolean,
-): StateMachineJobStatus {
-  if (dryRun) {
+function statusForCompletedRun(input: {
+  readonly dryRun: boolean;
+  readonly deliveredSignalIndexes: ReadonlySet<number>;
+  readonly signals: readonly StateMachineSignal[];
+  readonly jobSubmissions: readonly StateMachineJobSubmission[];
+  readonly thisRunSubmissions: readonly StateMachineJobSubmission[];
+}): StateMachineJobStatus {
+  if (input.dryRun) {
     return 'matched';
   }
-  const allDelivered = totalSignals > 0 && deliveredSignalCount >= totalSignals;
-  const allThisRunConfirmed = submissions.length > 0
-    && submissions.every((submission) => !submission.dryRun && submission.confirmed);
-  if (allDelivered && allThisRunConfirmed) {
+  const contextSignalCount = new Set(
+    input.jobSubmissions.filter((submission) => submission.signalIndex < 0).map((submission) => submission.signalIndex),
+  ).size;
+  const deliveredContextCount = [...input.deliveredSignalIndexes].filter((index) => index < 0).length;
+  const returnedComplete = input.signals.every((_signal, index) => input.deliveredSignalIndexes.has(index));
+  const contextComplete = deliveredContextCount >= contextSignalCount;
+  const observedThisRun = input.thisRunSubmissions
+    .filter((submission) => submission.dryRun !== true && submission.error === undefined);
+  const allObservedConfirmed = observedThisRun.length > 0 && observedThisRun.every((submission) => submission.confirmed === true);
+  const unresolvedBroadcasts = input.jobSubmissions
+    .filter((submission) => isUnconfirmedBroadcast(submission, submission.signalIndex)
+      && !input.deliveredSignalIndexes.has(submission.signalIndex))
+    .length;
+  const hasRealBroadcast = input.jobSubmissions.some((submission) => submission.dryRun !== true);
+  if (
+    returnedComplete
+    && contextComplete
+    && input.signals.length + contextSignalCount > 0
+    && allObservedConfirmed
+    && unresolvedBroadcasts === 0
+  ) {
     return 'confirmed';
   }
-  if (submissions.length > 0 || deliveredSignalCount > 0) {
+  if (input.thisRunSubmissions.length > 0 || input.deliveredSignalIndexes.size > 0 || hasRealBroadcast) {
     return 'submitted';
   }
   return 'matched';
@@ -2638,18 +2825,34 @@ function unconfirmedBroadcastCount(
   return submissions.filter((submission) => isUnconfirmedBroadcast(submission, signalIndex)).length;
 }
 
-/** Newest unconfirmed broadcast tx for one signal, for the receipt recheck. */
-function latestUnconfirmedBroadcastTxHash(
-  submissions: readonly StateMachineJobSubmission[],
-  signalIndex: number,
-): Hex | undefined {
-  for (let index = submissions.length - 1; index >= 0; index -= 1) {
-    const submission = submissions[index];
-    if (submission && isUnconfirmedBroadcast(submission, signalIndex)) {
-      return submission.txHash;
+/**
+ * Append a submission record to the audit trail. Dry-run records are
+ * simulations of one deterministic request per signal: a replayed dry-run must
+ * not append a duplicate (the record list grew once per signal per rescan).
+ * Real broadcasts are never deduped — each is a distinct on-chain fact.
+ */
+function appendJobSubmission(
+  submissions: StateMachineJobSubmission[],
+  candidate: StateMachineJobSubmission,
+): void {
+  if (candidate.dryRun === true) {
+    const duplicate = submissions.some((submission) =>
+      submission.dryRun === true
+      && submission.signalIndex === candidate.signalIndex
+      && submission.request?.data === candidate.request?.data);
+    if (duplicate) {
+      return;
     }
   }
-  return undefined;
+  submissions.push(candidate);
+}
+
+/** Next per-signal attempt ordinal for a recovered/replayed record. */
+function nextSubmissionAttempt(
+  submissions: readonly StateMachineJobSubmission[],
+  signalIndex: number,
+): number {
+  return submissions.filter((submission) => submission.signalIndex === signalIndex).length + 1;
 }
 
 /** Exponential resend delay capped at maxDelayMs. */
@@ -2950,6 +3153,26 @@ async function tryGetBlockHash(client: StateMachinePublicClient, blockNumber: bi
 
 function sameBlockHash(left: string, right: string): boolean {
   return left.toLowerCase() === right.toLowerCase();
+}
+
+/**
+ * Record one (height, hash) anchor into a checkpoint list, in place: dedupe
+ * by height, keep the list sorted, and trim the stored body (not just a read
+ * view) to the reorg window — every round used to re-sort and re-persist the
+ * full anchor history (~150k/day), unbounded.
+ */
+function recordCheckpoint(
+  checkpoints: StateMachineCursorCheckpoint[],
+  blockNumber: bigint,
+  blockHash: string,
+  reorgWindow: number,
+): void {
+  const filtered = checkpoints.filter((checkpoint) => checkpoint.blockNumber !== blockNumber);
+  filtered.push({ blockNumber, blockHash });
+  filtered.sort((left, right) => (left.blockNumber < right.blockNumber ? -1 : left.blockNumber > right.blockNumber ? 1 : 0));
+  const trimmed = filtered.slice(-reorgWindow);
+  checkpoints.length = 0;
+  checkpoints.push(...trimmed);
 }
 
 /**
