@@ -201,6 +201,24 @@ describe('executor-kit classification completeness against the taxonomy', () => 
     expect(attrs.dead_letter).toBe(false);
   });
 
+  it('keeps public 0x-prefixed identifiers in classified messages while redacting bare key material', () => {
+    // F191: the redactor swept every 66-char 0x-prefixed value — including
+    // tx hashes operators need for correlation — into [redacted]; only bare
+    // 64-hex key material (the shape of raw key echoes) is redacted now.
+    const receiptError = classifyExecutorKitError(new SubmitSignalReceiptError(
+      TX_HASH,
+      `submitSignal transaction receipt wait failed for ${TX_HASH}: Request timed out.`,
+      { cause: new Error('Request timed out.') },
+    ));
+    expect(receiptError.message).toContain(TX_HASH);
+    expect(receiptError.message).not.toContain('[redacted');
+
+    const bareKey = 'ab'.repeat(32);
+    const leaked = classifyExecutorKitError(new Error(`signing failed with key ${bareKey}`));
+    expect(leaked.message).not.toContain(bareKey);
+    expect(leaked.message).toContain('[redacted-32-byte-hex]');
+  });
+
   it('pins the state-machine job status lanes that consume the classification', () => {
     // jobStatusForError semantics (watcher.ts): benign kinds -> `ignored`,
     // retryable -> `failed`, non-retryable -> `dead_letter`. Pinned here via
