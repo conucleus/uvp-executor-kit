@@ -414,13 +414,18 @@ Watcher job semantics:
   acceptance window (5 minutes by default), and `createWebhookReplayGuard`
   burns each nonce once inside the window — a captured `(body, signature)`
   pair can no longer be replayed forever.
-- The `serve` HTTP server's callback host whitelist is LOCAL HARNESS
-  positioning. It ships loopback hosts (`localhost`, `127.0.0.1`, `::1`) plus
-  the `UVP_EXECUTOR_CALLBACK_HOST_ALLOWLIST` env var so local tests can
-  dispatch to a co-located receiver; it is an anti-footgun for the reference
-  harness, not an egress policy. A production callback dispatcher (real
-  network policy, credential handling, audit) is a separately designed and
-  deployed component — do not harden this whitelist into one.
+- The `serve` HTTP server's callback egress is EXPLICIT ALLOWLIST ONLY: no
+  host — loopback included — is allowed by default, and starting the server
+  with an empty allowlist fails loudly. Allowlist callback hosts (including
+  `127.0.0.1` for a co-located local harness receiver) via the
+  `UVP_EXECUTOR_CALLBACK_HOST_ALLOWLIST` env var (comma-separated) or the
+  `callbackHostAllowlist` option. An implicitly loopback-open executor was a
+  probe proxy for the host's local services, with endpoint responses readable
+  back through the jobs API (delivery errors echo at most a bounded prefix of
+  the response body). A production callback dispatcher (real network policy,
+  credential handling, audit) is a separately designed and deployed
+  component — this allowlist is the kit's own fail-closed floor, not that
+  policy.
 
 ## SDK Surface
 

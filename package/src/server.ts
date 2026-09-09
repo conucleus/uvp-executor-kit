@@ -24,8 +24,6 @@ export const WEBHOOK_NONCE_HEADER = 'x-uvp-webhook-nonce';
 export const DEFAULT_WEBHOOK_TIMESTAMP_TOLERANCE_MS = 5 * 60_000;
 const DEFAULT_WEBHOOK_REPLAY_MAX_NONCES = 10_000;
 
-const LOOPBACK_CALLBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
-
 export interface ExecutorStaticHandlerDefinition {
   readonly source: string;
   readonly stageIdentifier: string;
@@ -213,6 +211,16 @@ export async function startExecutorServer(options: ExecutorServerOptions): Promi
   const callbackToken = requireNonEmpty(options.callbackToken, 'callbackToken');
   const callbackHmacSecret = options.callbackHmacSecret?.trim() || undefined;
   const callbackHostAllowlist = options.callbackHostAllowlist ?? parseCallbackHostAllowlist(process.env[DEFAULT_CALLBACK_HOST_ALLOWLIST_ENV]);
+  if (callbackHostAllowlist.length === 0) {
+    // Default deny: an empty allowlist used to mean "loopback allowed", which
+    // let any dispatcher turn the executor into a probe proxy for the host's
+    // local services with the response readable back through the jobs API.
+    throw new ValidationError(
+      `callback host allowlist is empty: set ${DEFAULT_CALLBACK_HOST_ALLOWLIST_ENV}`
+      + ' (comma-separated hosts, loopback included) or pass callbackHostAllowlist;'
+      + ' no callback URL is allowed by default',
+    );
+  }
   const now = options.now ?? (() => new Date().toISOString());
   const fetchImpl = options.fetchImpl ?? fetch;
   const jobStore = options.jobStore ?? new InMemoryExecutorJobStore();
@@ -431,8 +439,12 @@ async function postSignalCallback(
   });
   if (!response.ok) {
     // Includes every 3xx (and the status-0 opaqueredirect response a manual
-    // redirect policy yields): a redirecting callback endpoint failed.
-    throw new Error(`callback endpoint failed with ${response.status}: ${await response.text()}`);
+    // redirect policy yields): a redirecting callback endpoint failed. The
+    // body echo is bounded because it lands in the job record the jobs API
+    // reads back — the delivery error must not become an unbounded read
+    // channel for whatever the callback endpoint returned.
+    const body = (await response.text()).slice(0, 512);
+    throw new Error(`callback endpoint failed with ${response.status}: ${body}`);
   }
 }
 
@@ -668,10 +680,15 @@ export function assertCallbackUrlAllowed(callbackUrl: string, allowlist: readonl
     throw new ValidationError(`callbackUrl scheme must be http or https, got ${url.protocol}`);
   }
   const hostname = normalizeCallbackHost(url.hostname);
-  if (LOOPBACK_CALLBACK_HOSTS.has(hostname) || allowlist.includes(hostname)) {
+  // Explicit allowlist only — loopback included. The executor must never be a
+  // default-open proxy into the host's local services.
+  if (allowlist.includes(hostname)) {
     return;
   }
-  throw new ValidationError(`callbackUrl host is not allowed: ${hostname}`);
+  throw new ValidationError(
+    `callbackUrl host is not allowed: ${hostname}`
+    + `; allowlist it via ${DEFAULT_CALLBACK_HOST_ALLOWLIST_ENV} or the callbackHostAllowlist option`,
+  );
 }
 
 function normalizeCallbackHost(host: string): string {
