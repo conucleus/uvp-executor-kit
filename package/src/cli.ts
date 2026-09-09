@@ -41,6 +41,7 @@ import {
   DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV,
   FileStateMachineCursorStore,
   FileStateMachineJobStore,
+  acquireWatcherStateDirLock,
   createStateMachineHandlersFromConfig,
   createStateMachineWatcher,
   deadLetterStateMachineJob,
@@ -52,6 +53,7 @@ import {
   submitStateMachineSignal,
   type StateMachineCursorStore,
   type StateMachineJobStore,
+  type WatcherStateDirLock,
 } from './watcher.js';
 import {
   addressFromPrivateKey,
@@ -565,13 +567,17 @@ export function buildProgram(): Command {
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainWatchOptions) => {
-      const { watcher, storage } = await buildStateMachineWatcherFromCli(options);
-      const poll = await watcher.pollOnce();
-      console.log(stringifyForTransport({ watcher: watcher.describe(), storage, poll }));
-      // Honest exit code: submission errors folded into the poll result (or
-      // failed/dead-lettered jobs) must not masquerade as a successful run.
-      if (chainPollExecutionFailed(poll)) {
-        process.exitCode = 1;
+      const { watcher, storage, stateLock } = await buildStateMachineWatcherFromCli(options);
+      try {
+        const poll = await watcher.pollOnce();
+        console.log(stringifyForTransport({ watcher: watcher.describe(), storage, poll }));
+        // Honest exit code: submission errors folded into the poll result (or
+        // failed/dead-lettered jobs) must not masquerade as a successful run.
+        if (chainPollExecutionFailed(poll)) {
+          process.exitCode = 1;
+        }
+      } finally {
+        await stateLock?.release();
       }
     });
 
@@ -595,7 +601,7 @@ export function buildProgram(): Command {
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainWatchOptions) => {
-      const { watcher, storage } = await buildStateMachineWatcherFromCli(options);
+      const { watcher, storage, stateLock } = await buildStateMachineWatcherFromCli(options);
       console.log(stringifyForTransport({ watcher: watcher.describe(), storage }));
       const handle = await watcher.start();
       try {
@@ -610,6 +616,9 @@ export function buildProgram(): Command {
         ]);
       } finally {
         await handle.stop();
+        // Signal shutdown paths run through waitForShutdown -> stop(); the
+        // state-dir lock must not outlive the watcher process either way.
+        await stateLock?.release();
       }
     });
 
@@ -780,6 +789,8 @@ export function resolveWatcherStorage(
 async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Promise<{
   watcher: ReturnType<typeof createStateMachineWatcher>;
   storage: WatcherStorageSummary;
+  /** Held for the process lifetime in file mode; release on exit (including signal shutdown). */
+  stateLock?: WatcherStateDirLock | undefined;
 }> {
   const config = await loadStateMachineHandlerConfig(options.config);
   const configuredStateMachines = config.stateMachines ?? [];
@@ -801,6 +812,11 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Prom
     throw new ValidationError('missing state machine address: pass --state-machine or set stateMachines[] in config');
   }
   const storage = resolveWatcherStorage(options);
+  // File 模式下 state-dir 由一个 watcher 进程独占：启动即取进程锁，
+  // 既有锁的持有进程存活时直接拒绝（fail-closed），崩溃残留锁接管。
+  const stateLock = storage.summary.mode === 'file'
+    ? await acquireWatcherStateDirLock(storage.summary.stateDir)
+    : undefined;
   const effectiveDryRun = options.dryRun ?? config.dryRun ?? false;
   if (options.dryRun === undefined && config.dryRun === true) {
     // The config-level dryRun silently overrides the documented "real
@@ -839,7 +855,7 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Prom
       console.error(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
     },
   });
-  return { watcher, storage: storage.summary };
+  return { watcher, storage: storage.summary, stateLock };
 }
 
 async function validateConfigFromCli(options: ConfigValidateOptions): Promise<Record<string, unknown>> {

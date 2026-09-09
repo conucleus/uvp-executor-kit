@@ -1,5 +1,5 @@
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import {
   createPublicClient,
@@ -629,6 +629,92 @@ async function isStaleJobsFileLock(lockPath: string): Promise<boolean> {
     return Date.now() - info.mtimeMs > JOBS_FILE_LOCK_STALE_MS;
   } catch {
     return false;
+  }
+}
+
+export const WATCHER_STATE_DIR_LOCK_FILE_NAME = 'watcher.lock';
+
+export interface WatcherStateDirLock {
+  readonly lockPath: string;
+  readonly pid: number;
+  /** Release is idempotent: a second call is a no-op. */
+  release(): Promise<void>;
+}
+
+/**
+ * 进程级互斥：jobs 文件锁只串行化单次读改写，挡不住两个 watcher 进程共用同一
+ * state-dir 时交错扫描与推进同一 cursor（丢事件/回绕扫描）。启动锁是 O_EXCL
+ * 标记文件 + pid 存活判定：既有锁的 pid 存活即启动拒绝（报出持有者），
+ * pid 不存活即崩溃残留，接管重写；无 pid 可读时退回按文件年龄判陈旧。
+ */
+export async function acquireWatcherStateDirLock(stateDir: string): Promise<WatcherStateDirLock> {
+  if (!stateDir || stateDir.trim().length === 0) {
+    throw new ValidationError('state dir path is required');
+  }
+  await mkdir(stateDir, { recursive: true });
+  const lockPath = join(stateDir, WATCHER_STATE_DIR_LOCK_FILE_NAME);
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await writeFile(lockPath, `${process.pid}\n`, { flag: 'wx' });
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== 'EEXIST') {
+        throw error;
+      }
+      if (attempt >= 3) {
+        throw new ExecutorKitError(
+          `timed out acquiring the watcher state dir lock ${lockPath}: the existing lock could not be taken over`,
+        );
+      }
+      const holderPid = await readWatcherStateDirLockPid(lockPath);
+      if (holderPid !== undefined && isProcessAlive(holderPid)) {
+        throw new ExecutorKitError(
+          `watcher state dir ${stateDir} is locked by running process ${holderPid} (${lockPath});`
+          + ' concurrent watchers must not share one state dir, stop the holder first',
+        );
+      }
+      // 崩溃残留（pid 已死），或锁无 pid 且已老化到可判定为残留：接管重写。
+      const takeOver = holderPid !== undefined || await isStaleJobsFileLock(lockPath);
+      if (!takeOver) {
+        throw new ExecutorKitError(
+          `watcher state dir lock ${lockPath} holds no readable pid and is not stale yet;`
+          + ' after confirming no watcher is running, remove the file and retry',
+        );
+      }
+      await rm(lockPath, { force: true }).catch(() => undefined);
+      continue;
+    }
+    let released = false;
+    return {
+      lockPath,
+      pid: process.pid,
+      release: async () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        await rm(lockPath, { force: true }).catch(() => undefined);
+      },
+    };
+  }
+}
+
+async function readWatcherStateDirLockPid(lockPath: string): Promise<number | undefined> {
+  try {
+    const content = await readFile(lockPath, 'utf8');
+    const pid = Number.parseInt(content.trim(), 10);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Signal 0 探测存活；EPERM 表示进程存在但属主不同，仍算存活。 */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return isNodeError(error) && error.code === 'EPERM';
   }
 }
 
