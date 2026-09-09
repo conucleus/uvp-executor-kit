@@ -787,9 +787,9 @@ describe('state machine chain watcher', () => {
   });
 
   it('keeps the watch loop alive with backed-off retries when every poll keeps failing', async () => {
-    // F9: a permanent clearInterval abort after a few consecutive failures
-    // had no recovery path — a transient RPC outage killed the listener until
-    // a human restarted the process. The loop now reports through onError and
+    // a permanent clearInterval abort after a few consecutive failures
+    // has no recovery path — a transient RPC outage would kill the listener
+    // until a human restarted the process. The loop reports through onError and
     // slows down (capped exponential backoff) instead of stopping.
     const errors: unknown[] = [];
     let polls = 0;
