@@ -45,8 +45,8 @@ describe('executor HTTP server', () => {
     expect(verify()).toBe(true);
     expect(verify({ nonce: 'b'.repeat(32) })).toBe(false);
     expect(verify({ timestamp: '1799000000' })).toBe(false);
-    // A captured (body, signature) pair without timestamp+nonce no longer
-    // verifies: the bare-body HMAC was permanently replayable.
+    // A captured (body, signature) pair without timestamp+nonce does not
+    // verify: a bare-body HMAC would be permanently replayable.
     expect(verifyWebhookSignature(body, signature, callbackToken)).toBe(false);
     // Outside the acceptance window the signature is stale even when intact.
     expect(verify({ nowMs: () => 1_800_000_000_000 + 5 * 60_000 + 1 })).toBe(false);

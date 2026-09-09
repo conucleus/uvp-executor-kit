@@ -20,7 +20,7 @@ export const DEFAULT_CALLBACK_RETRY_BASE_DELAY_MS = 250;
 export const WEBHOOK_SIGNATURE_HEADER = 'x-uvp-webhook-signature';
 export const WEBHOOK_TIMESTAMP_HEADER = 'x-uvp-webhook-timestamp';
 export const WEBHOOK_NONCE_HEADER = 'x-uvp-webhook-nonce';
-/** Acceptance window for the webhook timestamp; outside it a captured request no longer verifies. */
+/** Acceptance window for the webhook timestamp; outside it a captured request cannot be verified. */
 export const DEFAULT_WEBHOOK_TIMESTAMP_TOLERANCE_MS = 5 * 60_000;
 const DEFAULT_WEBHOOK_REPLAY_MAX_NONCES = 10_000;
 
@@ -212,7 +212,7 @@ export async function startExecutorServer(options: ExecutorServerOptions): Promi
   const callbackHmacSecret = options.callbackHmacSecret?.trim() || undefined;
   const callbackHostAllowlist = options.callbackHostAllowlist ?? parseCallbackHostAllowlist(process.env[DEFAULT_CALLBACK_HOST_ALLOWLIST_ENV]);
   if (callbackHostAllowlist.length === 0) {
-    // Default deny: an empty allowlist used to mean "loopback allowed", which
+    // Default deny: an implicit "loopback allowed" for an empty allowlist would
     // let any dispatcher turn the executor into a probe proxy for the host's
     // local services with the response readable back through the jobs API.
     throw new ValidationError(

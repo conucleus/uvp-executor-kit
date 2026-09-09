@@ -259,11 +259,11 @@ describe('executor CLI', () => {
     ])).rejects.toThrow(/--payload-ref is not supported by chain-signal/);
   });
 
-  it('no longer exposes --ready-event-id on chain-signal', async () => {
-    // The readyEventId explicit input surface is deleted (audit ruling #10):
+  it('rejects --ready-event-id on chain-signal', async () => {
+    // The readyEventId explicit input surface is deleted:
     // the off-chain HookReady anchor never participated in the chain identity
     // or the default idempotency key, so the flag was dead input. Commander
-    // now treats it as an unknown option and exits 1 (the CLI harness turns
+    // treats it as an unknown option and exits 1 (the CLI harness turns
     // process.exit into a rejection) instead of accepting and silently
     // dropping it.
     await expect(main([
@@ -618,9 +618,9 @@ describe('watcher state storage', () => {
       expect(firstRun.watcher?.jobStore).toBe('file');
       expect(firstRun.watcher?.nextBlock).toBe('13');
       expect(firstRun.poll?.fromBlock).toBe('10');
-      // The config-only handler carries no planId, and since the planId fix it
-      // no longer needs one: the planId decoded from the HookReady event feeds
-      // the submission, so the dry-run scan succeeds and exits 0.
+      // The config-only handler carries no planId and needs none: the planId
+      // decoded from the HookReady event feeds the submission, so the dry-run
+      // scan succeeds and exits 0.
       expect(process.exitCode).toBeUndefined();
 
       const storedCursor = JSON.parse(
@@ -743,10 +743,10 @@ describe('watcher state storage', () => {
   });
 
   it('ships a bundled demo config that loads, defaults to real execution, and can actually match', async () => {
-    // the fixture used to pin dryRun:true (silently overriding the
-    // documented real-execution default) and keyed its handler by
-    // stage#hookName text, which never matches without an artifact index —
-    // the demo could never submit anything.
+    // the fixture must honor the documented real-execution default (no
+    // silent dryRun:true override) and key its handler through the artifact
+    // index — a stage#hookName text key never matches, and the demo must be
+    // able to actually submit.
     const config = await loadStateMachineHandlerConfig(
       new URL('../fixtures/state-machine-executor.config.json', import.meta.url).pathname,
     );

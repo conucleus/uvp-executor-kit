@@ -784,10 +784,11 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Prom
   const config = await loadStateMachineHandlerConfig(options.config);
   const configuredStateMachines = config.stateMachines ?? [];
   if (options.stateMachine && configuredStateMachines.length > 0) {
-    // Coexistence used to let config stateMachines[] silently override the
-    // flag for the scan set: the operator believed machine A was watched
-    // while only the config set was scanned. Refuse and make the operator
-    // pick one source of truth instead of guessing.
+    // Coexistence of --state-machine and config stateMachines[] is ambiguous:
+    // a silent config override of the flag for the scan set would leave the
+    // operator believing machine A was watched while only the config set was
+    // scanned. Refuse and make the operator pick one source of truth instead
+    // of guessing.
     throw new ValidationError(
       `--state-machine ${options.stateMachine} conflicts with stateMachines[] in ${options.config}`
       + ' (the flag would be silently ignored by the scan set); configure the scanned state machines in exactly one place',

@@ -47,9 +47,9 @@ export const DEFAULT_FINALITY_CONFIRMATIONS = 1;
  */
 export const DEFAULT_REORG_WINDOW_BLOCKS = 64;
 /**
- * Max blocks per eth_getLogs request. Deep-lag catch-up rounds used to issue
- * one unbounded query that RPC providers reject outright, failing every round.
- * Mirrors the chain-services indexer span.
+ * Max blocks per eth_getLogs request. A deep-lag catch-up round issuing one
+ * unbounded query gets it rejected outright by RPC providers, failing every
+ * round. Mirrors the chain-services indexer span.
  */
 export const DEFAULT_GET_LOGS_BLOCK_SPAN = 9_999;
 /** Cap on the poll-delay multiplier during consecutive-failure backoff. */
@@ -582,8 +582,8 @@ export class InMemoryStateMachineJobStore implements StateMachineJobStore {
  * Cross-process exclusion for the jobs-file read-modify-write cycle. The whole
  * file is the store, so two processes (or two concurrent CLI invocations, e.g.
  * `jobs retry` against a running watcher) reading the same base and writing
- * their own view silently dropped each other's updates — including broadcasts
- * the audit trail then no longer carried. The lock is an O_EXCL marker file
+ * their own view would silently drop each other's updates — including
+ * broadcasts the audit trail would then lack. The lock is an O_EXCL marker file
  * broken by age (a crashed holder must not block the store forever).
  */
 const JOBS_FILE_LOCK_STALE_MS = 10_000;
@@ -1004,7 +1004,7 @@ export class StateMachineWatcher {
     }
 
     // Chunk deep ranges: one unbounded eth_getLogs over a large gap is exactly
-    // the query RPC providers reject, which used to fail every catch-up round.
+    // the query RPC providers reject; a rejected catch-up round fails wholesale.
     const logBatches = await Promise.all(
       this.config.stateMachines.map(async (deployment) => {
         const logs = (
@@ -1031,8 +1031,8 @@ export class StateMachineWatcher {
       results.push(await this.handleLog(log));
     }
     // Persistence is part of the round: save first, advance memory second. A
-    // save that fails after the memory advance used to leave the process
-    // holding an unpersisted skip interval — combined with a crash, blocks were
+    // save that fails after the memory advance leaves the process holding an
+    // unpersisted skip interval — combined with a crash, blocks would be
     // silently never rescanned by this or any restarted instance.
     const nextBlock = toBlock + 1n;
     // Stage this round's cursor evidence off to the side: persistence happens
@@ -1457,7 +1457,7 @@ export class StateMachineWatcher {
       : deliveredSignalIndexesFromSubmissions(currentJob.submissions);
     // Receipt recheck for every broadcast whose outcome is still unknown — the
     // returned-signal lane, the handler-context `submitSignal` lane, and
-    // indexes the handler no longer emits. A mined success settles the signal
+    // signals the handler no longer emits. A mined success settles the signal
     // without a rebroadcast; a mined revert refutes the job whichever channel
     // put the tx on chain (a `waitForReceipt:false` revert must not stay open
     // forever); a receipt that cannot be obtained leaves the signal open for
@@ -3116,8 +3116,9 @@ async function readStateMachineJobsFile(filePath: string): Promise<Map<Hex, Stat
   try {
     return parseStateMachineJobsFile(raw);
   } catch (error) {
-    // Quarantine-and-recover instead of throwing forever: a truncated write
-    // used to poison every later read, aborting the watch loop permanently.
+    // Quarantine-and-recover instead of throwing forever: an untreated
+    // truncated write poisons every later read and aborts the watch loop
+    // permanently.
     await quarantineCorruptStateFile(filePath, raw, error, 'jobs');
     return new Map();
   }
@@ -3142,8 +3143,8 @@ function parseStateMachineJobsFile(raw: string): Map<Hex, StateMachineWatcherJob
 
 /**
  * Whole-file persistence must be tmp+rename: a plain writeFile that crashes
- * mid-write leaves a truncated file that used to make every later parse throw
- * and eventually abort the watch loop.
+ * mid-write leaves a truncated file whose every later parse throws and
+ * eventually aborts the watch loop.
  */
 async function writeStateFileAtomically(filePath: string, contents: string): Promise<void> {
   await mkdir(dirname(filePath), { recursive: true });
@@ -3295,8 +3296,8 @@ function sameBlockHash(left: string, right: string): boolean {
 /**
  * Record one (height, hash) anchor into a checkpoint list, in place: dedupe
  * by height, keep the list sorted, and trim the stored body (not just a read
- * view) to the reorg window — every round used to re-sort and re-persist the
- * full anchor history (~150k/day), unbounded.
+ * view) to the reorg window — re-sorting and re-persisting the full anchor
+ * history every round would rewrite ~150k anchors/day, unbounded.
  */
 function recordCheckpoint(
   checkpoints: StateMachineCursorCheckpoint[],

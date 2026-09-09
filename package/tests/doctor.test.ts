@@ -461,8 +461,8 @@ describe('Product API doctor', () => {
 
   it('reports per-task readiness without wallet address as explicitly unverified', async () => {
     // Without a wallet the assignee check cannot run at all. The readiness
-    // must not claim a match it never made (assigneeMatch used to be
-    // unconditionally true here, printing an unverified "Ready to prepare");
+    // must not claim a match it never made (a missing wallet must not yield
+    // an unconditionally true assigneeMatch printing "Ready to prepare");
     // the SDK reports assigneeUnverified instead, and the CLI refuses
     // --task-id without --wallet-address entirely.
     const fetch: ProductApiFetch = async (url) => {
@@ -536,11 +536,9 @@ describe('Product API doctor', () => {
   });
 
   it('keeps the server canSubmit authoritative over the locally computed deadline', async () => {
-    // M7: the local clock used to veto canSubmit when it computed the
-    // deadline as expired, and naive deadline strings were parsed in the
-    // operator's local timezone. The deadline is display-only now (parsed as
-    // UTC), and the server's verdict wins even when the local computation
-    // says expired.
+    // The deadline is display-only (parsed as UTC): the local clock never
+    // vetoes canSubmit from its own expiry computation, and the server's
+    // verdict wins even when the local computation says expired.
     const fetch: ProductApiFetch = async (url) => {
       if (!url.includes('/product/')) {
         return jsonResponse({ service: 'chain-services' });
@@ -579,11 +577,10 @@ describe('Product API doctor', () => {
   });
 
   it('keeps the server blockedReason displayed even when the local clock computes the deadline as expired', async () => {
-    // Audit ruling #26 (residual): the local expiry computation used to win
-    // the nextAction label over the server's own blockedReason, masking the
-    // server's stated conclusion with a clock-derived verdict. The local
+    // The server's blockedReason always wins the nextAction label: the local
     // deadline stays display-only (deadlineExpired) and never rewrites the
-    // action guidance when the server gave a reason.
+    // action guidance with a clock-derived verdict when the server gave a
+    // reason.
     const fetch: ProductApiFetch = async (url) => {
       if (!url.includes('/product/')) {
         return jsonResponse({ service: 'chain-services' });
@@ -648,8 +645,8 @@ describe('Product API doctor', () => {
 describe('doctor CLI', () => {
   it('refuses --task-id without --wallet-address instead of printing unverified readiness', async () => {
     // without a wallet, assignee ownership cannot be checked at all —
-    // the readiness verdict used to print "Ready to prepare" anyway. The CLI
-    // now enforces what its option help always claimed.
+    // the readiness verdict must not print "Ready to prepare" anyway. The CLI
+    // enforces what its option help claims.
     await expect(main([
       'node',
       'uvp-executor',

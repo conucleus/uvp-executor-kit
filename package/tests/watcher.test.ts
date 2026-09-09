@@ -1107,10 +1107,10 @@ describe('state machine chain watcher', () => {
   });
 
   it('counts only real failures in attempts so completed dry-run multi-signal jobs stay retryable', async () => {
-    // 0200#19: attempts used to accumulate per signal x per attempt with
-    // successes included, so a finished dry-run multi-signal job hit the
-    // manual retry entry already >= maxAttempts and the dead-letter branch
-    // killed a job that had never failed once.
+    // attempts must count only real failures: accumulating per signal x per
+    // attempt with successes included would let a finished dry-run multi-
+    // signal job hit the manual retry entry already >= maxAttempts, and the
+    // dead-letter branch would kill a job that never failed once.
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',
       stateMachineAddress: STATE_MACHINE,
@@ -1269,9 +1269,9 @@ describe('state machine chain watcher', () => {
   });
 
   it('re-opens a confirmed job through the manual retry channel with forced resubmission', async () => {
-    // `confirmed` used to be a permanent lock — retry refused it, so a
-    // reorg that flipped the confirmation off the canonical chain left the
-    // job stuck with no human recovery. The retry now resubmits every signal
+    // `confirmed` must not be a permanent lock: a reorg that flips the
+    // confirmation off the canonical chain would leave the job stuck with
+    // no human recovery if retry refused it. The retry resubmits every signal
     // (the on-chain idempotency key absorbs a duplicate when the signal
     // actually survived).
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
@@ -1762,8 +1762,8 @@ describe('state machine chain watcher', () => {
 
   it('accepts a manual retry for a detected job stranded by a crash', async () => {
     // A crash between detection and processing leaves the job in
-    // `detected` with no run at all. `jobs retry` used to refuse that status,
-    // so the job was unreachable even for the manual channel.
+    // `detected` with no run at all — the manual retry channel must accept
+    // that status, or the job is unreachable even for human recovery.
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',
       stateMachineAddress: STATE_MACHINE,
@@ -1907,10 +1907,10 @@ describe('state machine chain watcher', () => {
   });
 
   it('derives distinct default idempotency keys for distinct sources and stable keys across re-emitted events', async () => {
-    // the config-driven default key used to be orderId:hookId:signalName,
-    // so different sources behind one signalName were judged the same fact. The
-    // default now carries the source dimension, and it deliberately does NOT
-    // carry the event dimension: the key mirrors the contract's
+    // The default key carries the source dimension: an orderId:hookId:-
+    // signalName key would judge different sources behind one signalName as
+    // the same fact. It deliberately does NOT carry the event dimension: the
+    // key mirrors the contract's
     // SignalAlreadyExists tuple (planId, orderId, sourceId, signalId), so a
     // HookReady re-emitted in a new transaction after a deep reorg reuses the
     // same key instead of minting a fresh one per event anchor and putting a
@@ -1955,9 +1955,10 @@ describe('state machine chain watcher', () => {
   });
 
   it('converges a replayed dry-run job instead of replaying the handler and growing the audit trail', async () => {
-    // a finished dry-run pass used to stay non-terminal forever, so every
-    // rescan re-ran the handler (replaying its side effects) and appended the
-    // full simulated submission set again — jobs.json grew without bound.
+    // a finished dry-run pass must converge to terminal: staying
+    // non-terminal forever would re-run the handler on every rescan
+    // (replaying its side effects) and append the full simulated submission
+    // set again — jobs.json would grow without bound.
     let handlerRuns = 0;
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',
@@ -2003,11 +2004,11 @@ describe('state machine chain watcher', () => {
   });
 
   it('records handler-context submitSignal broadcasts in the job audit trail', async () => {
-    // The handler-context submitSignal channel used to bypass the job
-    // submissions bookkeeping, so its broadcast txHash silently left the
-    // audit trail the README promises is never dropped from. Context
-    // submissions are recorded with negative signal indexes so they never
-    // alias returned-signal indexes.
+    // The handler-context submitSignal channel must go through the job
+    // submissions bookkeeping: a bypassing broadcast txHash would silently
+    // leave the audit trail the README promises is never dropped from.
+    // Context submissions are recorded with negative signal indexes so they
+    // never alias returned-signal indexes.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();
     try {
@@ -2046,9 +2047,10 @@ describe('state machine chain watcher', () => {
   });
 
   it('resolves the planId per signal so a sibling pin never leaks into unpinned signals', async () => {
-    // the first explicit signal planId used to become the whole job's
-    // fallback, so an unpinned sibling was broadcast with a planId the event
-    // never carried — a guaranteed on-chain revert that dead-lettered the job.
+    // the planId must be resolved per signal: reusing the first explicit
+    // signal planId as the whole job's fallback would broadcast an unpinned
+    // sibling with a planId the event never carried — a guaranteed on-chain
+    // revert that dead-letters the job.
     const pinnedPlanId = `0x${'99'.repeat(32)}` as Hex;
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',
@@ -2199,10 +2201,11 @@ describe('state machine chain watcher', () => {
   });
 
   it('finishes a receipt-confirmed handler-context run as terminal confirmed instead of looping', async () => {
-    // The terminal computation used to count only returned-signal
-    // submissions as "observed this run", so even a fully receipt-confirmed
-    // context-channel run landed in the open `submitted` lane — the handler
-    // then re-ran on every scan and rebroadcast into a guaranteed
+    // The terminal computation must count returned-signal and context-channel
+    // submissions alike as "observed this run": counting only returned-signal
+    // submissions would land even a fully receipt-confirmed context-channel
+    // run in the open `submitted` lane — the handler would then re-run on
+    // every scan and rebroadcast into a guaranteed
     // SignalAlreadyExists revert.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();
@@ -2246,8 +2249,8 @@ describe('state machine chain watcher', () => {
 
   it('applies the resend backoff and receipt consult to handler-context rebroadcasts', async () => {
     // waitForReceipt:false with the receipt unavailable: the context channel
-    // used to rebroadcast on every scan with no throttle. It now defers
-    // inside the backoff window and only rebroadcasts past it.
+    // defers inside the backoff window and only rebroadcasts past it —
+    // never rebroadcasting on every scan with no throttle.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();
     try {
@@ -2317,10 +2320,10 @@ describe('state machine chain watcher', () => {
   });
 
   it('defers a handler-context broadcast whose receipt wait failed instead of inviting an immediate rebroadcast', async () => {
-    // A retryable receipt-wait timeout after a successful broadcast used to
-    // be rethrown into the handler-retry loop, which answered it with an
+    // A retryable receipt-wait timeout after a successful broadcast must not
+    // be rethrown into the handler-retry loop, which would answer it with an
     // immediate second transaction for the same signal. The context channel
-    // now resolves with the deferred marker and keeps the job open.
+    // resolves with the deferred marker and keeps the job open.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();
     try {
@@ -2381,9 +2384,9 @@ describe('state machine chain watcher', () => {
   });
 
   it('keeps a job with unresolved broadcasts in the open lane when the handler stops emitting signals', async () => {
-    // an empty handler result used to flip a job with an unconfirmed
-    // broadcast down to `matched`, taking it out of the revisit lane exactly
-    // when its broadcast still needed the automatic receipt recheck.
+    // an empty handler result must not flip a job with an unconfirmed
+    // broadcast down to `matched` — that takes it out of the revisit lane
+    // exactly when its broadcast still needs the automatic receipt recheck.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();
     try {
@@ -2563,9 +2566,10 @@ describe('state machine chain watcher', () => {
   });
 
   it('does not commit in-memory cursor anchors when persistence fails', async () => {
-    // checkpoints and the cursor hash used to be updated in memory
-    // before the save, so a failed save made the next round's continuity check
-    // mismatch by construction — a false reorg rolling the whole range back.
+    // checkpoints and the cursor hash must be updated in memory only after
+    // the save: updating them before would make a failed save leave the next
+    // round's continuity check mismatch by construction — a false reorg
+    // rolling the whole range back.
     const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-cursor-save-fail-'));
     const errors: unknown[] = [];
     try {
@@ -2759,9 +2763,9 @@ describe('state machine chain watcher', () => {
   });
 
   it('trims stored reorg checkpoints to the reorg window instead of growing forever', async () => {
-    // R1-9: recordCheckpoint only ever appended; trimmedCheckpoints applied
-    // to the read view alone, so the stored array (and its per-round sort)
-    // grew unbounded with every scanned round.
+    // trimming must apply to the stored checkpoint array, not the read view
+    // alone: append-only storage (with a per-round sort) grows unbounded with
+    // every scanned round.
     const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-checkpoint-trim-'));
     try {
       const cursorFile = join(dir, 'cursor.json');
@@ -2803,10 +2807,10 @@ describe('state machine chain watcher', () => {
   });
 
   it('treats a failed toBlock hash read as no evidence instead of saving a stale hash', async () => {
-    // R1-16: a transient getBlock failure after a successful round used to
-    // persist the OLD cursor hash next to the NEW height, so the next round's
-    // continuity check mismatched by construction and rolled the cursor back
-    // forever (a false-reorg loop). No evidence now means no saved hash: the
+    // a transient getBlock failure after a successful round must not
+    // persist the OLD cursor hash next to the NEW height — the next round's
+    // continuity check would mismatch by construction and roll the cursor
+    // back forever (a false-reorg loop). No evidence means no saved hash: the
     // finality buffer alone covers the round until hashes come back.
     const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-hash-read-fail-'));
     const errors: unknown[] = [];
@@ -3623,8 +3627,8 @@ describe('submitSignal receipt visibility', () => {
   it('defers an unconfirmed broadcast to later scans when the receipt is not available', async () => {
     // Replay-guard null-receipt branch: getTransactionReceipt resolves null
     // (the tx is not mined yet) — "no evidence", not provable absence. The
-    // bounded in-run retry used to rebroadcast once per attempt (3 txs); the
-    // run now defers, and the immediate rescan re-checks the receipt again
+    // run defers instead of rebroadcasting once per attempt (3 txs), and the
+    // immediate rescan re-checks the receipt again
     // before the resend backoff allows any rebroadcast.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();
@@ -3687,8 +3691,8 @@ describe('submitSignal receipt visibility', () => {
   it('keeps a job with an unknown-outcome broadcast open instead of dead-lettering it on an unclassifiable receipt failure', async () => {
     // The receipt wait failed with an error no classifier pattern matches
     // (non-retryable fallback) after the transaction was already broadcast:
-    // the terminal decision used to dead-letter the job while its
-    // transaction was still in flight. An unknown outcome must stay in the
+    // the terminal decision must not dead-letter the job while its
+    // transaction is still in flight. An unknown outcome stays in the
     // open lane so the later-scan receipt recheck can observe the real one.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();

@@ -420,7 +420,7 @@ Watcher job semantics:
   nonce })`: it fails closed on a missing timestamp/nonce, enforces an
   acceptance window (5 minutes by default), and `createWebhookReplayGuard`
   burns each nonce once inside the window — a captured `(body, signature)`
-  pair can no longer be replayed forever.
+  pair cannot be replayed past the window.
 - The `serve` HTTP server's callback egress is EXPLICIT ALLOWLIST ONLY: no
   host — loopback included — is allowed by default, and starting the server
   with an empty allowlist fails loudly. Allowlist callback hosts (including
