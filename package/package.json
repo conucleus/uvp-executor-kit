@@ -23,7 +23,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
+    "test": "vitest run && tsx --test \"tests/**/*.node.test.ts\"",
     "test:watch": "vitest",
     "dev": "tsx src/cli.ts",
     "cli": "tsx src/cli.ts"
