@@ -1269,7 +1269,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('re-opens a confirmed job through the manual retry channel with forced resubmission', async () => {
-    // F-03: `confirmed` used to be a permanent lock — retry refused it, so a
+    // `confirmed` used to be a permanent lock — retry refused it, so a
     // reorg that flipped the confirmation off the canonical chain left the
     // job stuck with no human recovery. The retry now resubmits every signal
     // (the on-chain idempotency key absorbs a duplicate when the signal
@@ -1325,7 +1325,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('rolls the scan cursor back to the common ancestor when a reorg flips the cursor block hash', async () => {
-    // F-03: with no hash continuity check, a short fork let the cursor pass a
+    // With no hash continuity check, a short fork let the cursor pass a
     // block that left the canonical chain, and everything on the orphaned
     // branch was silently never rescanned.
     const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-reorg-'));
@@ -1761,7 +1761,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('accepts a manual retry for a detected job stranded by a crash', async () => {
-    // F-06: a crash between detection and processing leaves the job in
+    // A crash between detection and processing leaves the job in
     // `detected` with no run at all. `jobs retry` used to refuse that status,
     // so the job was unreachable even for the manual channel.
     const watcher = createStateMachineWatcher({
@@ -1796,7 +1796,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('revisits open jobs behind the cursor on later scans instead of stranding them', async () => {
-    // F-06: handleLog only ran for logs inside the current poll window, so an
+    // handleLog only ran for logs inside the current poll window, so an
     // open job whose block the cursor already passed was never revisited —
     // the README's later-scan promise had no implementation. The poll now
     // replays open jobs (detected/submitted) from the store whose blocks are
@@ -1847,7 +1847,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('rechecks the receipt of an unconfirmed broadcast when a later scan revisits the job', async () => {
-    // F-07: a waitForReceipt:false broadcast returned without error and was
+    // A waitForReceipt:false broadcast returned without error and was
     // permanently counted as delivered — a reverted tx could never be
     // rechecked. Unconfirmed broadcasts are now resolved by receipt evidence
     // on the next scan, without a rebroadcast when the receipt shows success.
@@ -2003,7 +2003,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('records handler-context submitSignal broadcasts in the job audit trail', async () => {
-    // F-21: the handler-context submitSignal channel used to bypass the job
+    // The handler-context submitSignal channel used to bypass the job
     // submissions bookkeeping, so its broadcast txHash silently left the
     // audit trail the README promises is never dropped from. Context
     // submissions are recorded with negative signal indexes so they never
