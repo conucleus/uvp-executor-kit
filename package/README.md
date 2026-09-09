@@ -367,12 +367,18 @@ Watcher job semantics:
   re-checks the receipt and adopts or refutes it). The receipt recheck, the
   resend backoff, and the terminal-state computation cover BOTH submission
   channels: signals returned by the handler and signals submitted through the
-  handler-context `submitSignal` channel (a `waitForReceipt:false` revert on
-  either channel refutes the job on the next scan instead of staying open
-  forever). When the receipt step itself fails after a successful broadcast
-  (reverted receipt, or waiting for the receipt throws), the error carries
-  the broadcast `txHash` and the job's `submissions` record keeps it, so
-  "already broadcast" transactions are never dropped from the audit trail.
+  handler-context `submitSignal` channel. That context channel answers an
+  already-delivered signal from its recorded evidence instead of
+  rebroadcasting, and resolves with `{ deferredBroadcast: true }` when the
+  signal's prior broadcast has an unknown outcome or sits inside the resend
+  backoff window — handlers must treat that marker as "pending, do not retry
+  now", never as success or failure. When the receipt step itself fails after
+  a successful broadcast, the error carries the broadcast `txHash` and the
+  job's `submissions` record keeps it, so "already broadcast" transactions
+  are never dropped from the audit trail — and a failure recorded alongside a
+  broadcast whose outcome is unknown leaves the job open (`submitted`) for the
+  later-scan receipt recheck instead of dead-lettering it; only a receipt
+  actually observed as reverted terminalizes the failure.
 - Failures are classified from explicit machine-readable error codes first,
   then from well-known real-world error texts and contract revert data
   (for example `SignalAlreadyExists()`, `AccessControlUnauthorizedAccount`,
@@ -381,13 +387,14 @@ Watcher job semantics:
   `failed` when exhausted, which `jobs retry` still accepts; deterministic
   non-retryable failures and unrecognized errors dead-letter for human
   triage via `jobs dead-letter`. A duplicate-signal fact
-  (`SignalAlreadyExists`) is not a failure, and where it surfaces decides the
-  job state: a handler that itself throws the duplicate classification ends
-  the job as terminal `ignored`, while a duplicate answered by the chain
-  during `submitSignal` is recorded as a delivered dedupe fact and leaves the
-  job in the non-terminal `submitted` state (the signal is on chain but this
-  process never observed its receipt, so a later scan or retry can still
-  check the real outcome). `jobs retry` also accepts `detected` jobs (crash
+  (`SignalAlreadyExists`) is not a failure: the contract's check on the
+  `(planId, orderId, sourceId, signalId)` tuple is itself the delivery
+  verdict, so a duplicate answered by the chain during `submitSignal` is
+  recorded as a delivered dedupe fact and — exactly like an observed success
+  receipt — completes the job as terminal `confirmed` once every signal is
+  delivered. (A handler that itself THROWS the duplicate classification still
+  ends the job as terminal `ignored`: the handler is asserting a failure, not
+  relaying a chain answer.) `jobs retry` also accepts `detected` jobs (crash
   recovery: detection was persisted but the job never got a run) and
   `confirmed` jobs: the retry resubmits every signal, which is the manual
   recovery channel when a reorg flipped a confirmation off the canonical

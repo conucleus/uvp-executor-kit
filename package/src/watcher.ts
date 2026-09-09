@@ -167,10 +167,18 @@ export interface StateMachineWatchHandle {
 
 export interface StateMachineHookReadyHandlerContext {
   readonly matchedKey: string;
+  /**
+   * Submit one signal through the handler-context channel. Resolves with the
+   * submission result, or with `{ deferredBroadcast: true }` when the signal's
+   * prior broadcast has an unknown outcome (or is inside the resend backoff
+   * window): the transaction is already on chain or throttled, and a later
+   * scan — not another in-run broadcast — settles it. Handlers must treat the
+   * deferred marker as "pending, do not retry now", not as success.
+   */
   readonly submitSignal: (
     signal: StateMachineSignal,
     overrides?: Partial<SubmitStateMachineSignalConfig>,
-  ) => Promise<SubmitStateMachineSignalResult>;
+  ) => Promise<SubmitStateMachineSignalResult | DeferredBroadcastOutcome>;
 }
 
 export type StateMachineHookReadyHandlerResult =
@@ -1237,7 +1245,10 @@ export class StateMachineWatcher {
             return { deferredBroadcast: true };
           }
           if (!classified.retryable || attemptForSignal >= this.config.retry.maxAttempts) {
-            throw new ClassifiedStateMachineError(classified);
+            // Keep the original error reachable through the cause chain: the
+            // terminal-status guard must tell a receipt-observed revert apart
+            // from a broadcast whose outcome is simply unknown.
+            throw new ClassifiedStateMachineError(classified, { cause: error });
           }
           await delay(this.config.retry.baseDelayMs * attemptForSignal);
         }
@@ -1250,15 +1261,72 @@ export class StateMachineWatcher {
     // returned-signals path (README: already-broadcast transactions are never
     // dropped from it). signalIndex -1, -2, ... keeps context submissions from
     // aliasing returned-signal indexes in the resume/backoff machinery.
+    // The channel also honors the same replay rules as the returned-signal
+    // lane: an already-delivered signal is answered from its recorded evidence
+    // instead of rebroadcast, and an unresolved prior broadcast is settled by
+    // its receipt (or deferred under the resend backoff) before any new
+    // transaction goes out.
     let contextSubmissionCount = 0;
+    let deferredResend = false;
     const context: StateMachineHookReadyHandlerContext = {
       matchedKey: resolved.key,
       submitSignal: async (signal, overrides) => {
         const signalIndex = -1 - contextSubmissionCount;
         contextSubmissionCount += 1;
         const attempt = contextSubmissionCount;
+        const submitConfig = normalizeSubmitConfig({ ...eventSubmitConfig, ...overrides });
+        // Signal identity for the replay decisions below: submitSignal calldata
+        // is a deterministic function of the four-tuple (plus an explicit key),
+        // so equal data across runs means the same logical signal.
+        const identityRequest = buildSubmitStateMachineSignalCall(submitConfig, signal);
+        const priorRecords = jobSubmissions.filter((submission) => submission.request?.data === identityRequest.data);
+        const deliveredPrior = priorRecords.find((submission) =>
+          submission.error?.kind === 'duplicate_signal'
+          || (!submission.error && submission.dryRun === false && submission.confirmed === true));
+        if (deliveredPrior?.txHash !== undefined && !deliveredPrior.dryRun) {
+          // The chain already carries this signal by this job's own recorded
+          // evidence; rebroadcasting could only collect another revert.
+          return {
+            dryRun: false,
+            request: deliveredPrior.request ?? identityRequest,
+            txHash: deliveredPrior.txHash,
+            confirmed: true,
+          };
+        }
+        const unresolvedPrior = priorRecords
+          .filter((submission) => isUnconfirmedBroadcast(submission, submission.signalIndex))
+          .at(-1);
+        if (unresolvedPrior?.txHash !== undefined) {
+          // Replay guard, same as the returned-signal lane: the prior
+          // broadcast's outcome is unknown until its receipt says otherwise.
+          const recovered = await this.recoverBroadcastSubmission(submitConfig, signal, unresolvedPrior.txHash);
+          if (recovered) {
+            appendJobSubmission(jobSubmissions, toJobSubmission(signalIndex, attempt, recovered));
+            currentJob = await this.updateJob(job.id, {
+              updatedAt: this.config.now(),
+              submissions: jobSubmissions,
+              clearLastError: true,
+            });
+            return recovered;
+          }
+          const priorUnconfirmed = priorRecords
+            .filter((submission) => isUnconfirmedBroadcast(submission, submission.signalIndex)).length;
+          const requiredDelayMs = resendBackoffDelayMs(this.config.resendBackoff, priorUnconfirmed);
+          const lastAttemptAtMs = Date.parse(currentJob.lastSignalAttemptAt ?? '');
+          if (
+            options?.bypassResendBackoff !== true
+            && Number.isFinite(lastAttemptAtMs)
+            && this.config.nowMs() - lastAttemptAtMs < requiredDelayMs
+          ) {
+            deferredResend = true;
+            return { deferredBroadcast: true };
+          }
+          // Past the backoff window: fall through and rebroadcast — the
+          // contract's SignalAlreadyExists dedupe absorbs it if the prior
+          // transaction actually mined.
+        }
         try {
-          const result = await submitStateMachineSignal({ ...eventSubmitConfig, ...overrides }, signal);
+          const result = await submitStateMachineSignal(submitConfig, signal);
           appendJobSubmission(jobSubmissions, toJobSubmission(signalIndex, attempt, result));
           currentJob = await this.updateJob(job.id, {
             updatedAt: this.config.now(),
@@ -1272,9 +1340,35 @@ export class StateMachineWatcher {
           jobSubmissions.push({
             signalIndex,
             attempt,
+            request: identityRequest,
             ...(broadcastTxHash ? { txHash: broadcastTxHash } : {}),
             error: classified,
           });
+          if (broadcastTxHash !== undefined && !carriesKnownRevert(error)) {
+            // The broadcast went out but its outcome is unknown. Handing the
+            // handler a retryable-looking error invited an immediate second
+            // transaction for the same signal; consult the receipt once and
+            // otherwise defer to the later-scan recheck under the backoff.
+            const recovered = await this.recoverBroadcastSubmission(submitConfig, signal, broadcastTxHash)
+              .catch(() => undefined);
+            if (recovered) {
+              appendJobSubmission(jobSubmissions, toJobSubmission(signalIndex, attempt, recovered));
+              currentJob = await this.updateJob(job.id, {
+                updatedAt: this.config.now(),
+                submissions: jobSubmissions,
+                clearLastError: true,
+              });
+              return recovered;
+            }
+            currentJob = await this.updateJob(job.id, {
+              updatedAt: this.config.now(),
+              lastSignalAttemptAt: this.config.now(),
+              submissions: jobSubmissions,
+              lastError: classified,
+            });
+            deferredResend = true;
+            return { deferredBroadcast: true };
+          }
           currentJob = await this.updateJob(job.id, {
             updatedAt: this.config.now(),
             lastSignalAttemptAt: this.config.now(),
@@ -1309,7 +1403,7 @@ export class StateMachineWatcher {
           continue;
         }
         const failed = await this.updateJob(job.id, {
-          status: jobStatusForError(classified),
+          status: statusForTerminalError(error, classified, jobSubmissions),
           updatedAt: this.config.now(),
           attempts,
           submissions: jobSubmissions,
@@ -1378,6 +1472,10 @@ export class StateMachineWatcher {
       } catch (error) {
         const classified = classifyExecutorKitError(error);
         attempts += 1;
+        // Unlike the other terminal decisions this path only fires on a
+        // receipt actually observed with a non-success status — a known
+        // reverted outcome — so dead_letter/failed here never freezes a
+        // broadcast whose outcome is unknown.
         const failed = await this.updateJob(job.id, {
           status: jobStatusForError(classified),
           updatedAt: this.config.now(),
@@ -1420,7 +1518,6 @@ export class StateMachineWatcher {
         clearLastError: true,
       });
     }
-    let deferredResend = false;
     for (const [index, signal] of signals.entries()) {
       if (deliveredSignalIndexes.has(index)) {
         continue;
@@ -1469,7 +1566,7 @@ export class StateMachineWatcher {
           continue;
         }
         const failed = await this.updateJob(job.id, {
-          status: jobStatusForError(classified),
+          status: statusForTerminalError(error, classified, jobSubmissions),
           updatedAt: this.config.now(),
           attempts,
           submissions: jobSubmissions,
@@ -1609,7 +1706,7 @@ export class StateMachineWatcher {
       return undefined;
     }
     if (receipt.status && receipt.status !== 'success') {
-      throw new SubmitSignalReceiptError(txHash, `submitSignal transaction receipt status ${receipt.status}`);
+      throw new SubmitSignalReceiptError(txHash, `submitSignal transaction receipt status ${receipt.status}`, { reverted: true });
     }
     return receipt.status === 'success' ? 'success' : undefined;
   }
@@ -2152,14 +2249,19 @@ export function buildSubmitStateMachineSignalCall(
  * or waiting for the receipt itself failed (timeout, RPC fault). The broadcast
  * txHash rides on the error so callers can keep the already-broadcast
  * transaction in the job audit trail instead of losing it to a retry.
+ * `reverted` separates the two cases: only a receipt actually observed with a
+ * non-success status is a known outcome; a receipt that could not be obtained
+ * leaves the broadcast's outcome unknown and must never terminalize the job.
  */
 export class SubmitSignalReceiptError extends Error {
   readonly txHash: Hex;
+  readonly reverted: boolean;
 
-  constructor(txHash: Hex, message: string, options?: { readonly cause?: unknown }) {
+  constructor(txHash: Hex, message: string, options?: { readonly cause?: unknown; readonly reverted?: boolean }) {
     super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
     this.name = 'SubmitSignalReceiptError';
     this.txHash = txHash;
+    this.reverted = options?.reverted ?? false;
   }
 }
 
@@ -2219,7 +2321,7 @@ export async function submitStateMachineSignal(
       throw new SubmitSignalReceiptError(txHash, `submitSignal transaction receipt wait failed for ${txHash}: ${detail}`, { cause: error });
     }
     if (receipt.status && receipt.status !== 'success') {
-      throw new SubmitSignalReceiptError(txHash, `submitSignal transaction receipt status ${receipt.status}`);
+      throw new SubmitSignalReceiptError(txHash, `submitSignal transaction receipt status ${receipt.status}`, { reverted: true });
     }
     confirmed = receipt.status === 'success';
   }
@@ -2725,14 +2827,16 @@ function* walkSubmissionErrorChain(error: unknown): Generator<Error> {
  * Terminal status for a run that processed (or resumed) its signals, over both
  * submission lanes:
  *
- * - `confirmed`: every signal — returned and handler-context — is delivered,
- *   every successful this-run submission (broadcast or receipt-recovered)
- *   observed a successful receipt, and no broadcast is left unresolved;
+ * - `confirmed`: every signal — returned and handler-context — is delivered by
+ *   evidence (an observed success receipt, or the chain's own
+ *   `SignalAlreadyExists` verdict on the four-tuple), and no recorded
+ *   broadcast is left without such evidence — an unobserved receipt never
+ *   counts, not even from this run;
  * - `submitted`: any real broadcast happened or remains unresolved — including
  *   a handler that stopped emitting signals an earlier run had already
  *   broadcast (an unresolved broadcast keeps the job in the revisit lane
- *   whatever the handler now returns) and fully resumed runs with nothing new
- *   to send;
+ *   whatever the handler now returns) and runs whose delivery evidence is a
+ *   duplicate fact plus nothing else observed this run;
  * - `matched`: dry-runs and handler-only runs with nothing to broadcast.
  */
 function statusForCompletedRun(input: {
@@ -2745,26 +2849,29 @@ function statusForCompletedRun(input: {
   if (input.dryRun) {
     return 'matched';
   }
+  // Delivery evidence is recomputed from the records, not taken from the
+  // in-run index set: that set also marks merely-sent signals (a
+  // waitForReceipt:false broadcast) which are not evidence of anything.
+  const provenDelivered = deliveredSignalIndexesFromSubmissions(input.jobSubmissions);
   const contextSignalCount = new Set(
     input.jobSubmissions.filter((submission) => submission.signalIndex < 0).map((submission) => submission.signalIndex),
   ).size;
-  const deliveredContextCount = [...input.deliveredSignalIndexes].filter((index) => index < 0).length;
-  const returnedComplete = input.signals.every((_signal, index) => input.deliveredSignalIndexes.has(index));
+  const deliveredContextCount = [...provenDelivered].filter((index) => index < 0).length;
+  const returnedComplete = input.signals.every((_signal, index) => provenDelivered.has(index));
   const contextComplete = deliveredContextCount >= contextSignalCount;
-  const observedThisRun = input.thisRunSubmissions
-    .filter((submission) => submission.dryRun !== true && submission.error === undefined);
-  const allObservedConfirmed = observedThisRun.length > 0 && observedThisRun.every((submission) => submission.confirmed === true);
-  const unresolvedBroadcasts = input.jobSubmissions
-    .filter((submission) => isUnconfirmedBroadcast(submission, submission.signalIndex)
-      && !input.deliveredSignalIndexes.has(submission.signalIndex))
-    .length;
+  const unprovenBroadcasts = input.jobSubmissions.filter((submission) =>
+    submission.dryRun !== true
+    && submission.txHash !== undefined
+    && submission.confirmed !== true
+    && submission.error?.kind !== 'duplicate_signal'
+    && !provenDelivered.has(submission.signalIndex),
+  ).length;
   const hasRealBroadcast = input.jobSubmissions.some((submission) => submission.dryRun !== true);
   if (
     returnedComplete
     && contextComplete
     && input.signals.length + contextSignalCount > 0
-    && allObservedConfirmed
-    && unresolvedBroadcasts === 0
+    && unprovenBroadcasts === 0
   ) {
     return 'confirmed';
   }
@@ -2880,6 +2987,43 @@ function jobStatusForError(error: ClassifiedExecutorKitError): StateMachineJobSt
   // non-retryable failures dead-letter for human triage instead of parking in the
   // retryable lane where automatic or manual retries would pointlessly re-run them.
   return error.retryable ? 'failed' : 'dead_letter';
+}
+
+/**
+ * Terminal status for a run that failed. A failure recorded together with a
+ * broadcast whose outcome is unknown must not terminalize the job — `failed`
+ * and `dead_letter` both end the automatic receipt rechecks, and the tx may
+ * still mine. The job stays in the open `submitted` lane instead, and later
+ * scans settle it by receipt (a mined revert then dead-letters with a known
+ * outcome). A receipt actually observed as reverted is a known outcome and
+ * still terminalizes normally.
+ */
+function statusForTerminalError(
+  error: unknown,
+  classified: ClassifiedExecutorKitError,
+  jobSubmissions: readonly StateMachineJobSubmission[],
+): StateMachineJobStatus {
+  if (!carriesKnownRevert(error) && hasUnresolvedBroadcast(jobSubmissions)) {
+    return 'submitted';
+  }
+  return jobStatusForError(classified);
+}
+
+function hasUnresolvedBroadcast(submissions: readonly StateMachineJobSubmission[]): boolean {
+  const provenDelivered = deliveredSignalIndexesFromSubmissions(submissions);
+  return submissions.some((submission) =>
+    submission.dryRun !== true
+    && submission.txHash !== undefined
+    && submission.confirmed !== true
+    && submission.error?.kind !== 'duplicate_signal'
+    && !provenDelivered.has(submission.signalIndex));
+}
+
+/** True when the error chain proves a receipt was observed with a non-success status. */
+function carriesKnownRevert(error: unknown): boolean {
+  return [...walkSubmissionErrorChain(error)].some(
+    (current) => current instanceof SubmitSignalReceiptError && current.reverted,
+  );
 }
 
 function isTerminalJobStatus(status: StateMachineJobStatus): boolean {
@@ -3242,15 +3386,16 @@ function cloneJob(job: StateMachineWatcherJob): StateMachineWatcherJob {
  * could not be obtained (lookup fault, client without receipt support, or not
  * mined yet). That is "outcome unknown", not provable absence — the run must
  * not blind-rebroadcast. The signal stays open and later scans re-check the
- * receipt, rebroadcasting only under the resend backoff.
+ * receipt, rebroadcasting only under the resend backoff. The handler-context
+ * `submitSignal` channel resolves with this marker for the same condition.
  */
-type DeferredBroadcastOutcome = { readonly deferredBroadcast: true };
+export type DeferredBroadcastOutcome = { readonly deferredBroadcast: true };
 
 class ClassifiedStateMachineError extends Error {
   readonly classified: ClassifiedExecutorKitError;
 
-  constructor(classified: ClassifiedExecutorKitError) {
-    super(classified.message);
+  constructor(classified: ClassifiedExecutorKitError, options?: { readonly cause?: unknown }) {
+    super(classified.message, options?.cause !== undefined ? { cause: options.cause } : undefined);
     this.name = 'ClassifiedStateMachineError';
     this.classified = classified;
   }
