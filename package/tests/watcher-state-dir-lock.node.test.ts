@@ -6,7 +6,15 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, it } from 'node:test';
-import { acquireWatcherStateDirLock } from '../src/watcher.js';
+import {
+  acquireWatcherStateDirLock,
+  createStateMachineWatcher,
+  decodeHookReadyLog,
+  FileStateMachineJobStore,
+  InMemoryStateMachineJobStore,
+  retryStateMachineJob,
+  stateMachineJobId,
+} from '../src/watcher.js';
 import { main } from '../src/cli.js';
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -274,5 +282,147 @@ describe('watcher state-dir 进程锁', () => {
       process.exitCode = previousExitCode;
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('watcher 任务级运行认领', () => {
+  const machine = '0x1111111111111111111111111111111111111111' as const;
+  const word = (hex: string) => `0x${hex.repeat(32)}`;
+
+  async function hookReadyLog(): Promise<Parameters<ReturnType<typeof createStateMachineWatcher>['handleLog']>[0]> {
+    const fixture = JSON.parse(await readFile(
+      join(packageDir, '../../uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.10.json'),
+      'utf8',
+    )) as { events: { HookReady: { topic: string } } };
+    return {
+      address: machine,
+      topics: [fixture.events.HookReady.topic, word('77'), word('11'), word('22')],
+      data: `0x${'55'.repeat(32)}${'66'.repeat(32)}`,
+      blockNumber: 12n,
+      transactionHash: word('33'),
+      logIndex: 7,
+    };
+  }
+
+  it('handler 运行中手工 retry 被拒，handler 不被并发二次执行', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-run-claim-'));
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolveStarted) => { entered = resolveStarted; });
+    const blocked = new Promise<void>((resolveBlocked) => { release = resolveBlocked; });
+    let effects = 0;
+    const build = (handler: () => Promise<void>) => createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:1',
+      stateMachineAddress: machine,
+      chainId: 31_337,
+      walletAddress: wallet,
+      privateKeyEnv: 'UVP_RUN_CLAIM_UNUSED_KEY',
+      dryRun: true,
+      jobStore: new FileStateMachineJobStore(join(dir, 'jobs.json')),
+      handlers: { '*': handler },
+    });
+    try {
+      const running = build(async () => { effects += 1; entered(); await blocked; });
+      const manual = build(async () => { effects += 1; });
+      const log = await hookReadyLog();
+      const active = running.handleLog(log);
+      await started;
+
+      const jobId = stateMachineJobId(decodeHookReadyLog(log));
+      const duringRun = await manual.config.jobStore.get(jobId);
+      assert.equal(duringRun?.status, 'matched', 'precondition: the job is claimed mid-run');
+      assert.ok(duringRun?.claim !== undefined, 'precondition: the claim is recorded');
+
+      await assert.rejects(
+        retryStateMachineJob(manual, jobId, { operator: 'claim-test' }),
+        (error: unknown) => {
+          assert.match(String((error as Error).message), /being processed by executor pid/u);
+          return true;
+        },
+      );
+      assert.equal(effects, 1, 'the handler must not have been invoked a second time while blocked');
+
+      release();
+      await active;
+      assert.equal(effects, 1);
+    } finally {
+      release?.();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('持有者已死的 matched 认领可被手工 retry 接管（崩溃恢复通道）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-run-claim-dead-'));
+    let effects = 0;
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:1',
+      stateMachineAddress: machine,
+      chainId: 31_337,
+      walletAddress: wallet,
+      privateKeyEnv: 'UVP_RUN_CLAIM_UNUSED_KEY',
+      dryRun: true,
+      jobStore: new FileStateMachineJobStore(join(dir, 'jobs.json')),
+      handlers: { '*': async () => { effects += 1; } },
+    });
+    try {
+      const log = await hookReadyLog();
+      await watcher.handleLog(log);
+      assert.equal(effects, 1);
+
+      const jobId = stateMachineJobId(decodeHookReadyLog(log));
+      // 模拟 watcher 进程崩溃：任务停在 matched 且认领 pid 已死。
+      const crashedPid = await deadPid();
+      await watcher.config.jobStore.update(jobId, {
+        status: 'matched',
+        updatedAt: new Date().toISOString(),
+        claim: { pid: crashedPid, at: new Date().toISOString() },
+      });
+
+      const retried = await retryStateMachineJob(watcher, jobId, { operator: 'claim-test' });
+      assert.equal(retried.status, 'handled', 'a dead claim must not block the manual recovery channel');
+      assert.equal(effects, 2, 'the retry runs the handler exactly once more');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('store 更新的 CAS 守卫：状态或认领不符时拒写并返回 undefined', async () => {
+    const store = new InMemoryStateMachineJobStore();
+    const log = await hookReadyLog();
+    const event = decodeHookReadyLog(log);
+    if (!event) {
+      throw new Error('test fixture log must decode as HookReady');
+    }
+    const created = await store.upsertDetected(event, { now: new Date().toISOString(), maxAttempts: 3 });
+
+    assert.equal(await store.update(created.id, {
+      updatedAt: new Date().toISOString(),
+      status: 'matched',
+      expectStatus: 'confirmed',
+    }), undefined, 'expectStatus mismatch must reject the write');
+
+    const claimed = await store.update(created.id, {
+      updatedAt: new Date().toISOString(),
+      status: 'matched',
+      claim: { pid: 424_242, at: new Date().toISOString() },
+      expectStatus: 'detected',
+      expectClaimPid: null,
+    });
+    assert.ok(claimed?.claim, 'the CAS-accepted write records the claim');
+
+    assert.equal(await store.update(created.id, {
+      updatedAt: new Date().toISOString(),
+      claim: null,
+      expectClaimPid: null,
+    }), undefined, 'a claim mismatch must reject the release');
+
+    const released = await store.update(created.id, {
+      updatedAt: new Date().toISOString(),
+      status: 'failed',
+      claim: null,
+      expectClaimPid: 424_242,
+    });
+    assert.equal(released?.status, 'failed');
+    assert.equal(released?.claim, undefined, 'the conclusive status write releases the claim');
   });
 });

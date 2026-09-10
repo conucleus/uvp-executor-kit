@@ -464,6 +464,16 @@ export interface StateMachineWatcherJob {
    */
   readonly lastSignalAttemptAt?: string;
   readonly manualActions?: readonly StateMachineJobManualAction[];
+  /**
+   * Run claim: the pid currently executing this job (set on the `matched`
+   * transition, released on every conclusive status write). A live foreign
+   * claim is what separates "matched because a watcher died mid-run" (claim
+   * holder is gone, manual retry is the recovery channel) from "matched
+   * because a run is in flight right now" (retrying would run the handler a
+   * second time concurrently — chain idempotency cannot protect handler-side
+   * external effects).
+   */
+  readonly claim?: { readonly pid: number; readonly at: string };
   readonly raw?: StateMachineRawLog;
 }
 
@@ -499,6 +509,17 @@ export interface StateMachineJobPatch {
   readonly clearLastError?: boolean;
   readonly lastSignalAttemptAt?: string;
   readonly manualActions?: readonly StateMachineJobManualAction[];
+  /**
+   * CAS guards: the update applies only while the job still matches them,
+   * otherwise the store returns undefined without writing. Read-validate-write
+   * sequences (manual retry reopening a job, a watcher claiming a run) must
+   * hold both so a concurrent writer cannot interleave between the read and
+   * the write.
+   */
+  readonly expectStatus?: StateMachineJobStatus;
+  readonly expectClaimPid?: number | null;
+  /** Takes or releases the run claim; omitted patches leave the claim as is. */
+  readonly claim?: { readonly pid: number; readonly at: string } | null;
 }
 
 export class InMemoryStateMachineJobStore implements StateMachineJobStore {
@@ -548,20 +569,10 @@ export class InMemoryStateMachineJobStore implements StateMachineJobStore {
     if (!current) {
       return undefined;
     }
-    const { lastError: currentLastError, ...currentWithoutLastError } = current;
-    const next: StateMachineWatcherJob = {
-      ...currentWithoutLastError,
-      ...(patch.status ? { status: patch.status } : {}),
-      updatedAt: patch.updatedAt,
-      ...(patch.attempts !== undefined ? { attempts: patch.attempts } : {}),
-      ...(patch.matchedKey !== undefined ? { matchedKey: patch.matchedKey } : {}),
-      ...(patch.planId !== undefined ? { planId: patch.planId } : {}),
-      ...(patch.submissions ? { submissions: patch.submissions } : {}),
-      ...(patch.clearLastError ? {} : currentLastError ? { lastError: currentLastError } : {}),
-      ...(patch.lastError ? { lastError: patch.lastError } : {}),
-      ...(patch.lastSignalAttemptAt !== undefined ? { lastSignalAttemptAt: patch.lastSignalAttemptAt } : {}),
-      ...(patch.manualActions ? { manualActions: patch.manualActions } : {}),
-    };
+    if (!patchCasMatches(current, patch)) {
+      return undefined;
+    }
+    const next = applyJobPatch(current, patch);
     this.jobs.set(jobId, cloneJob(next));
     return next;
   }
@@ -776,21 +787,11 @@ export class FileStateMachineJobStore implements StateMachineJobStore {
       if (!current) {
         return undefined;
       }
+      if (!patchCasMatches(current, patch)) {
+        return undefined;
+      }
 
-      const { lastError: currentLastError, ...currentWithoutLastError } = current;
-      const next: StateMachineWatcherJob = {
-        ...currentWithoutLastError,
-        ...(patch.status ? { status: patch.status } : {}),
-        updatedAt: patch.updatedAt,
-        ...(patch.attempts !== undefined ? { attempts: patch.attempts } : {}),
-        ...(patch.matchedKey !== undefined ? { matchedKey: patch.matchedKey } : {}),
-        ...(patch.planId !== undefined ? { planId: patch.planId } : {}),
-        ...(patch.submissions ? { submissions: patch.submissions } : {}),
-        ...(patch.clearLastError ? {} : currentLastError ? { lastError: currentLastError } : {}),
-        ...(patch.lastError ? { lastError: patch.lastError } : {}),
-        ...(patch.lastSignalAttemptAt !== undefined ? { lastSignalAttemptAt: patch.lastSignalAttemptAt } : {}),
-        ...(patch.manualActions ? { manualActions: patch.manualActions } : {}),
-      };
+      const next = applyJobPatch(current, patch);
       jobs.set(jobId, cloneJob(next));
       await writeStateMachineJobsFile(this.filePath, jobs);
       return next;
@@ -1256,11 +1257,41 @@ export class StateMachineWatcher {
       };
     }
 
-    let currentJob = await this.updateJob(job.id, {
-      status: 'matched',
-      updatedAt: this.config.now(),
-      matchedKey: resolved.key,
-    });
+    // 任务级原子认领：读-验-写竞态下两个执行器（watcher 扫描与手工
+    // `jobs retry`）可同时进入同一 handler，链上幂等键保护不了 handler 的
+    // 链外副作用。认领以 CAS 写入（expectStatus+expectClaimPid），输者读到
+    // 活认领即跳过本轮；持有者死亡（pid 不存活）时认领视为崩溃残留，可被
+    // 接管——搁浅的 matched 任务仍保留手工重试这条恢复通道。
+    const claimOutcome = await this.claimForRun(job, resolved.key);
+    if (claimOutcome.outcome !== 'claimed') {
+      return {
+        status: 'skipped',
+        event,
+        submissions: [],
+        ...(claimOutcome.job ? { job: claimOutcome.job } : {}),
+      };
+    }
+    try {
+      return await this.processClaimedRun(claimOutcome.job, event, resolved, options);
+    } finally {
+      // 认领保护的是"进行中的运行"，不是任务状态：dry-run 收敛等出口会
+      // 把任务留在 matched（非终态，等待真实运行接管），若只在终态写时
+      // 释放认领，这类任务会被一个早已结束的运行永久占住。
+      await this.releaseRunClaim(job.id);
+    }
+  }
+
+  private async processClaimedRun(
+    claimedJob: StateMachineWatcherJob,
+    event: StateMachineHookReady,
+    resolved: { readonly key: string; readonly handler: StateMachineHookReadyHandler },
+    options?: {
+      readonly resubmitDelivered?: boolean;
+      readonly bypassResendBackoff?: boolean;
+    },
+  ): Promise<StateMachineLogProcessResult> {
+    let job = claimedJob;
+    let currentJob = claimedJob;
     let attempts = currentJob.attempts;
     const jobSubmissions: StateMachineJobSubmission[] = [...currentJob.submissions];
     // Effective submit config for this event: the emitting contract wins over
@@ -1760,11 +1791,68 @@ export class StateMachineWatcher {
   }
 
   private async updateJob(jobId: Hex, patch: StateMachineJobPatch): Promise<StateMachineWatcherJob> {
-    const updated = await this.config.jobStore.update(jobId, patch);
+    // 结论性状态写入释放运行认领：只有 `matched` 是运行中的占位状态，
+    // 其余状态都意味着本轮运行已结束（含 submitted——回执未知但本轮不再
+    // 推进，后续扫描重跑时会重新认领）。
+    const withClaimRelease =
+      patch.status !== undefined && patch.status !== 'matched' && patch.claim === undefined
+        ? { ...patch, claim: null }
+        : patch;
+    const updated = await this.config.jobStore.update(jobId, withClaimRelease);
     if (!updated) {
       throw new ValidationError(`job ${jobId} not found`);
     }
     return updated;
+  }
+
+  /**
+   * Atomically take the run claim for this job. Returns:
+   * - `claimed`: this process owns the run (status `matched`, claim set);
+   * - `busy`: a live foreign claim holds the job — another executor is mid-run;
+   * - `terminal`: the job reached a terminal state since the caller last read it;
+   * - `lost`: the CAS write lost a race twice in a row — yield this round.
+   */
+  private async claimForRun(
+    job: StateMachineWatcherJob,
+    matchedKey: string,
+  ): Promise<
+    | { readonly outcome: 'claimed'; readonly job: StateMachineWatcherJob }
+    | { readonly outcome: 'busy' | 'terminal' | 'lost'; readonly job?: StateMachineWatcherJob }
+  > {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const fresh = await this.config.jobStore.get(job.id);
+      if (!fresh) {
+        return { outcome: 'lost' };
+      }
+      if (isTerminalJobStatus(fresh.status)) {
+        return { outcome: 'terminal', job: fresh };
+      }
+      if (isHeldRunClaim(fresh.claim)) {
+        return { outcome: 'busy', job: fresh };
+      }
+      const at = this.config.now();
+      const claimed = await this.config.jobStore.update(job.id, {
+        status: 'matched',
+        updatedAt: at,
+        matchedKey,
+        claim: { pid: process.pid, at },
+        expectStatus: fresh.status,
+        expectClaimPid: fresh.claim?.pid ?? null,
+      });
+      if (claimed) {
+        return { outcome: 'claimed', job: claimed };
+      }
+    }
+    return { outcome: 'lost' };
+  }
+
+  /** Release this process's run claim; a no-op when the conclusive status write already released it. */
+  private async releaseRunClaim(jobId: Hex): Promise<void> {
+    await this.config.jobStore.update(jobId, {
+      updatedAt: this.config.now(),
+      claim: null,
+      expectClaimPid: process.pid,
+    }).catch(() => undefined);
   }
 
   /**
@@ -2027,6 +2115,15 @@ export async function retryStateMachineJob(
   if (!isRetriableStateMachineJobStatus(job.status)) {
     throw new ValidationError(`job ${normalizedJobId} cannot be retried from status ${job.status}`);
   }
+  if (isHeldRunClaim(job.claim)) {
+    // matched 的可重试性是崩溃恢复通道：只有持有者已死才可接管。被持有的
+    // 认领下重试等于第二个执行器并发跑同一 handler——链上幂等键挡不住
+    // handler 的链外副作用。
+    throw new ExecutorKitError(
+      `job ${normalizedJobId} is being processed by executor pid ${job.claim?.pid}` +
+        ` (claimed at ${job.claim?.at}); wait for that run to finish or stop its process, then retry`,
+    );
+  }
   if (!job.raw) {
     throw new ValidationError(`job ${normalizedJobId} cannot be retried because its raw HookReady log was not stored`);
   }
@@ -2063,9 +2160,11 @@ export async function retryStateMachineJob(
       updatedAt: at,
       manualActions,
       lastError: error,
+      claim: null,
+      expectStatus: job.status,
     });
     if (!deadLetter) {
-      throw new ValidationError(`job ${normalizedJobId} not found`);
+      throw await conflictRetryError(normalizedJobId, watcher);
     }
     return {
       status: 'ignored',
@@ -2075,13 +2174,21 @@ export async function retryStateMachineJob(
     };
   }
 
-  await watcher.config.jobStore.update(normalizedJobId, {
+  // CAS 重开：仅当任务仍处于读取时的状态才写回 detected。读取与写入之间
+  // 若 watcher 已推进（detected→matched 等），这里失败而不是覆盖——覆盖
+  // 会把进行中的运行打回 detected，形成同一 handler 的并发二次执行。
+  const reopened = await watcher.config.jobStore.update(normalizedJobId, {
     status: 'detected',
     updatedAt: at,
     ...(job.status === 'failed' ? { attempts: 0 } : {}),
     manualActions,
     clearLastError: true,
+    claim: null,
+    expectStatus: job.status,
   });
+  if (!reopened) {
+    throw await conflictRetryError(normalizedJobId, watcher);
+  }
   // Retrying out of `confirmed` is the manual recovery channel for a
   // reorg-invalidated confirmation: the operator explicitly declares the prior
   // outcome invalid, so the run resubmits everything instead of treating the
@@ -2091,6 +2198,17 @@ export async function retryStateMachineJob(
     resubmitDelivered: job.status === 'confirmed',
     bypassResendBackoff: true,
   });
+}
+
+async function conflictRetryError(
+  jobId: Hex,
+  watcher: StateMachineWatcher,
+): Promise<ExecutorKitError> {
+  const current = await watcher.config.jobStore.get(jobId);
+  return new ExecutorKitError(
+    `job ${jobId} changed state while the retry was being applied (now ${current?.status ?? 'missing'});` +
+      ' re-check the job and run the retry again',
+  );
 }
 
 export async function deadLetterStateMachineJob(
@@ -2123,9 +2241,13 @@ export async function deadLetterStateMachineJob(
       at,
       reason,
     }),
+    claim: null,
+    expectStatus: job.status,
   });
   if (!updated) {
-    throw new ValidationError(`job ${normalizedJobId} not found`);
+    throw new ExecutorKitError(
+      `job ${normalizedJobId} changed state while dead-lettering was being applied; re-check the job and retry`,
+    );
   }
   return updated;
 }
@@ -3466,6 +3588,66 @@ function delay(ms: number): Promise<void> {
 
 function cloneJob(job: StateMachineWatcherJob): StateMachineWatcherJob {
   return structuredClone(job) as StateMachineWatcherJob;
+}
+
+function patchCasMatches(
+  job: StateMachineWatcherJob,
+  patch: StateMachineJobPatch,
+): boolean {
+  if (patch.expectStatus !== undefined && job.status !== patch.expectStatus) {
+    return false;
+  }
+  if (patch.expectClaimPid !== undefined && (job.claim?.pid ?? null) !== patch.expectClaimPid) {
+    return false;
+  }
+  return true;
+}
+
+function applyJobPatch(
+  current: StateMachineWatcherJob,
+  patch: StateMachineJobPatch,
+): StateMachineWatcherJob {
+  const { lastError: currentLastError, claim: currentClaim, ...currentWithoutOptional } = current;
+  const next: StateMachineWatcherJob = {
+    ...currentWithoutOptional,
+    ...(patch.status ? { status: patch.status } : {}),
+    updatedAt: patch.updatedAt,
+    ...(patch.attempts !== undefined ? { attempts: patch.attempts } : {}),
+    ...(patch.matchedKey !== undefined ? { matchedKey: patch.matchedKey } : {}),
+    ...(patch.planId !== undefined ? { planId: patch.planId } : {}),
+    ...(patch.submissions ? { submissions: patch.submissions } : {}),
+    ...(patch.clearLastError ? {} : currentLastError ? { lastError: currentLastError } : {}),
+    ...(patch.lastError ? { lastError: patch.lastError } : {}),
+    ...(patch.lastSignalAttemptAt !== undefined ? { lastSignalAttemptAt: patch.lastSignalAttemptAt } : {}),
+    ...(patch.manualActions ? { manualActions: patch.manualActions } : {}),
+  };
+  // claim 解析：显式写入优先（对象=认领，null=释放），未声明则保持现状。
+  const resolvedClaim = patch.claim !== undefined ? patch.claim : currentClaim;
+  return resolvedClaim !== undefined && resolvedClaim !== null
+    ? { ...next, claim: resolvedClaim }
+    : next;
+}
+
+/** A claim held by another live process: the run is in flight right now. */
+function isLiveForeignClaim(
+  claim: { readonly pid: number; readonly at: string } | undefined,
+): boolean {
+  return claim !== undefined && claim.pid !== process.pid && isProcessAlive(claim.pid);
+}
+
+/**
+ * Any held claim blocks a second executor: a foreign pid counts as held while
+ * its process is alive, a same-pid claim is always held — the only way it can
+ * exist is a run currently in flight inside this process (another watcher
+ * instance or CLI entry), since every concluded run releases its claim.
+ */
+function isHeldRunClaim(
+  claim: { readonly pid: number; readonly at: string } | undefined,
+): boolean {
+  if (claim === undefined) {
+    return false;
+  }
+  return claim.pid === process.pid || isProcessAlive(claim.pid);
 }
 
 /**

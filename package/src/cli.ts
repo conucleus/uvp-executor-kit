@@ -536,9 +536,9 @@ export function buildProgram(): Command {
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (jobId: string, options: JobsRetryOptions) => {
-      // README 承诺 file 模式下不停机手工重投：retry 不取 state-dir 启动
-      // 锁（与运行中的 watcher 共存）；jobs 文件写路径由 withJobsFileLock
-      // 串行化，单 watcher 进程纪律不被破坏。
+      // README 承诺 file 模式下不停机手工重投：retry 不取 state-dir 启动锁
+      // （与运行中的 watcher 共存）。并发安全由任务级运行认领承担：正在被
+      // 其它执行器运行的任务会被拒绝，只有空闲或持有者已崩溃的任务可接管。
       const { watcher } = await buildStateMachineWatcherFromCli(options, { holdStateDirLock: false });
       const result = await retryStateMachineJob(watcher, jobId, {
         operator: options.operator,
@@ -811,8 +811,8 @@ async function buildStateMachineWatcherFromCli(
   builderOptions: {
     /**
      * jobs retry 按 README 承诺与运行中的 watcher 共存：不取 state-dir
-     * 启动锁（单 watcher 进程纪律仍由 watcher.lock 承担；retry 对
-     * jobs 文件的写路径由 withJobsFileLock 独立串行化）。
+     * 启动锁。并发安全由任务级运行认领承担——retry 拒绝正在被其它执行器
+     * 运行的任务（认领 pid 存活），只有在任务空闲或持有者已崩溃时才接管。
      */
     readonly holdStateDirLock?: boolean;
   } = {},
