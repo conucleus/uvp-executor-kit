@@ -133,10 +133,11 @@ describe('executor HTTP server', () => {
             stageIdentifier: 'exec.main',
             signalName: 'exec.main.cmp',
             senderId: 'exec-executor',
-            // Default key caliber matches the watcher SDK: order, source,
-            // signal, and the ready-event dimension — distinct sources behind
-            // one signalName are distinct facts.
-            idempotencyKey: 'order-1:buyer:exec.main.cmp:event-1',
+            // Default key caliber matches the watcher's fixed default:
+            // order, source, signal — the emitting event anchor (event-1)
+            // must NOT enter the key, or a re-emitted HookReady becomes a
+            // guaranteed-reverting duplicate broadcast.
+            idempotencyKey: 'order-1:buyer:exec.main.cmp',
             receivedAt: '2026-04-27T00:00:03.000Z',
           },
         },

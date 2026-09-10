@@ -190,12 +190,14 @@ export function createHandlersFromExecutorConfig(config: ExecutorConfig): Readon
         stageIdentifier: handler.stageIdentifier,
         signalName: handler.signalName,
         senderId: handler.senderId ?? config.executorId,
-        // Same caliber as the watcher's SDK default: the key carries the
-        // source and ready-event dimensions. The old orderId:hookId:signalName
-        // shape collapsed a re-emitted HookReady for the same (order, hook)
-        // and distinct sources behind one key.
+        // Same caliber as the watcher's fixed default (watcher.ts): the key
+        // carries the logical signal dimensions (order, source, signal). The
+        // emitting HookReady event anchor (eventId) is deliberately absent —
+        // a fresh key per event anchor turns a re-emitted HookReady into a
+        // guaranteed-reverting duplicate broadcast on chain, the exact defect
+        // the watcher lane already fixed.
         idempotencyKey: handler.idempotencyKey
-          ?? ((effect) => `${effect.orderId}:${handler.source}:${handler.signalName}:${effect.eventId}`),
+          ?? ((effect) => `${effect.orderId}:${handler.source}:${handler.signalName}`),
         ...(handler.traceId ? { traceId: handler.traceId } : {}),
         ...(handler.payloadRef ? { payloadRef: handler.payloadRef } : {}),
         ...(handler.receivedAt ? { receivedAt: handler.receivedAt } : {}),

@@ -150,6 +150,8 @@ interface ProductSubmitOptions extends ProductClientCliOptions {
   preparedFile: string;
   privateKeyEnv: string;
   walletAddress?: string;
+  expectedChainId?: string;
+  expectedVerifyingContract?: string;
 }
 
 type ProductProofOptions = ProductClientCliOptions;
@@ -345,6 +347,8 @@ export function buildProgram(): Command {
     .option('--wallet-address <address>', 'expected signer wallet; defaults to the private key address')
     .option('--principal-id <id>', 'optional Product API principal id header')
     .option('--auth-token-env <ENV_NAME>', 'env var containing Product API bearer token')
+    .option('--expected-chain-id <id>', 'expected chain id anchoring the prepared typedData domain; signing fails closed on mismatch')
+    .option('--expected-verifying-contract <address>', 'expected verifying contract anchoring the prepared typedData domain; signing fails closed on mismatch')
     .option('--verbose', 'include the raw Product API submission payload')
     .action(async (taskId: string, options: ProductSubmitOptions) => {
       const prepared = await readPreparedSignalContainerFile(options.preparedFile);
@@ -359,6 +363,16 @@ export function buildProgram(): Command {
         prepared,
         privateKeyEnv: options.privateKeyEnv,
         ...(options.walletAddress ? { walletAddress: options.walletAddress } : {}),
+        // 域锚（对齐浏览器端调用方）：锚来自操作方按部署配置声明的
+        // 选项，不从 prepared 载荷自取（循环信任）。
+        ...(options.expectedChainId !== undefined || options.expectedVerifyingContract !== undefined
+          ? {
+              expectedDomain: {
+                ...(options.expectedChainId !== undefined ? { chainId: parsePositiveInteger(options.expectedChainId, 'expectedChainId') } : {}),
+                ...(options.expectedVerifyingContract !== undefined ? { verifyingContract: options.expectedVerifyingContract } : {}),
+              },
+            }
+          : {}),
       });
       const submission = await submitPreparedSignalContainer({
         ...productClientOptions(options),
@@ -522,7 +536,10 @@ export function buildProgram(): Command {
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (jobId: string, options: JobsRetryOptions) => {
-      const { watcher } = await buildStateMachineWatcherFromCli(options);
+      // README 承诺 file 模式下不停机手工重投：retry 不取 state-dir 启动
+      // 锁（与运行中的 watcher 共存）；jobs 文件写路径由 withJobsFileLock
+      // 串行化，单 watcher 进程纪律不被破坏。
+      const { watcher } = await buildStateMachineWatcherFromCli(options, { holdStateDirLock: false });
       const result = await retryStateMachineJob(watcher, jobId, {
         operator: options.operator,
         ...(options.reason ? { reason: options.reason } : {}),
@@ -602,22 +619,25 @@ export function buildProgram(): Command {
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainWatchOptions) => {
       const { watcher, storage, stateLock } = await buildStateMachineWatcherFromCli(options);
-      console.log(stringifyForTransport({ watcher: watcher.describe(), storage }));
-      const handle = await watcher.start();
       try {
-        // handle.done resolves on stop(); persistent poll failures are
-        // reported through the watcher's onError (stderr) with capped
-        // exponential backoff instead of aborting the loop.
-        await Promise.race([
-          handle.done,
-          waitForShutdown(async () => {
-            await handle.stop();
-          }),
-        ]);
+        console.log(stringifyForTransport({ watcher: watcher.describe(), storage }));
+        const handle = await watcher.start();
+        try {
+          // handle.done resolves on stop(); persistent poll failures are
+          // reported through the watcher's onError (stderr) with capped
+          // exponential backoff instead of aborting the loop.
+          await Promise.race([
+            handle.done,
+            waitForShutdown(async () => {
+              await handle.stop();
+            }),
+          ]);
+        } finally {
+          await handle.stop();
+        }
       } finally {
-        await handle.stop();
-        // Signal shutdown paths run through waitForShutdown -> stop(); the
-        // state-dir lock must not outlive the watcher process either way.
+        // 取锁与 finally 之间的一切失败路径（describe/start 抛错）都必须
+        // 释放 state-dir 锁，否则泄漏的 watcher.lock 拒绝下一个进程。
         await stateLock?.release();
       }
     });
@@ -786,7 +806,17 @@ export function resolveWatcherStorage(
   };
 }
 
-async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Promise<{
+async function buildStateMachineWatcherFromCli(
+  options: ChainWatchOptions,
+  builderOptions: {
+    /**
+     * jobs retry 按 README 承诺与运行中的 watcher 共存：不取 state-dir
+     * 启动锁（单 watcher 进程纪律仍由 watcher.lock 承担；retry 对
+     * jobs 文件的写路径由 withJobsFileLock 独立串行化）。
+     */
+    readonly holdStateDirLock?: boolean;
+  } = {},
+): Promise<{
   watcher: ReturnType<typeof createStateMachineWatcher>;
   storage: WatcherStorageSummary;
   /** Held for the process lifetime in file mode; release on exit (including signal shutdown). */
@@ -814,48 +844,55 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Prom
   const storage = resolveWatcherStorage(options);
   // File 模式下 state-dir 由一个 watcher 进程独占：启动即取进程锁，
   // 既有锁的持有进程存活时直接拒绝（fail-closed），崩溃残留锁接管。
-  const stateLock = storage.summary.mode === 'file'
+  const stateLock = storage.summary.mode === 'file' && builderOptions.holdStateDirLock !== false
     ? await acquireWatcherStateDirLock(storage.summary.stateDir)
     : undefined;
-  const effectiveDryRun = options.dryRun ?? config.dryRun ?? false;
-  if (options.dryRun === undefined && config.dryRun === true) {
-    // The config-level dryRun silently overrides the documented "real
-    // execution is the default" contract for every invocation that omits the
-    // flag; make the effective mode visible instead.
-    console.error(
-      `warning: dryRun:true in ${options.config} is active; nothing is broadcast until it is removed or --dry-run is passed explicitly`,
-    );
+  try {
+    const effectiveDryRun = options.dryRun ?? config.dryRun ?? false;
+    if (options.dryRun === undefined && config.dryRun === true) {
+      // The config-level dryRun silently overrides the documented "real
+      // execution is the default" contract for every invocation that omits the
+      // flag; make the effective mode visible instead.
+      console.error(
+        `warning: dryRun:true in ${options.config} is active; nothing is broadcast until it is removed or --dry-run is passed explicitly`,
+      );
+    }
+    const watcher = createStateMachineWatcher({
+      rpcUrl: options.rpcUrl,
+      stateMachineAddress,
+      stateMachines: configuredStateMachines.length > 0
+        ? configuredStateMachines
+        : [{ stateMachineAddress }],
+      chainId: parsePositiveInteger(options.chainId, 'chainId'),
+      ...(config.supplierId ?? config.executorId ? { supplierId: config.supplierId ?? config.executorId } : {}),
+      ...(options.walletAddress ? { walletAddress: normalizeAddress(options.walletAddress, 'walletAddress') } : config.walletAddress ? { walletAddress: config.walletAddress } : {}),
+      privateKeyEnv: options.privateKeyEnv,
+      handlers: createStateMachineHandlersFromConfig(config),
+      ...(config.artifact ? { artifact: config.artifact } : {}),
+      ...(config.retry ? { retry: config.retry } : {}),
+      ...(storage.jobStore ? { jobStore: storage.jobStore } : {}),
+      ...(storage.cursorStore ? { cursorStore: storage.cursorStore } : {}),
+      dryRun: effectiveDryRun,
+      ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
+      ...(options.fromBlock ? { fromBlock: options.fromBlock } : {}),
+      ...(options.pollIntervalMs ? { pollIntervalMs: parsePositiveInteger(options.pollIntervalMs, 'pollIntervalMs') } : {}),
+      ...(options.confirmations !== undefined ? { confirmations: parseNonNegativeIntegerOption(options.confirmations, 'confirmations') } : {}),
+      ...(options.reorgWindow !== undefined ? { reorgWindow: parsePositiveInteger(options.reorgWindow, 'reorgWindow') } : {}),
+      ...(options.getLogsBlockSpan !== undefined ? { getLogsBlockSpan: parsePositiveInteger(options.getLogsBlockSpan, 'getLogsBlockSpan') } : {}),
+      onPoll: (poll) => {
+        console.log(stringifyForTransport({ poll }));
+      },
+      onError: (error) => {
+        console.error(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
+      },
+    });
+    return { watcher, storage: storage.summary, stateLock };
+  } catch (error) {
+    // 取锁之后的任何构造/参数解析失败都必须先释放锁再抛出——泄漏的
+    // watcher.lock 会把下一个进程（含同主机的手工 jobs retry）拒之门外。
+    await stateLock?.release();
+    throw error;
   }
-  const watcher = createStateMachineWatcher({
-    rpcUrl: options.rpcUrl,
-    stateMachineAddress,
-    stateMachines: configuredStateMachines.length > 0
-      ? configuredStateMachines
-      : [{ stateMachineAddress }],
-    chainId: parsePositiveInteger(options.chainId, 'chainId'),
-    ...(config.supplierId ?? config.executorId ? { supplierId: config.supplierId ?? config.executorId } : {}),
-    ...(options.walletAddress ? { walletAddress: normalizeAddress(options.walletAddress, 'walletAddress') } : config.walletAddress ? { walletAddress: config.walletAddress } : {}),
-    privateKeyEnv: options.privateKeyEnv,
-    handlers: createStateMachineHandlersFromConfig(config),
-    ...(config.artifact ? { artifact: config.artifact } : {}),
-    ...(config.retry ? { retry: config.retry } : {}),
-    ...(storage.jobStore ? { jobStore: storage.jobStore } : {}),
-    ...(storage.cursorStore ? { cursorStore: storage.cursorStore } : {}),
-    dryRun: effectiveDryRun,
-    ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
-    ...(options.fromBlock ? { fromBlock: options.fromBlock } : {}),
-    ...(options.pollIntervalMs ? { pollIntervalMs: parsePositiveInteger(options.pollIntervalMs, 'pollIntervalMs') } : {}),
-    ...(options.confirmations !== undefined ? { confirmations: parseNonNegativeIntegerOption(options.confirmations, 'confirmations') } : {}),
-    ...(options.reorgWindow !== undefined ? { reorgWindow: parsePositiveInteger(options.reorgWindow, 'reorgWindow') } : {}),
-    ...(options.getLogsBlockSpan !== undefined ? { getLogsBlockSpan: parsePositiveInteger(options.getLogsBlockSpan, 'getLogsBlockSpan') } : {}),
-    onPoll: (poll) => {
-      console.log(stringifyForTransport({ poll }));
-    },
-    onError: (error) => {
-      console.error(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
-    },
-  });
-  return { watcher, storage: storage.summary, stateLock };
 }
 
 async function validateConfigFromCli(options: ConfigValidateOptions): Promise<Record<string, unknown>> {

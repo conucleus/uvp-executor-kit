@@ -208,4 +208,71 @@ describe('watcher state-dir 进程锁', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('取锁后的构造/参数解析失败必须释放锁——泄漏的 watcher.lock 会拒绝下一个进程', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-state-lock-release-'));
+    const originalLog = console.log;
+    const previousExitCode = process.exitCode;
+    process.exitCode = undefined;
+    console.log = () => {};
+    const stub = await startChainStub();
+    const configPath = await writeHandlerConfig(dir);
+    try {
+      // --chain-id abc 在锁取得之后才解析失败（ValidationError）。
+      await assert.rejects(
+        main(chainOnceArgv({ stubUrl: stub.url, configPath, stateDir: dir }).map(
+          (arg, index, all) => (all[index - 1] === '--chain-id' ? 'abc' : arg),
+        )),
+        /chainId/u,
+      );
+      // 失败路径不得泄漏 watcher.lock：锁文件已移除，下一个进程可启动。
+      assert.equal(await readFile(join(dir, 'watcher.lock'), 'utf8').then(() => 'still-there', () => 'removed'), 'removed');
+      const lock = await acquireWatcherStateDirLock(dir);
+      await lock.release();
+    } finally {
+      await stub.close();
+      console.log = originalLog;
+      process.exitCode = previousExitCode;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('jobs retry 不取 state-dir 启动锁：持锁 watcher 存活时仍可执行（README 承诺）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-state-lock-retry-'));
+    const originalLog = console.log;
+    const previousExitCode = process.exitCode;
+    process.exitCode = undefined;
+    console.log = () => {};
+    const stub = await startChainStub();
+    const configPath = await writeHandlerConfig(dir);
+    const holder = await acquireWatcherStateDirLock(dir);
+    try {
+      const jobId = '0x' + 'ab'.repeat(32);
+      // 持锁进程存活：jobs retry 不因 state-dir 锁被拒——按业务事实失败
+      // （job 不存在），而不是 "locked by running process"。
+      await assert.rejects(
+        main([
+          'node', 'uvp-executor', 'jobs', 'retry', jobId,
+          '--jobs-file', join(dir, 'jobs.json'),
+          '--rpc-url', stub.url,
+          '--state-machine', stateMachine,
+          '--chain-id', '31337',
+          '--config', configPath,
+          '--operator', 'lock-test-operator',
+        ]),
+        (error: unknown) => {
+          const message = String((error as Error).message);
+          assert.ok(!message.includes('locked by running process'), `retry must not be rejected by the state-dir lock: ${message}`);
+          assert.match(message, /job .* not found/u);
+          return true;
+        },
+      );
+    } finally {
+      await holder.release();
+      await stub.close();
+      console.log = originalLog;
+      process.exitCode = previousExitCode;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

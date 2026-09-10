@@ -305,9 +305,6 @@ async function checkTaskReadiness(
       nextActionLabel = assigneeUnverified
         ? 'Ready to prepare, but assignee ownership was NOT verified (no wallet address configured). Run product prepare to build the signal container.'
         : 'Ready to prepare. Run product prepare to build the signal container.';
-    } else if (summary.status === 'closed' || summary.status === 'cancelled') {
-      nextAction = 'blocked';
-      nextActionLabel = `Task is ${summary.status} and cannot be acted on.`;
     } else if (blockedReason) {
       // The server's own blockedReason wins the action guidance. The locally
       // computed deadline is display context only (deadlineExpired above): a
