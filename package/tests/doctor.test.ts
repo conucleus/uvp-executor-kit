@@ -459,7 +459,12 @@ describe('Product API doctor', () => {
     expect(report.taskReadiness?.ok).toBe(false);
   });
 
-  it('reports per-task readiness without wallet address', async () => {
+  it('reports per-task readiness without wallet address as explicitly unverified', async () => {
+    // Without a wallet the assignee check cannot run at all. The readiness
+    // must not claim a match it never made (a missing wallet must not yield
+    // an unconditionally true assigneeMatch printing "Ready to prepare");
+    // the SDK reports assigneeUnverified instead, and the CLI refuses
+    // --task-id without --wallet-address entirely.
     const fetch: ProductApiFetch = async (url) => {
       if (!url.includes('/product/')) {
         return jsonResponse({ service: 'chain-services' });
@@ -486,9 +491,11 @@ describe('Product API doctor', () => {
       taskId: 'task_nowallet',
       status: 'open',
       canSubmit: true,
-      assigneeMatch: true,
+      assigneeMatch: false,
+      assigneeUnverified: true,
       configuredWallet: '',
     });
+    expect(report.taskReadiness?.nextActionLabel).toContain('NOT verified');
     // no tasks list when task-id is provided
     expect(report.tasks).toBeUndefined();
     expect(report.walletAddress).toBeUndefined();
@@ -528,6 +535,89 @@ describe('Product API doctor', () => {
     expect(report.ok).toBe(false);
   });
 
+  it('keeps the server canSubmit authoritative over the locally computed deadline', async () => {
+    // The deadline is display-only (parsed as UTC): the local clock never
+    // vetoes canSubmit from its own expiry computation, and the server's
+    // verdict wins even when the local computation says expired.
+    const fetch: ProductApiFetch = async (url) => {
+      if (!url.includes('/product/')) {
+        return jsonResponse({ service: 'chain-services' });
+      }
+      return jsonResponse({
+        task: {
+          taskId: 'task_deadline',
+          orderId: 'order_deadline',
+          title: 'Skewed clock task',
+          status: 'open',
+          assigneeWallet: submitter,
+          // Naive (no offset) past timestamp: displayed as expired, but the
+          // server said canSubmit=true and that conclusion is authoritative.
+          deadline: '2020-01-01T00:00:00.000',
+          canSubmit: true,
+        },
+      });
+    };
+
+    const report = await runProductDoctor({
+      chainServicesUrl: 'http://chain.local/api',
+      walletAddress: submitter,
+      taskId: 'task_deadline',
+      fetch,
+    });
+
+    expect(report.taskReadiness).toMatchObject({
+      taskId: 'task_deadline',
+      canSubmit: true,
+      assigneeMatch: true,
+      deadlineExpired: true,
+      nextAction: 'prepare',
+    });
+    expect(report.taskReadiness?.nextActionLabel).toContain('Ready to prepare');
+    expect(report.ok).toBe(true);
+  });
+
+  it('keeps the server blockedReason displayed even when the local clock computes the deadline as expired', async () => {
+    // The server's blockedReason always wins the nextAction label: the local
+    // deadline stays display-only (deadlineExpired) and never rewrites the
+    // action guidance with a clock-derived verdict when the server gave a
+    // reason.
+    const fetch: ProductApiFetch = async (url) => {
+      if (!url.includes('/product/')) {
+        return jsonResponse({ service: 'chain-services' });
+      }
+      return jsonResponse({
+        task: {
+          taskId: 'task_blocked_skew',
+          orderId: 'order_blocked_skew',
+          title: 'Blocked with skewed clock',
+          status: 'open',
+          assigneeWallet: submitter,
+          deadline: '2020-01-01T00:00:00.000Z',
+          canSubmit: false,
+          blockedReason: 'Required evidence not yet uploaded',
+        },
+      });
+    };
+
+    const report = await runProductDoctor({
+      chainServicesUrl: 'http://chain.local/api',
+      walletAddress: submitter,
+      taskId: 'task_blocked_skew',
+      fetch,
+    });
+
+    expect(report.taskReadiness).toMatchObject({
+      taskId: 'task_blocked_skew',
+      canSubmit: false,
+      blockedReason: 'Required evidence not yet uploaded',
+      // Local computation is still reported, as display context only.
+      deadlineExpired: true,
+      nextAction: 'wait',
+    });
+    expect(report.taskReadiness?.nextActionLabel).toContain('Required evidence not yet uploaded');
+    expect(report.taskReadiness?.nextActionLabel).not.toContain('deadline has passed');
+  });
+
   it('omits readiness and raw-task data when the task lookup fails', async () => {
     const fetch: ProductApiFetch = async (url) => {
       if (!url.includes('/product/')) {
@@ -553,6 +643,21 @@ describe('Product API doctor', () => {
 });
 
 describe('doctor CLI', () => {
+  it('refuses --task-id without --wallet-address instead of printing unverified readiness', async () => {
+    // without a wallet, assignee ownership cannot be checked at all —
+    // the readiness verdict must not print "Ready to prepare" anyway. The CLI
+    // enforces what its option help claims.
+    await expect(main([
+      'node',
+      'uvp-executor',
+      'doctor',
+      '--chain-services-url',
+      'http://chain.local/api',
+      '--task-id',
+      'task_no_wallet',
+    ])).rejects.toThrow(/--task-id requires --wallet-address/);
+  });
+
   it('passes Product API auth token env headers and reports only redacted auth status', async () => {
     const logs: string[] = [];
     const envName = 'UVP_DOCTOR_PRODUCT_API_TOKEN';

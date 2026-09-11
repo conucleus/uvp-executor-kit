@@ -106,11 +106,22 @@ export interface PrepareSignalContainerInput extends ProductApiClientOptions {
   readonly intent: ProductSubmitIntent;
 }
 
+/**
+ * 签名前对 prepared 载荷的预期锚（可选提供，逐项生效）：
+ * 与浏览器面 signTypedData 的期望域同口径——被攻陷的 prepare 响应可以把
+ * 签名引到另一条链或另一个状态机合约的域上，提供锚即在这些字段上 fail-closed。
+ */
+export interface SignPreparedSignalContainerExpectedDomain {
+  readonly chainId?: number;
+  readonly verifyingContract?: Address | string;
+}
+
 export interface SignPreparedSignalContainerInput {
   readonly target?: ChainTarget;
   readonly prepared: PreparedSignalContainer | Record<string, unknown>;
   readonly privateKeyEnv: string;
   readonly walletAddress?: Address | string;
+  readonly expectedDomain?: SignPreparedSignalContainerExpectedDomain;
 }
 
 export interface SignedPreparedSignalContainer {
@@ -343,6 +354,19 @@ export async function signPreparedSignalContainer(
   }
   if (signerAddress !== configuredWallet) {
     throw new ValidationError('private key signer does not match configured wallet');
+  }
+  if (input.expectedDomain?.chainId !== undefined && prepared.typedData.domain.chainId !== input.expectedDomain.chainId) {
+    throw new ValidationError(
+      `prepared typedData.domain.chainId ${prepared.typedData.domain.chainId} does not match expected chainId ${input.expectedDomain.chainId}`,
+    );
+  }
+  if (input.expectedDomain?.verifyingContract !== undefined) {
+    const expectedContract = normalizeAddress(input.expectedDomain.verifyingContract, 'expectedDomain.verifyingContract');
+    if (prepared.typedData.domain.verifyingContract !== expectedContract) {
+      throw new ValidationError(
+        `prepared typedData.domain.verifyingContract ${prepared.typedData.domain.verifyingContract} does not match expected verifyingContract ${expectedContract}`,
+      );
+    }
   }
 
   const signature = await account.signTypedData(
@@ -585,11 +609,8 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
   requireExactKeys(message, PRODUCT_SUBMIT_TYPED_DATA_FIELDS.map((field) => field.name), `${label}.message`);
   const planId = normalizeBytes32(requiredString(message, 'planId', `${label}.message`), `${label}.message.planId`);
   if (planId === ZERO_BYTES32) {
-    // The signature commits to (planId, orderId) and the contract
-    // verifies plan existence, so a zero-planId prepared submission could only
-    // produce a signature that can never land. The protocol-bindings builder's
-    // optional-planId zero default exists solely for shape-checking gates; a
-    // signer must never accept it.
+    // prepared 载荷来自网络对端：签名对 (planId, orderId) 承诺，合约侧还要
+    // 核验 plan 存在性，零 planId 的签名永远无法上链落地，必须在签名前拒绝。
     throw new ValidationError(`${label}.message.planId must be a non-zero bytes32 plan id: the zero placeholder cannot satisfy the on-chain (planId, orderId) existence check`);
   }
   return {

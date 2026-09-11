@@ -34,7 +34,7 @@ const TX_HASH: Hex = '0x' + 'ab'.repeat(32);
  */
 
 const TAXONOMY_VERSION = 'uvp.error-taxonomy.v1';
-const TAXONOMY_SHA256 = 'b742667c145f4e14db428405af64b004a6379f46cc440f9fafe2114fc19d30fc';
+const TAXONOMY_SHA256 = 'eb3ceba32669cbdc74b62482e341314f864c49e26bdc570401772457544bd059';
 
 interface TaxonomyErrorEntry {
   readonly code: string;
@@ -199,6 +199,24 @@ describe('executor-kit classification completeness against the taxonomy', () => 
     expect(classified.kind).toBe('rpc_network');
     expect(classified.retryable).toBe(attrs.retryable);
     expect(attrs.dead_letter).toBe(false);
+  });
+
+  it('keeps public 0x-prefixed identifiers in classified messages while redacting bare key material', () => {
+    // the redactor swept every 66-char 0x-prefixed value — including
+    // tx hashes operators need for correlation — into [redacted]; only bare
+    // 64-hex key material (the shape of raw key echoes) is redacted now.
+    const receiptError = classifyExecutorKitError(new SubmitSignalReceiptError(
+      TX_HASH,
+      `submitSignal transaction receipt wait failed for ${TX_HASH}: Request timed out.`,
+      { cause: new Error('Request timed out.') },
+    ));
+    expect(receiptError.message).toContain(TX_HASH);
+    expect(receiptError.message).not.toContain('[redacted');
+
+    const bareKey = 'ab'.repeat(32);
+    const leaked = classifyExecutorKitError(new Error(`signing failed with key ${bareKey}`));
+    expect(leaked.message).not.toContain(bareKey);
+    expect(leaked.message).toContain('[redacted-32-byte-hex]');
   });
 
   it('pins the state-machine job status lanes that consume the classification', () => {

@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -787,9 +787,9 @@ describe('state machine chain watcher', () => {
   });
 
   it('keeps the watch loop alive with backed-off retries when every poll keeps failing', async () => {
-    // F9: a permanent clearInterval abort after a few consecutive failures
-    // had no recovery path — a transient RPC outage killed the listener until
-    // a human restarted the process. The loop now reports through onError and
+    // a permanent clearInterval abort after a few consecutive failures
+    // has no recovery path — a transient RPC outage would kill the listener
+    // until a human restarted the process. The loop reports through onError and
     // slows down (capped exponential backoff) instead of stopping.
     const errors: unknown[] = [];
     let polls = 0;
@@ -1107,10 +1107,10 @@ describe('state machine chain watcher', () => {
   });
 
   it('counts only real failures in attempts so completed dry-run multi-signal jobs stay retryable', async () => {
-    // 0200#19: attempts used to accumulate per signal x per attempt with
-    // successes included, so a finished dry-run multi-signal job hit the
-    // manual retry entry already >= maxAttempts and the dead-letter branch
-    // killed a job that had never failed once.
+    // attempts must count only real failures: accumulating per signal x per
+    // attempt with successes included would let a finished dry-run multi-
+    // signal job hit the manual retry entry already >= maxAttempts, and the
+    // dead-letter branch would kill a job that never failed once.
     const watcher = createStateMachineWatcher({
       rpcUrl: 'http://127.0.0.1:8545',
       stateMachineAddress: STATE_MACHINE,
@@ -1269,9 +1269,9 @@ describe('state machine chain watcher', () => {
   });
 
   it('re-opens a confirmed job through the manual retry channel with forced resubmission', async () => {
-    // F-03: `confirmed` used to be a permanent lock — retry refused it, so a
-    // reorg that flipped the confirmation off the canonical chain left the
-    // job stuck with no human recovery. The retry now resubmits every signal
+    // `confirmed` must not be a permanent lock: a reorg that flips the
+    // confirmation off the canonical chain would leave the job stuck with
+    // no human recovery if retry refused it. The retry resubmits every signal
     // (the on-chain idempotency key absorbs a duplicate when the signal
     // actually survived).
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
@@ -1325,7 +1325,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('rolls the scan cursor back to the common ancestor when a reorg flips the cursor block hash', async () => {
-    // F-03: with no hash continuity check, a short fork let the cursor pass a
+    // With no hash continuity check, a short fork let the cursor pass a
     // block that left the canonical chain, and everything on the orphaned
     // branch was silently never rescanned.
     const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-reorg-'));
@@ -1441,7 +1441,7 @@ describe('state machine chain watcher', () => {
   });
 
   it('throttles rebroadcasts of unconfirmed signals with capped exponential backoff', async () => {
-    // O13: the rescan keeps meeting the open job every poll round; without a
+    // the rescan keeps meeting the open job every poll round; without a
     // backoff the same unconfirmed signal was rebroadcast once per round. The
     // chain idempotency key stays the dedupe anchor (accepted stance) — this
     // only stops the per-round gas burn.
@@ -1587,11 +1587,12 @@ describe('state machine chain watcher', () => {
 
   it('resumes a partially delivered multi-signal job from the next pending signal instead of replaying', async () => {
     // Retry resume contract: after a partial multi-signal failure, retrying
-    // must not resubmit signals that already have a prior real broadcast —
-    // the chain would answer the already delivered one with
-    // SignalAlreadyExists and the job would park in terminal
-    // `ignored`, which `jobs retry` rejects — a dead-locked job. Retry
-    // resumes from the first signal without a prior real broadcast.
+    // must not resubmit signals whose delivery is already evidenced — the
+    // chain would answer the already delivered one with SignalAlreadyExists
+    // and the job would park in terminal `ignored`, which `jobs retry`
+    // rejects — a dead-locked job. Delivery evidence now means the receipt:
+    // the seeded signal-0 broadcast carries no observed receipt, so the retry
+    // re-checks it (mined success) and adopts it without rebroadcasting.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();
     try {
@@ -1600,7 +1601,23 @@ describe('state machine chain watcher', () => {
         stateMachineAddress: STATE_MACHINE,
         chainId: 31_337,
         privateKeyEnv: KEY_ENV,
-        publicClient: fakeReceiptClient(31_337, { status: 'success' }),
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async waitForTransactionReceipt() {
+            return { status: 'success' };
+          },
+          async getTransactionReceipt() {
+            return { status: 'success' };
+          },
+        },
         artifact: artifactIndex(),
         retry: { maxAttempts: 3, baseDelayMs: 0 },
         handlers: {
@@ -1612,7 +1629,8 @@ describe('state machine chain watcher', () => {
       });
 
       // Seed the exact post-partial-failure state: signal 0 was really
-      // broadcast (no error), signal 1 failed and exhausted the run.
+      // broadcast but its receipt was never observed, signal 1 failed and
+      // exhausted the run.
       const event = decodeHookReadyLog(hookReadyLog(), artifactIndex())!;
       const seeded = await watcher.config.jobStore.upsertDetected(event, {
         now: '2026-04-28T00:00:00.000Z',
@@ -1638,17 +1656,20 @@ describe('state machine chain watcher', () => {
         reason: 'rpc recovered',
       });
 
-      // Only the pending signal was rebroadcast — one broadcast total.
+      // Signal 0 was adopted from its mined receipt (no rebroadcast); only the
+      // pending signal went out — one broadcast total.
       expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
       expect(result.status).toBe('handled');
       expect(result.job?.status).toBe('confirmed');
       expect(result.job?.lastError).toBeUndefined();
-      // Audit trail: the seeded history is preserved and exactly one new
-      // submission (signalIndex 1, successful) was appended.
+      // Audit trail: the seeded history is preserved, signal 0's delivery is
+      // recorded as a confirmed receipt-recovery entry, and exactly one new
+      // broadcast submission (signalIndex 1) was appended.
       const submissions = result.job?.submissions ?? [];
-      expect(submissions).toHaveLength(3);
-      expect(submissions[2]).toMatchObject({ signalIndex: 1, dryRun: false, txHash: TX_HASH });
-      expect(submissions[2]?.error).toBeUndefined();
+      expect(submissions).toHaveLength(4);
+      expect(submissions[2]).toMatchObject({ signalIndex: 0, dryRun: false, txHash: TX_HASH, confirmed: true });
+      expect(submissions[3]).toMatchObject({ signalIndex: 1, dryRun: false, txHash: TX_HASH, confirmed: true });
+      expect(submissions[3]?.error).toBeUndefined();
     } finally {
       await stub.close();
       delete process.env[KEY_ENV];
@@ -1738,6 +1759,1287 @@ describe('state machine chain watcher', () => {
     expect(after?.status).toBe('submitted');
     expect(after?.manualActions).toBeUndefined();
   });
+
+  it('accepts a manual retry for a detected job stranded by a crash', async () => {
+    // A crash between detection and processing leaves the job in
+    // `detected` with no run at all — the manual retry channel must accept
+    // that status, or the job is unreachable even for human recovery.
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      dryRun: true,
+      artifact: artifactIndex(),
+      handlers: {
+        '*': (event) => ({
+          planId: PLAN_ID,
+          orderId: event.orderId,
+          source: 'buyer',
+          signalName: 'exec.main.cmp',
+          payloadHash: PAYLOAD_HASH,
+        }),
+      },
+    });
+    const event = decodeHookReadyLog(hookReadyLog(), artifactIndex())!;
+    await watcher.config.jobStore.upsertDetected(event, {
+      now: '2026-04-28T00:00:00.000Z',
+      maxAttempts: 3,
+    });
+
+    const retried = await retryStateMachineJob(watcher, stateMachineJobId(event), {
+      operator: 'ops@example.com',
+      reason: 'crash left the job detected',
+    });
+    expect(retried.status).toBe('handled');
+    expect(retried.job?.status).toBe('matched');
+  });
+
+  it('revisits open jobs behind the cursor on later scans instead of stranding them', async () => {
+    // handleLog only ran for logs inside the current poll window, so an
+    // open job whose block the cursor already passed was never revisited —
+    // the README's later-scan promise had no implementation. The poll now
+    // replays open jobs (detected/submitted) from the store whose blocks are
+    // behind the window.
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      fromBlock: 20,
+      dryRun: true,
+      artifact: artifactIndex(),
+      handlers: {
+        '*': (event) => ({
+          planId: PLAN_ID,
+          orderId: event.orderId,
+          source: 'buyer',
+          signalName: 'exec.main.cmp',
+          payloadHash: PAYLOAD_HASH,
+        }),
+      },
+      publicClient: {
+        async getChainId() {
+          return 31_337;
+        },
+        async getBlockNumber() {
+          return 22n;
+        },
+        async getLogs() {
+          return [];
+        },
+      },
+    });
+    // A detected job from block 12 — long behind the 20..21 scan window.
+    const event = decodeHookReadyLog(hookReadyLog(), artifactIndex())!;
+    await watcher.config.jobStore.upsertDetected(event, {
+      now: '2026-04-28T00:00:00.000Z',
+      maxAttempts: 3,
+    });
+
+    const poll = await watcher.pollOnce();
+
+    expect(poll.scannedLogs).toBe(0);
+    expect(poll.results).toHaveLength(1);
+    expect(poll.results[0]?.status).toBe('handled');
+    expect(poll.results[0]?.job?.status).toBe('matched');
+    expect(watcher.describe().nextBlock).toBe('22');
+  });
+
+  it('rechecks the receipt of an unconfirmed broadcast when a later scan revisits the job', async () => {
+    // A waitForReceipt:false broadcast returned without error and was
+    // permanently counted as delivered — a reverted tx could never be
+    // rechecked. Unconfirmed broadcasts are now resolved by receipt evidence
+    // on the next scan, without a rebroadcast when the receipt shows success.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      let receipt: { readonly status?: string } | null = null;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        waitForReceipt: false,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getTransactionReceipt() {
+            return receipt;
+          },
+        },
+        artifact: artifactIndex(),
+        handlers: {
+          '*': (event) => ({
+            planId: PLAN_ID,
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          }),
+        },
+      });
+
+      // First run: broadcast without waiting — outcome unknown, job open.
+      const first = await watcher.handleLog(hookReadyLog());
+      expect(first.job?.status).toBe('submitted');
+      expect(first.job?.submissions[0]?.confirmed).toBeUndefined();
+
+      // Later scan, receipt now visible: adopted as confirmed, no rebroadcast.
+      receipt = { status: 'success' };
+      const second = await watcher.handleLog(hookReadyLog());
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(second.job?.status).toBe('confirmed');
+      const submissions = second.job?.submissions ?? [];
+      expect(submissions).toHaveLength(2);
+      expect(submissions[1]).toMatchObject({ signalIndex: 0, dryRun: false, txHash: TX_HASH, confirmed: true });
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('derives distinct default idempotency keys for distinct sources and stable keys across re-emitted events', async () => {
+    // The default key carries the source dimension: an orderId:hookId:-
+    // signalName key would judge different sources behind one signalName as
+    // the same fact. It deliberately does NOT carry the event dimension: the
+    // key mirrors the contract's
+    // SignalAlreadyExists tuple (planId, orderId, sourceId, signalId), so a
+    // HookReady re-emitted in a new transaction after a deep reorg reuses the
+    // same key instead of minting a fresh one per event anchor and putting a
+    // guaranteed-reverting duplicate broadcast on chain.
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      dryRun: true,
+      artifact: artifactIndex(),
+      handlers: createStateMachineHandlersFromConfig({
+        handlers: {
+          '*': {
+            signals: [
+              { source: 'buyer', stageIdentifier: 'exec.main', signalName: 'cmp' },
+              { source: 'seller', stageIdentifier: 'exec.main', signalName: 'cmp' },
+            ],
+          },
+        },
+      }),
+    });
+
+    const first = await watcher.handleLog(hookReadyLog());
+    const keys = first.submissions.map((submission) =>
+      submission.dryRun ? submission.request.args[5] : undefined);
+    // Distinct sources behind the same signalName are distinct facts.
+    expect(keys[0]).not.toBe(keys[1]);
+
+    // The same (order, hook) re-emitted in a new log is the same logical
+    // signal: the key is anchored to the contract's dedupe tuple, not to the
+    // volatile (txHash, logIndex) event identity.
+    const reEmitLog = { ...hookReadyLog(), transactionHash: `0x${'34'.repeat(32)}` as Hex, logIndex: 9 };
+    const reEmit = await watcher.handleLog(reEmitLog);
+    const reEmitKey = reEmit.submissions[0]?.dryRun ? reEmit.submissions[0].request.args[5] : undefined;
+    expect(reEmitKey).toBe(keys[0]);
+
+    // Replaying the same event is converged (see the dry-run replay test): no
+    // second simulation, no new key.
+    const replay = await watcher.handleLog(hookReadyLog());
+    expect(replay.submissions).toHaveLength(0);
+  });
+
+  it('converges a replayed dry-run job instead of replaying the handler and growing the audit trail', async () => {
+    // a finished dry-run pass must converge to terminal: staying
+    // non-terminal forever would re-run the handler on every rescan
+    // (replaying its side effects) and append the full simulated submission
+    // set again — jobs.json would grow without bound.
+    let handlerRuns = 0;
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      dryRun: true,
+      artifact: artifactIndex(),
+      handlers: {
+        '*': (event) => {
+          handlerRuns += 1;
+          return {
+            planId: PLAN_ID,
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          };
+        },
+      },
+    });
+
+    const first = await watcher.handleLog(hookReadyLog());
+    expect(first.job?.status).toBe('matched');
+    expect(first.job?.submissions).toHaveLength(1);
+    expect(handlerRuns).toBe(1);
+
+    // Rescan of the same log: the converged dry-run job is skipped, not re-run.
+    const replay = await watcher.handleLog(hookReadyLog());
+    expect(replay.status).toBe('ignored');
+    expect(handlerRuns).toBe(1);
+    expect(replay.job?.submissions).toHaveLength(1);
+
+    // A manual retry re-opens the job and re-simulates without duplicating the
+    // persisted record.
+    const jobId = first.job?.id;
+    if (!jobId) {
+      throw new Error('expected job id');
+    }
+    const retried = await retryStateMachineJob(watcher, jobId, { operator: 'ops@example.com' });
+    expect(handlerRuns).toBe(2);
+    expect(retried.job?.submissions).toHaveLength(1);
+  });
+
+  it('records handler-context submitSignal broadcasts in the job audit trail', async () => {
+    // The handler-context submitSignal channel must go through the job
+    // submissions bookkeeping: a bypassing broadcast txHash would silently
+    // leave the audit trail the README promises is never dropped from.
+    // Context submissions are recorded with negative signal indexes so they
+    // never alias returned-signal indexes.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: fakeReceiptClient(31_337, { status: 'success' }),
+        artifact: artifactIndex(),
+        handlers: {
+          '*': async (event, context) => {
+            await context.submitSignal({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: PAYLOAD_HASH,
+            });
+          },
+        },
+      });
+
+      const result = await watcher.handleLog(hookReadyLog());
+
+      expect(stub.methods).toContain('eth_sendRawTransaction');
+      const submissions = result.job?.submissions ?? [];
+      expect(submissions).toHaveLength(1);
+      expect(submissions[0]?.signalIndex).toBe(-1);
+      expect(submissions[0]?.txHash).toBe(TX_HASH);
+      expect(submissions[0]?.confirmed).toBe(true);
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('resolves the planId per signal so a sibling pin never leaks into unpinned signals', async () => {
+    // the planId must be resolved per signal: reusing the first explicit
+    // signal planId as the whole job's fallback would broadcast an unpinned
+    // sibling with a planId the event never carried — a guaranteed on-chain
+    // revert that dead-letters the job.
+    const pinnedPlanId = `0x${'99'.repeat(32)}` as Hex;
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+      dryRun: true,
+      artifact: artifactIndex(),
+      handlers: {
+        '*': (event) => ([
+          { planId: pinnedPlanId, orderId: event.orderId, source: 'buyer', signalName: 'exec.main.cmp' },
+          { orderId: event.orderId, source: 'seller', signalName: 'exec.main.cmp' },
+        ]),
+      },
+    });
+
+    const result = await watcher.handleLog(hookReadyLog());
+    const planIds = result.submissions.map((submission) =>
+      submission.dryRun ? submission.request.args[0] : undefined);
+    // The pinned signal keeps its pin; the unpinned sibling takes the event
+    // planId, never the sibling's pin.
+    expect(planIds).toEqual([pinnedPlanId, PLAN_ID]);
+    expect(result.job?.planId).toBe(PLAN_ID);
+  });
+
+  it('refutes a reverted handler-context broadcast on a later scan instead of leaving it open forever', async () => {
+    // the handler-context submitSignal channel did not participate in
+    // the receipt recheck or the terminal-state computation, so a
+    // waitForReceipt:false context broadcast that actually reverted could never
+    // be refuted.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      let receipt: { readonly status?: string } | null = null;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        waitForReceipt: false,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getTransactionReceipt() {
+            return receipt;
+          },
+        },
+        artifact: artifactIndex(),
+        handlers: {
+          '*': async (event, context) => {
+            await context.submitSignal({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: PAYLOAD_HASH,
+            });
+          },
+        },
+      });
+
+      // First run: context broadcast without a receipt wait — outcome unknown.
+      const first = await watcher.handleLog(hookReadyLog());
+      expect(first.job?.status).toBe('submitted');
+      expect(first.job?.submissions[0]?.signalIndex).toBe(-1);
+
+      // Later scan, receipt shows the broadcast reverted: the job is refuted,
+      // not parked in the open lane forever. The context channel consults the
+      // prior broadcast's receipt before sending again, so no second
+      // transaction went out.
+      receipt = { status: 'reverted' };
+      const second = await watcher.handleLog(hookReadyLog());
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(second.job?.status).toBe('dead_letter');
+      expect(second.error?.message).toContain('submitSignal transaction receipt status reverted');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('adopts a confirmed handler-context broadcast on a later scan and finishes the job', async () => {
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      let receipt: { readonly status?: string } | null = null;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        waitForReceipt: false,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getTransactionReceipt() {
+            return receipt;
+          },
+        },
+        artifact: artifactIndex(),
+        handlers: {
+          '*': async (event, context) => {
+            await context.submitSignal({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: PAYLOAD_HASH,
+            });
+          },
+        },
+      });
+
+      const first = await watcher.handleLog(hookReadyLog());
+      expect(first.job?.status).toBe('submitted');
+
+      receipt = { status: 'success' };
+      const second = await watcher.handleLog(hookReadyLog());
+      // The context channel consults the prior broadcast's receipt before
+      // sending again, so the mined success is adopted without a second
+      // transaction, and the run finishes. Recovery and recheck keep the
+      // prior broadcast's signal index, so both adopted records sit on slot -1.
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(second.job?.status).toBe('confirmed');
+      const submissions = second.job?.submissions ?? [];
+      expect(submissions).toHaveLength(3);
+      expect(submissions[1]).toMatchObject({ signalIndex: -1, dryRun: false, txHash: TX_HASH, confirmed: true });
+      expect(submissions[2]).toMatchObject({ signalIndex: -1, dryRun: false, txHash: TX_HASH, confirmed: true });
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('keeps a job open when a later-scan receipt carries an unrecognized status instead of clipping it to reverted', async () => {
+    // Only a receipt observed as 'reverted' is a known revert. A node may
+    // return a status string outside the kit's vocabulary; clipping every
+    // non-success value to reverted terminalized broadcasts whose outcome was
+    // merely unknown.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      let receipt: { readonly status?: string } | null = null;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        waitForReceipt: false,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getTransactionReceipt() {
+            return receipt;
+          },
+        },
+        artifact: artifactIndex(),
+        handlers: {
+          '*': async (event, context) => {
+            await context.submitSignal({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: PAYLOAD_HASH,
+            });
+          },
+        },
+      });
+
+      const first = await watcher.handleLog(hookReadyLog());
+      expect(first.job?.status).toBe('submitted');
+
+      receipt = { status: '0xout-of-vocabulary' };
+      const second = await watcher.handleLog(hookReadyLog());
+      expect(second.job?.status).toBe('submitted');
+      expect(second.error).toBeUndefined();
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('resubmits a delivered handler-context signal when the manual retry declares the confirmation invalid', async () => {
+    // retry out of `confirmed` passes resubmitDelivered: the recorded delivery
+    // evidence is exactly what the operator declared invalid (reorg), so the
+    // context channel must rebroadcast instead of answering from evidence.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      let handlerRuns = 0;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: fakeReceiptClient(31_337, { status: 'success' }),
+        artifact: artifactIndex(),
+        handlers: {
+          '*': async (event, context) => {
+            handlerRuns += 1;
+            await context.submitSignal({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: PAYLOAD_HASH,
+            });
+          },
+        },
+      });
+
+      const first = await watcher.handleLog(hookReadyLog());
+      expect(first.job?.status).toBe('confirmed');
+
+      const retried = await retryStateMachineJob(watcher, first.job!.id, { operator: 'ops@example.com' });
+      expect(handlerRuns).toBe(2);
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(2);
+      expect(retried.job?.status).toBe('confirmed');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('continues context signal numbering across runs so a re-run signal never inherits a prior signal slot', async () => {
+    // Context indexes are the signal identity for the delivery-evidence set
+    // and the terminal-status intersection. Restarting at -1 every run let a
+    // re-run's new context signal adopt the prior signal's delivery evidence
+    // and land the job a false `confirmed` while its own broadcast was
+    // unobserved.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      let receiptLookups = 0;
+      let payload = PAYLOAD_HASH;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        waitForReceipt: false,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getTransactionReceipt() {
+            receiptLookups += 1;
+            return receiptLookups === 1 ? { status: 'success' } : null;
+          },
+        },
+        artifact: artifactIndex(),
+        handlers: {
+          '*': async (event, context) => {
+            await context.submitSignal({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: payload,
+            });
+          },
+        },
+      });
+
+      // First run: the context broadcast is resolved as success by the
+      // recheck, so the job lands `confirmed` with slot -1 delivered.
+      const first = await watcher.handleLog(hookReadyLog());
+      expect(first.job?.status).toBe('confirmed');
+      expect(first.job?.submissions.map((submission) => submission.signalIndex)).toEqual([-1, -1]);
+
+      // Manual retry emits a DIFFERENT context signal; its own receipt stays
+      // unobserved (lookup #2 returns null), so the job must remain open.
+      payload = `0x${'45'.repeat(32)}` as Hex;
+      const retried = await retryStateMachineJob(watcher, first.job!.id, { operator: 'ops@example.com' });
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(2);
+      const indexes = retried.job?.submissions.map((submission) => submission.signalIndex) ?? [];
+      expect(indexes).toEqual([-1, -1, -2]);
+      expect(retried.job?.status).toBe('submitted');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('finishes a receipt-confirmed handler-context run as terminal confirmed instead of looping', async () => {
+    // The terminal computation must count returned-signal and context-channel
+    // submissions alike as "observed this run": counting only returned-signal
+    // submissions would land even a fully receipt-confirmed context-channel
+    // run in the open `submitted` lane — the handler would then re-run on
+    // every scan and rebroadcast into a guaranteed
+    // SignalAlreadyExists revert.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      let handlerRuns = 0;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: fakeReceiptClient(31_337, { status: 'success' }),
+        artifact: artifactIndex(),
+        handlers: {
+          '*': async (event, context) => {
+            handlerRuns += 1;
+            await context.submitSignal({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: PAYLOAD_HASH,
+            });
+          },
+        },
+      });
+
+      const first = await watcher.handleLog(hookReadyLog());
+      expect(first.job?.status).toBe('confirmed');
+      expect(handlerRuns).toBe(1);
+
+      // Terminal: a later scan must not re-run the handler at all.
+      const rescan = await watcher.handleLog(hookReadyLog());
+      expect(rescan.status).toBe('ignored');
+      expect(handlerRuns).toBe(1);
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('applies the resend backoff and receipt consult to handler-context rebroadcasts', async () => {
+    // waitForReceipt:false with the receipt unavailable: the context channel
+    // defers inside the backoff window and only rebroadcasts past it —
+    // never rebroadcasting on every scan with no throttle.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const anchorAt = Date.parse('2026-04-28T00:00:00.000Z');
+      let clockMs = anchorAt;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        waitForReceipt: false,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getTransactionReceipt() {
+            return null;
+          },
+        },
+        artifact: artifactIndex(),
+        resendBackoff: { baseDelayMs: 30_000, maxDelayMs: 60_000 },
+        now: () => new Date(clockMs).toISOString(),
+        nowMs: () => clockMs,
+        handlers: {
+          '*': async (event, context) => {
+            const result = await context.submitSignal({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: PAYLOAD_HASH,
+            });
+            // A deferred outcome is a marker the handler must not mistake
+            // for success; anything else carries the submission result.
+            expect('deferredBroadcast' in result || 'txHash' in result).toBe(true);
+          },
+        },
+      });
+
+      const first = await watcher.handleLog(hookReadyLog());
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(first.job?.status).toBe('submitted');
+
+      // One second later: inside the 30s base delay — the rescan defers
+      // instead of putting a second transaction on chain.
+      clockMs = anchorAt + 1_000;
+      const deferred = await watcher.handleLog(hookReadyLog());
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(deferred.job?.status).toBe('submitted');
+
+      // Past the window the rebroadcast goes out; the chain's idempotency
+      // key absorbs the duplicate if the prior transaction mined.
+      clockMs = anchorAt + 30_001;
+      const resent = await watcher.handleLog(hookReadyLog());
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(2);
+      expect(resent.job?.status).toBe('submitted');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('defers a handler-context broadcast whose receipt wait failed instead of inviting an immediate rebroadcast', async () => {
+    // A retryable receipt-wait timeout after a successful broadcast must not
+    // be rethrown into the handler-retry loop, which would answer it with an
+    // immediate second transaction for the same signal. The context channel
+    // resolves with the deferred marker and keeps the job open.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      let handlerRuns = 0;
+      let sawDeferredMarker = false;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async waitForTransactionReceipt() {
+            throw new Error('Request timed out.');
+          },
+          async getTransactionReceipt() {
+            return null;
+          },
+        },
+        artifact: artifactIndex(),
+        retry: { maxAttempts: 3, baseDelayMs: 0 },
+        handlers: {
+          '*': async (event, context) => {
+            handlerRuns += 1;
+            const result = await context.submitSignal({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: PAYLOAD_HASH,
+            });
+            sawDeferredMarker = 'deferredBroadcast' in result;
+          },
+        },
+      });
+
+      const result = await watcher.handleLog(hookReadyLog());
+
+      // Exactly one broadcast and exactly one handler run: the unknown
+      // outcome defers to the later-scan receipt recheck.
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(handlerRuns).toBe(1);
+      expect(sawDeferredMarker).toBe(true);
+      expect(result.job?.status).toBe('submitted');
+      expect(result.job?.lastError?.kind).toBe('rpc_network');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('keeps a job with unresolved broadcasts in the open lane when the handler stops emitting signals', async () => {
+    // an empty handler result must not flip a job with an unconfirmed
+    // broadcast down to `matched` — that takes it out of the revisit lane
+    // exactly when its broadcast still needs the automatic receipt recheck.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      let emitSignals = true;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        waitForReceipt: false,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getTransactionReceipt() {
+            return null;
+          },
+        },
+        artifact: artifactIndex(),
+        handlers: {
+          '*': (event) => emitSignals
+            ? {
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: PAYLOAD_HASH,
+            }
+            : undefined,
+        },
+      });
+
+      const first = await watcher.handleLog(hookReadyLog());
+      expect(first.job?.status).toBe('submitted');
+
+      emitSignals = false;
+      const rescan = await watcher.handleLog(hookReadyLog());
+      expect(rescan.job?.status).toBe('submitted');
+      // The orphaned broadcast is still rechecked: its receipt was consulted
+      // (unavailable here) and no rebroadcast happened for an unemitted signal.
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('resends immediately when the backoff anchor is missing instead of starving the signal', async () => {
+    // the anchor fell back to updatedAt, which is rewritten on unrelated
+    // bookkeeping every round — jobs persisted before lastSignalAttemptAt
+    // existed deferred their rebroadcast forever.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const at = Date.parse('2026-04-28T00:00:00.000Z');
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: fakeReceiptClient(31_337, { status: 'success' }),
+        artifact: artifactIndex(),
+        retry: { maxAttempts: 3, baseDelayMs: 0 },
+        resendBackoff: { baseDelayMs: 30_000, maxDelayMs: 60_000 },
+        now: () => new Date(at).toISOString(),
+        nowMs: () => at,
+        handlers: {
+          '*': (event) => ({
+            planId: PLAN_ID,
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          }),
+        },
+      });
+      const event = decodeHookReadyLog(hookReadyLog(), artifactIndex())!;
+      const seeded = await watcher.config.jobStore.upsertDetected(event, {
+        now: new Date(at).toISOString(),
+        maxAttempts: 3,
+      });
+      // No lastSignalAttemptAt at all; updatedAt is as fresh as "now" — the old
+      // updatedAt fallback deferred this rebroadcast on every round.
+      await watcher.config.jobStore.update(seeded.id, {
+        status: 'submitted',
+        updatedAt: new Date(at).toISOString(),
+        submissions: [
+          { signalIndex: 0, attempt: 1, dryRun: false, txHash: TX_HASH, error: { kind: 'rpc_network', message: 'Request timed out.', retryable: true } },
+        ],
+      });
+
+      const result = await watcher.handleLog(hookReadyLog());
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(result.job?.status).toBe('confirmed');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('retries the cursor restore on the next poll after a transient store failure', async () => {
+    // one failed cursor read permanently abandoned the persisted
+    // position; the next successful round then saved a fresh cursor over
+    // anchors that were never read.
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-cursor-load-fail-'));
+    const errors: unknown[] = [];
+    try {
+      const cursorFile = join(dir, 'cursor.json');
+      await writeFile(cursorFile, `${JSON.stringify({
+        version: 2,
+        nextBlock: '16',
+        blockHash: `0x${'10'.repeat(32)}`,
+        checkpoints: [{ blockNumber: '15', blockHash: `0x${'0f'.repeat(32)}` }],
+        chainId: 31_337,
+        stateMachines: [STATE_MACHINE],
+      })}\n`);
+      let loadFails = true;
+      const client: StateMachinePublicClient = {
+        async getChainId() {
+          return 31_337;
+        },
+        async getBlockNumber() {
+          return 20n;
+        },
+        async getLogs() {
+          return [];
+        },
+        async getBlock(args: { readonly blockNumber: bigint }) {
+          return { hash: args.blockNumber === 15n ? `0x${'0f'.repeat(32)}` : `0x${Number(args.blockNumber + 1n).toString(16).padStart(64, '0')}` };
+        },
+      };
+      const buildWatcher = () => createStateMachineWatcher({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        walletAddress: WALLET_ADDRESS,
+        fromBlock: 10,
+        dryRun: true,
+        handlers: { '*': () => undefined },
+        onError: (error: unknown) => {
+          errors.push(error);
+        },
+        cursorStore: {
+          kind: 'file',
+          async load(context) {
+            if (loadFails) {
+              throw new Error('transient fs fault');
+            }
+            return new FileStateMachineCursorStore(cursorFile).load(context);
+          },
+          async save(state, context) {
+            return new FileStateMachineCursorStore(cursorFile).save(state, context);
+          },
+        },
+        publicClient: client,
+      });
+
+      // First poll dies on the transient load; the cursor is NOT silently
+      // abandoned (the failure surfaces instead of a fresh-start scan).
+      const first = buildWatcher();
+      await expect(first.pollOnce()).rejects.toThrow(/transient fs fault/);
+
+      // Second watcher instance (fresh memory) restores the persisted cursor.
+      loadFails = false;
+      const second = buildWatcher();
+      const poll = await second.pollOnce();
+      expect(poll.fromBlock).toBe(16n);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not commit in-memory cursor anchors when persistence fails', async () => {
+    // checkpoints and the cursor hash must be updated in memory only after
+    // the save: updating them before would make a failed save leave the next
+    // round's continuity check mismatch by construction — a false reorg
+    // rolling the whole range back.
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-cursor-save-fail-'));
+    const errors: unknown[] = [];
+    try {
+      const cursorFile = join(dir, 'cursor.json');
+      const realStore = new FileStateMachineCursorStore(cursorFile);
+      let saveFails = false;
+      const hashAt = (height: bigint): string => `0x${(Number(height) + 1).toString(16).padStart(64, '0')}`;
+      let head = 12n;
+      const buildWatcher = () => createStateMachineWatcher({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        walletAddress: WALLET_ADDRESS,
+        fromBlock: 10,
+        dryRun: true,
+        handlers: { '*': () => undefined },
+        onError: (error: unknown) => {
+          errors.push(error);
+        },
+        cursorStore: {
+          kind: 'file',
+          async load(context) {
+            return realStore.load(context);
+          },
+          async save(state, context) {
+            if (saveFails) {
+              throw new Error('disk full');
+            }
+            return realStore.save(state, context);
+          },
+        },
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return head;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getBlock(args: { readonly blockNumber: bigint }) {
+            return { hash: hashAt(args.blockNumber) };
+          },
+        },
+      });
+
+      await buildWatcher().pollOnce();
+      let stored = JSON.parse(await readFile(cursorFile, 'utf8')) as { nextBlock?: string };
+      expect(stored).toMatchObject({ nextBlock: '12' });
+
+      // Round 2 fails to persist: the round rejects and the in-memory anchors
+      // stay on the persisted position.
+      saveFails = true;
+      head = 14n;
+      const failing = buildWatcher();
+      await expect(failing.pollOnce()).rejects.toThrow(/disk full/);
+
+      // Round 3 persists again: no false reorg, the scan continues from the
+      // last persisted cursor.
+      saveFails = false;
+      head = 16n;
+      const poll = await buildWatcher().pollOnce();
+      expect(poll.fromBlock).toBe(12n);
+      stored = JSON.parse(await readFile(cursorFile, 'utf8')) as { nextBlock?: string };
+      expect(stored).toMatchObject({ nextBlock: '16' });
+      expect(errors).toHaveLength(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('clears stale adopted anchors when the overshoot correction rewinds to fromBlock', async () => {
+    // the overshoot fallback kept checkpoints from beyond the chain
+    // head, so the next round's continuity check mismatched by construction
+    // and fired a false reorg rollback.
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-overshoot-'));
+    const errors: unknown[] = [];
+    try {
+      const cursorFile = join(dir, 'cursor.json');
+      await writeFile(cursorFile, `${JSON.stringify({
+        version: 2,
+        nextBlock: '50',
+        blockHash: `0x${'31'.repeat(32)}`,
+        checkpoints: [
+          { blockNumber: '47', blockHash: `0x${'2e'.repeat(32)}` },
+          { blockNumber: '49', blockHash: `0x${'30'.repeat(32)}` },
+        ],
+        chainId: 31_337,
+        stateMachines: [STATE_MACHINE],
+      })}\n`);
+      let head = 12n;
+      const buildWatcher = () => createStateMachineWatcher({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        walletAddress: WALLET_ADDRESS,
+        fromBlock: 10,
+        dryRun: true,
+        handlers: { '*': () => undefined },
+        onError: (error: unknown) => {
+          errors.push(error);
+        },
+        cursorStore: new FileStateMachineCursorStore(cursorFile),
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return head;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getBlock(args: { readonly blockNumber: bigint }) {
+            return { hash: `0x${(Number(args.blockNumber) + 1).toString(16).padStart(64, '0')}` };
+          },
+        },
+      });
+
+      // Round 1: the adopted cursor sits beyond the head; the watcher alerts
+      // and rewinds to fromBlock.
+      const first = buildWatcher();
+      const poll1 = await first.pollOnce();
+      expect(poll1.fromBlock).toBe(10n);
+      expect(errors).toHaveLength(1);
+      expect(String(errors[0])).toContain('beyond the chain head');
+
+      // Round 2 on the same watcher: the stale anchors are gone, so the
+      // continuity check does not fire a false reorg.
+      head = 16n;
+      const poll2 = await first.pollOnce();
+      expect(poll2.fromBlock).toBe(12n);
+      expect(errors).toHaveLength(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes concurrent file-store writers so no update is silently lost', async () => {
+    // the jobs file read-modify-write had no cross-process exclusion;
+    // two concurrent writers (e.g. `jobs retry` against a running watcher)
+    // dropped each other's updates.
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-jobs-lock-'));
+    try {
+      const jobsFile = join(dir, 'jobs.json');
+      const storeA = new FileStateMachineJobStore(jobsFile);
+      const storeB = new FileStateMachineJobStore(jobsFile);
+      const eventA = decodeHookReadyLog(hookReadyLog(), artifactIndex())!;
+      const eventB = decodeHookReadyLog({ ...hookReadyLog(), transactionHash: `0x${'35'.repeat(32)}` as Hex, logIndex: 8 }, artifactIndex())!;
+
+      await Promise.all([
+        storeA.upsertDetected(eventA, { now: '2026-04-28T00:00:00.000Z', maxAttempts: 3 }),
+        storeB.upsertDetected(eventB, { now: '2026-04-28T00:00:00.000Z', maxAttempts: 3 }),
+      ]);
+
+      const jobs = await storeA.list();
+      expect(new Set(jobs.map((job) => job.id)).size).toBe(2);
+
+      // A stale lock (crashed holder) must not block the store forever.
+      const lockPath = `${jobsFile}.lock`;
+      await writeFile(lockPath, '999999\n');
+      const oneHourAgo = new Date(Date.now() - 3_600_000);
+      await utimes(lockPath, oneHourAgo, oneHourAgo);
+      const patched = await storeB.update(jobs[0]!.id, {
+        status: 'dead_letter',
+        updatedAt: '2026-04-28T00:01:00.000Z',
+      });
+      expect(patched?.status).toBe('dead_letter');
+      expect((await readdir(dir)).filter((name) => name.endsWith('.lock'))).toHaveLength(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a signal without source attribution instead of hashing the empty string', async () => {
+    // keccak("") minted one constant pseudo sourceId for every
+    // unattributed signal, collapsing the chain's (…, sourceId, signalId)
+    // identity across producers. The CLI already requires --source; the SDK
+    // path must refuse just as loudly.
+    expect(() => buildSubmitStateMachineSignalCall({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      walletAddress: WALLET_ADDRESS,
+    }, {
+      planId: PLAN_ID,
+      orderId: ORDER_ID,
+      signalName: 'exec.main.cmp',
+    })).toThrow(/signal\.source/);
+  });
+
+  it('trims stored reorg checkpoints to the reorg window instead of growing forever', async () => {
+    // trimming must apply to the stored checkpoint array, not the read view
+    // alone: append-only storage (with a per-round sort) grows unbounded with
+    // every scanned round.
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-checkpoint-trim-'));
+    try {
+      const cursorFile = join(dir, 'cursor.json');
+      let head = 12n;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        walletAddress: WALLET_ADDRESS,
+        fromBlock: 1,
+        reorgWindow: 4,
+        dryRun: true,
+        handlers: { '*': () => undefined },
+        cursorStore: new FileStateMachineCursorStore(cursorFile),
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return head;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getBlock(args: { readonly blockNumber: bigint }) {
+            return { hash: `0x${(Number(args.blockNumber) + 1).toString(16).padStart(64, '0')}` };
+          },
+        },
+      });
+      for (let round = 0; round < 8; round += 1) {
+        head += 2n;
+        await watcher.pollOnce();
+      }
+      const stored = JSON.parse(await readFile(cursorFile, 'utf8')) as { checkpoints?: Array<{ blockNumber: string }> };
+      expect(stored.checkpoints?.length).toBeLessThanOrEqual(4);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a failed toBlock hash read as no evidence instead of saving a stale hash', async () => {
+    // a transient getBlock failure after a successful round must not
+    // persist the OLD cursor hash next to the NEW height — the next round's
+    // continuity check would mismatch by construction and roll the cursor
+    // back forever (a false-reorg loop). No evidence means no saved hash: the
+    // finality buffer alone covers the round until hashes come back.
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-watcher-hash-read-fail-'));
+    const errors: unknown[] = [];
+    try {
+      const cursorFile = join(dir, 'cursor.json');
+      let blockReadsFail = false;
+      const hashAt = (height: bigint): string => `0x${(Number(height) + 1).toString(16).padStart(64, '0')}`;
+      let head = 12n;
+      const buildWatcher = () => createStateMachineWatcher({
+        rpcUrl: 'http://127.0.0.1:8545',
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        walletAddress: WALLET_ADDRESS,
+        fromBlock: 10,
+        dryRun: true,
+        handlers: { '*': () => undefined },
+        onError: (error: unknown) => {
+          errors.push(error);
+        },
+        cursorStore: new FileStateMachineCursorStore(cursorFile),
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return head;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getBlock(args: { readonly blockNumber: bigint }) {
+            if (blockReadsFail) {
+              throw new Error('rpc down');
+            }
+            return { hash: hashAt(args.blockNumber) };
+          },
+        },
+      });
+
+      // Round 1 anchors normally: cursor 12 with the canonical hash of 11.
+      await buildWatcher().pollOnce();
+      let stored = JSON.parse(await readFile(cursorFile, 'utf8')) as { nextBlock?: string; blockHash?: string };
+      expect(stored).toMatchObject({ nextBlock: '12', blockHash: hashAt(11n) });
+
+      // Round 2 cannot read any block hash: the cursor advances WITHOUT a
+      // hash instead of pairing the new height with block 11's old hash.
+      blockReadsFail = true;
+      head = 14n;
+      await buildWatcher().pollOnce();
+      stored = JSON.parse(await readFile(cursorFile, 'utf8')) as { nextBlock?: string; blockHash?: string };
+      expect(stored).toMatchObject({ nextBlock: '14' });
+      expect(stored.blockHash).toBeUndefined();
+
+      // Round 3 reads hashes again: continuity restarts from this round's own
+      // anchor — no false reorg alert, no rollback loop.
+      blockReadsFail = false;
+      errors.length = 0;
+      head = 16n;
+      const poll = await buildWatcher().pollOnce();
+      expect(poll.fromBlock).toBe(14n);
+      expect(errors).toHaveLength(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('state machine callback tx helper', () => {
@@ -1755,7 +3057,6 @@ describe('state machine callback tx helper', () => {
       source: 'seller',
       signalName: 'ship.pickup.done',
       payloadHash: PAYLOAD_HASH,
-      readyEventId: HOOK_ID,
       idempotencyKey: 'order-1:pickup:done',
     });
 
@@ -2241,7 +3542,13 @@ describe('submitSignal receipt visibility', () => {
     }
   });
 
-  it('records every retried broadcast txHash when receipt waits keep timing out', async () => {
+  it('defers instead of blind-rebroadcasting when the broadcast receipt cannot be checked', async () => {
+    // Replay-guard unknown-outcome branch: after a receipt-wait timeout the tx
+    // is already on chain (or in flight); this client cannot look receipts up
+    // at all, so the outcome is simply unknown. The in-run bounded retry used
+    // to rebroadcast once per attempt (2 txs); now the run defers — one
+    // broadcast, the failure and its txHash stay in the audit trail, and the
+    // job stays open (`submitted`) for later scans to resolve.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();
     try {
@@ -2279,16 +3586,14 @@ describe('submitSignal receipt visibility', () => {
 
       const result = await watcher.handleLog(hookReadyLog());
 
-      // Receipt-wait timeouts are retryable transport faults: exhausted retries
-      // land in `failed` so `jobs retry` stays available.
-      expect(result.job?.status).toBe('failed');
-      expect(result.job?.submissions).toHaveLength(2);
-      // Each attempt broadcast a tx, and each attempt's txHash stays visible in
-      // the audit trail instead of only the last successful bookkeeping entry.
-      for (const submission of result.job?.submissions ?? []) {
-        expect(submission.txHash).toBe(TX_HASH);
-        expect(submission.error?.kind).toBe('rpc_network');
-      }
+      // Exactly one broadcast: a receipt that cannot be checked is not proof
+      // of absence, so no second transaction went out in this run.
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(result.job?.status).toBe('submitted');
+      const submissions = result.job?.submissions ?? [];
+      expect(submissions).toHaveLength(1);
+      expect(submissions[0]?.txHash).toBe(TX_HASH);
+      expect(submissions[0]?.error?.kind).toBe('rpc_network');
     } finally {
       await stub.close();
       delete process.env[KEY_ENV];
@@ -2325,12 +3630,13 @@ describe('submitSignal receipt visibility', () => {
       const result = await watcher.handleLog(hookReadyLog());
 
       // The duplicate is a dedupe fact, not a failure: recognized from the real
-      // revert text without any explicit code, counted as delivered, and the
-      // run finishes. The job stays in the open `submitted` lane (the signal is
-      // on chain but this process never saw its receipt), so a later scan or
-      // retry can still observe the real outcome.
+      // revert text without any explicit code and counted as delivered. The
+      // contract's SignalAlreadyExists verdict on the four-tuple is itself the
+      // delivery judgment, so a fully duplicate-delivered job completes as
+      // terminal `confirmed` — parking it in the open lane re-ran the handler
+      // on every scan for a signal the chain already carries.
       expect(result.status).toBe('handled');
-      expect(result.job?.status).toBe('submitted');
+      expect(result.job?.status).toBe('confirmed');
       expect(result.error).toBeUndefined();
       expect(result.job?.lastError).toBeUndefined();
       const submissions = result.job?.submissions ?? [];
@@ -2339,6 +3645,13 @@ describe('submitSignal receipt visibility', () => {
         retryable: false,
       });
       expect(submissions[submissions.length - 1]?.error?.message).toContain('SignalAlreadyExists');
+
+      // Terminal means terminal: a later scan must not re-run the handler (and
+      // its off-chain side effects) for an already-delivered job. The duplicate
+      // reverts at gas estimation, so no transaction was ever broadcast.
+      const rescan = await watcher.handleLog(hookReadyLog());
+      expect(rescan.status).toBe('ignored');
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(0);
     } finally {
       await stub.close();
       delete process.env[KEY_ENV];
@@ -2475,11 +3788,12 @@ describe('submitSignal receipt visibility', () => {
     }
   });
 
-  it('falls back to the bounded retry when the broadcast receipt cannot be found', async () => {
-    // Replay-guard no-receipt branch: getTransactionReceipt resolves null (the
-    // tx is not mined yet, or the node simply has no receipt for it), so the
-    // recovery returns undefined and the caller keeps its normal retry
-    // decision — rebroadcast within the bounded budget.
+  it('defers an unconfirmed broadcast to later scans when the receipt is not available', async () => {
+    // Replay-guard null-receipt branch: getTransactionReceipt resolves null
+    // (the tx is not mined yet) — "no evidence", not provable absence. The
+    // run defers instead of rebroadcasting once per attempt (3 txs), and the
+    // immediate rescan re-checks the receipt again
+    // before the resend backoff allows any rebroadcast.
     process.env[KEY_ENV] = TEST_PRIVATE_KEY;
     const stub = await startJsonRpcStub();
     try {
@@ -2520,17 +3834,71 @@ describe('submitSignal receipt visibility', () => {
 
       const result = await watcher.handleLog(hookReadyLog());
 
-      // The normal retry path ran to exhaustion: one broadcast per attempt.
-      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(3);
-      expect(result.job?.status).toBe('failed');
-      expect(result.error?.kind).toBe('rpc_network');
-      expect(result.error?.retryable).toBe(true);
-      const submissions = result.job?.submissions ?? [];
-      expect(submissions).toHaveLength(3);
-      for (const submission of submissions) {
-        expect(submission.txHash).toBe(TX_HASH);
-        expect(submission.error?.kind).toBe('rpc_network');
-      }
+      // One broadcast; the unknown outcome keeps the job open, not `failed`.
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(result.job?.status).toBe('submitted');
+      expect(result.job?.submissions).toHaveLength(1);
+      expect(result.job?.submissions[0]?.txHash).toBe(TX_HASH);
+      expect(result.job?.lastError?.kind).toBe('rpc_network');
+
+      // Immediate rescan: the receipt is still unavailable and the resend
+      // backoff window is open — still exactly one broadcast on chain.
+      const rescan = await watcher.handleLog(hookReadyLog());
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(rescan.job?.status).toBe('submitted');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('keeps a job with an unknown-outcome broadcast open instead of dead-lettering it on an unclassifiable receipt failure', async () => {
+    // The receipt wait failed with an error no classifier pattern matches
+    // (non-retryable fallback) after the transaction was already broadcast:
+    // the terminal decision must not dead-letter the job while its
+    // transaction is still in flight. An unknown outcome stays in the
+    // open lane so the later-scan receipt recheck can observe the real one.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async waitForTransactionReceipt() {
+            throw new Error('provider halted unexpectedly');
+          },
+        },
+        artifact: artifactIndex(),
+        retry: { maxAttempts: 3, baseDelayMs: 0 },
+        handlers: {
+          '*': (event) => ({
+            planId: PLAN_ID,
+            orderId: event.orderId,
+            source: 'buyer',
+            signalName: 'exec.main.cmp',
+            payloadHash: PAYLOAD_HASH,
+          }),
+        },
+      });
+
+      const result = await watcher.handleLog(hookReadyLog());
+
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+      expect(result.job?.status).toBe('submitted');
+      expect(result.job?.lastError?.kind).toBe('unknown');
+      expect(result.job?.submissions[0]?.txHash).toBe(TX_HASH);
     } finally {
       await stub.close();
       delete process.env[KEY_ENV];

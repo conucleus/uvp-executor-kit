@@ -45,8 +45,8 @@ describe('executor HTTP server', () => {
     expect(verify()).toBe(true);
     expect(verify({ nonce: 'b'.repeat(32) })).toBe(false);
     expect(verify({ timestamp: '1799000000' })).toBe(false);
-    // A captured (body, signature) pair without timestamp+nonce no longer
-    // verifies: the bare-body HMAC was permanently replayable.
+    // A captured (body, signature) pair without timestamp+nonce does not
+    // verify: a bare-body HMAC would be permanently replayable.
     expect(verifyWebhookSignature(body, signature, callbackToken)).toBe(false);
     // Outside the acceptance window the signature is stale even when intact.
     expect(verify({ nowMs: () => 1_800_000_000_000 + 5 * 60_000 + 1 })).toBe(false);
@@ -92,6 +92,9 @@ describe('executor HTTP server', () => {
       executorId: 'exec-executor',
       executorToken,
       callbackToken,
+      // No host is allowed implicitly, loopback included: the local receiver
+      // must be allowlisted explicitly.
+      callbackHostAllowlist: ['127.0.0.1'],
       handlers: createHandlersFromExecutorConfig({
         executorId: 'exec-executor',
         handlers: {
@@ -130,7 +133,11 @@ describe('executor HTTP server', () => {
             stageIdentifier: 'exec.main',
             signalName: 'exec.main.cmp',
             senderId: 'exec-executor',
-            idempotencyKey: 'order-1:exec.main#START:exec.main.cmp',
+            // Default key caliber matches the watcher's fixed default:
+            // order, source, signal — the emitting event anchor (event-1)
+            // must NOT enter the key, or a re-emitted HookReady becomes a
+            // guaranteed-reverting duplicate broadcast.
+            idempotencyKey: 'order-1:buyer:exec.main.cmp',
             receivedAt: '2026-04-27T00:00:03.000Z',
           },
         },
@@ -149,6 +156,7 @@ describe('executor HTTP server', () => {
       executorToken,
       callbackToken,
       callbackHmacSecret: hmacSecret,
+      callbackHostAllowlist: ['127.0.0.1'],
       handlers: createHandlersFromExecutorConfig({
         executorId: 'exec-executor',
         handlers: {
@@ -208,6 +216,7 @@ describe('executor HTTP server', () => {
       executorId: 'exec-executor',
       executorToken,
       callbackToken,
+      callbackHostAllowlist: ['127.0.0.1'],
       handlers: {},
       port: 0,
     });
@@ -238,6 +247,7 @@ describe('executor HTTP server', () => {
       executorId: 'exec-executor',
       executorToken,
       callbackToken,
+      callbackHostAllowlist: ['127.0.0.1'],
       handlers: {
         'exec.main#START': () => ({ status: 'failed', error: 'local executor failed' }),
       },
@@ -266,6 +276,7 @@ describe('executor HTTP server', () => {
       executorId: 'exec-executor',
       executorToken,
       callbackToken,
+      callbackHostAllowlist: ['127.0.0.1'],
       handlers: createHandlersFromExecutorConfig({
         executorId: 'exec-executor',
         handlers: {
@@ -316,6 +327,7 @@ describe('executor HTTP server', () => {
       executorId: 'exec-executor',
       executorToken,
       callbackToken,
+      callbackHostAllowlist: ['127.0.0.1'],
       handlers: createHandlersFromExecutorConfig({
         executorId: 'exec-executor',
         handlers: {
@@ -388,6 +400,7 @@ describe('executor HTTP server', () => {
       executorId: 'exec-executor',
       executorToken,
       callbackToken,
+      callbackHostAllowlist: ['127.0.0.1'],
       handlers: { 'exec.main#START': twoSignalHandler },
       port: 0,
       // The first signal (.cmp) is accepted; every delivery of the second one
@@ -439,6 +452,7 @@ describe('executor HTTP server', () => {
       executorId: 'exec-executor',
       executorToken,
       callbackToken,
+      callbackHostAllowlist: ['127.0.0.1'],
       handlers: createHandlersFromExecutorConfig({
         executorId: 'exec-executor',
         handlers: {
@@ -497,6 +511,7 @@ describe('executor HTTP server', () => {
       executorId: 'exec-executor',
       executorToken,
       callbackToken,
+      callbackHostAllowlist: ['127.0.0.1'],
       handlers: createHandlersFromExecutorConfig({
         executorId: 'exec-executor',
         handlers: {
@@ -564,6 +579,7 @@ describe('executor HTTP server', () => {
       executorId: 'exec-executor',
       executorToken,
       callbackToken,
+      callbackHostAllowlist: ['127.0.0.1'],
       handlers: createHandlersFromExecutorConfig({
         executorId: 'exec-executor',
         handlers: {
@@ -611,6 +627,7 @@ describe('executor HTTP server', () => {
       executorId: 'exec-executor',
       executorToken,
       callbackToken,
+      callbackHostAllowlist: ['127.0.0.1'],
       handlers: {},
       port: 0,
     });
@@ -639,12 +656,17 @@ describe('executor HTTP server', () => {
     }
   });
 
-  it('rejects non-loopback callback URLs before enqueuing and never sends the callback token', async () => {
+  it('rejects callback URLs outside the explicit allowlist before enqueuing and never sends the callback token', async () => {
+    // Default deny, loopback included: an allowlist that silently admitted
+    // every loopback host let a dispatcher use the executor as a probe proxy
+    // for the host's local services, with responses readable back through
+    // the jobs API.
     let outboundCalls = 0;
     const executor = await startExecutorServer({
       executorId: 'exec-executor',
       executorToken,
       callbackToken,
+      callbackHostAllowlist: ['127.0.0.1'],
       handlers: createHandlersFromExecutorConfig({
         executorId: 'exec-executor',
         handlers: {
@@ -666,6 +688,9 @@ describe('executor HTTP server', () => {
         'http://169.254.169.254/latest/meta-data/',
         'https://example.invalid/v0/signals',
         'file:///etc/passwd',
+        // Loopback variants are not implicitly allowlisted either.
+        'http://localhost:9/v0/signals',
+        'http://[::1]/v0/signals',
       ]) {
         const response = await fetch(`${executor.url}/v0/dispatches`, {
           method: 'POST',
@@ -684,6 +709,19 @@ describe('executor HTTP server', () => {
     } finally {
       await executor.close();
     }
+  });
+
+  it('refuses to start without an explicit callback host allowlist', async () => {
+    // An empty allowlist is a configuration error, not "allow loopback": the
+    // server must fail loudly at startup instead of accepting dispatches it
+    // can never deliver.
+    await expect(startExecutorServer({
+      executorId: 'exec-executor',
+      executorToken,
+      callbackToken,
+      handlers: {},
+      port: 0,
+    })).rejects.toThrow(/callback host allowlist is empty/);
   });
 
   it('sends the callback bearer token to non-loopback hosts only when allowlisted', async () => {
@@ -767,13 +805,15 @@ describe('executor HTTP server', () => {
       '::2',
     ]);
 
-    expect(() => assertCallbackUrlAllowed('http://127.0.0.1:9/v0/signals', [])).not.toThrow();
-    expect(() => assertCallbackUrlAllowed('http://localhost/v0/signals', [])).not.toThrow();
-    expect(() => assertCallbackUrlAllowed('http://[::1]/v0/signals', [])).not.toThrow();
+    // Loopback hosts are allowed only through the explicit allowlist.
+    expect(() => assertCallbackUrlAllowed('http://127.0.0.1:9/v0/signals', [])).toThrow(/not allowed/);
+    expect(() => assertCallbackUrlAllowed('http://127.0.0.1:9/v0/signals', ['127.0.0.1'])).not.toThrow();
+    expect(() => assertCallbackUrlAllowed('http://localhost/v0/signals', ['localhost'])).not.toThrow();
+    expect(() => assertCallbackUrlAllowed('http://[::1]/v0/signals', ['::1'])).not.toThrow();
     expect(() => assertCallbackUrlAllowed('http://internal.example/v0/signals', ['internal.example'])).not.toThrow();
 
-    expect(() => assertCallbackUrlAllowed('ftp://127.0.0.1/v0/signals', [])).toThrow(/scheme/);
-    expect(() => assertCallbackUrlAllowed('http://169.254.169.254/', [])).toThrow(/not allowed/);
+    expect(() => assertCallbackUrlAllowed('ftp://127.0.0.1/v0/signals', ['127.0.0.1'])).toThrow(/scheme/);
+    expect(() => assertCallbackUrlAllowed('http://169.254.169.254/', ['127.0.0.1'])).toThrow(/not allowed/);
     expect(() => assertCallbackUrlAllowed('not a url', [])).toThrow(/valid URL/);
   });
 
