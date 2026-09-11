@@ -14,14 +14,13 @@
   "chainServicesUrl": "http://127.0.0.1:3001",
   "stages": ["export.customs"],
   "callbackMode": "auto",
-  "dryRun": true,
   "authTokenRef": "UVP_EXECUTOR_TOKEN",
   "retry": {
     "maxAttempts": 3,
     "baseDelayMs": 0
   },
   "handlers": {
-    "export.customs#START": {
+    "*": {
       "signals": [
         {
           "source": "logistics-provider-a",

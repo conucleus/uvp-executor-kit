@@ -202,8 +202,14 @@ function errorToMessage(error: unknown): string {
   return String(error);
 }
 
+/**
+ * Redact bare 64-hex-digit runs (the shape of raw key material echoed by
+ * third-party error texts). `0x`-prefixed 32-byte values are deliberately
+ * spared: in this kit's messages they are public chain identifiers (tx/block
+ * hashes) that operators need for correlation, and the kit itself never
+ * interpolates secret material into an error message.
+ */
 function redactSecretLikeHex(value: string): string {
   return value
-    .replace(/\b0x[a-fA-F0-9]{64}\b/g, '[redacted-32-byte-hex]')
-    .replace(/\b[a-fA-F0-9]{64}\b/g, '[redacted-32-byte-hex]');
+    .replace(/(?<!0x)\b[a-fA-F0-9]{64}\b/g, '[redacted-32-byte-hex]');
 }

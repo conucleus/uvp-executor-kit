@@ -30,6 +30,12 @@ pnpm --filter @uvp-eth/executor-kit typecheck
 pnpm --filter @uvp-eth/executor-kit build
 ```
 
+`dist/` is a local, gitignored build output — the `bin` entry
+(`dist/cli.js`) only exists after `pnpm --filter @uvp-eth/executor-kit build`,
+and nothing republishes it automatically when `src/` changes: run the build
+before invoking the installed `uvp-executor` bin. Workspace consumers import
+the TypeScript sources through the package `exports` and never need `dist`.
+
 ## CLI
 
 Create or inspect a local wallet env file:
@@ -51,7 +57,6 @@ Scan once for `HookReady` logs and dry-run callback transactions:
 ```bash
 uvp-executor chain-once \
   --rpc-url http://127.0.0.1:8545 \
-  --state-machine 0x0000000000000000000000000000000000000001 \
   --chain-id 31337 \
   --config uvp-executor-kit/package/fixtures/state-machine-executor.config.json \
   --wallet-address 0x0000000000000000000000000000000000000002 \
@@ -63,11 +68,15 @@ Run the continuous watcher:
 ```bash
 uvp-executor chain-watch \
   --rpc-url http://127.0.0.1:8545 \
-  --state-machine 0x0000000000000000000000000000000000000001 \
   --chain-id 31337 \
   --config uvp-executor-kit/package/fixtures/state-machine-executor.config.json \
   --dry-run
 ```
+
+The fixture config declares its own `stateMachines[]` scan set. An explicit
+`--state-machine` flag together with a config `stateMachines[]` is rejected —
+the flag would otherwise be silently ignored by the scan set. Pass
+`--state-machine` only when the config declares no `stateMachines[]`.
 
 By default the chain commands persist watcher state to files so a restart
 resumes where the previous process stopped instead of rescanning from
@@ -85,7 +94,11 @@ the same chain id is caught by the genesis hash, not silently adopted).
 State files are written atomically (temp file + rename). A crash-truncated or
 structurally invalid `jobs.json`/`cursor.json` is moved aside to
 `<file>.corrupt-<timestamp>` for inspection and recreated from scratch instead
-of aborting every later read.
+of aborting every later read. Writers to one jobs file serialize through a
+lock file beside it (`<jobs-file>.lock`, broken by age when a holder crashes);
+still, one watcher (or one CLI operation such as `jobs retry`) per jobs file
+is the intended operating mode — the lock only prevents silent lost updates,
+not the confusion of two operators racing the same job.
 
 ### Reorg and Outage Defenses
 
@@ -110,11 +123,21 @@ configurable parameters (`--confirmations`, `--reorg-window`,
   failures are reported through the error channel and the poll cadence backs
   off exponentially (capped at 8x the interval), returning to the configured
   cadence on the first successful round.
-- **Resend backoff**: a signal whose prior broadcast was never confirmed is
-  rebroadcast with exponential backoff (30s base, 10min cap) anchored to the
-  job's `lastSignalAttemptAt`, instead of once per poll round. The chain's
-  `idempotencyKey` remains the dedupe anchor; the backoff only stops the
-  per-round gas burn. Manual `jobs retry` bypasses the throttle.
+- **Resend backoff and later scans**: open jobs behind the cursor — `detected`
+  leftovers from a crash between detection and processing, `submitted`
+  jobs with an unconfirmed broadcast, and `matched` jobs stranded by a crash
+  between the run claim and the conclusive status write (the claim holder is
+  dead, so no run is in flight) — are revisited on later scans. A signal
+  whose prior broadcast was never confirmed is settled by evidence first: the
+  scan re-checks the receipt and adopts a mined success without rebroadcasting
+  (a mined revert ends the job as a visible failure instead of silently
+  counting as delivered). Only when the receipt cannot be obtained does a
+  rebroadcast happen, with exponential backoff (30s base, 10min cap) anchored
+  to the job's `lastSignalAttemptAt`, instead of once per poll round — and an
+  in-run retry never blind-rebroadcasts a transaction whose outcome is simply
+  unknown. Dedupe on chain is the contract's `SignalAlreadyExists` check on
+  the `(planId, orderId, sourceId, signalId)` tuple; the backoff only stops
+  the per-round gas burn. Manual `jobs retry` bypasses the throttle.
 
 Build or submit one state-machine signal:
 
@@ -220,7 +243,12 @@ uvp-executor doctor \
 The doctor command needs no private key. It reports reachability, task visibility,
 proof-endpoint shape, and per-task readiness (assignee match, canSubmit,
 blockedReason, deadline status, required evidence, and a concrete
-`nextAction` label: `prepare`, `wait`, `proof`, or `blocked`). Normal output
+`nextAction` label: `prepare`, `wait`, `proof`, or `blocked`). Per-task
+readiness (`--task-id`) requires `--wallet-address`: without a wallet, assignee
+ownership cannot be checked, and the CLI refuses instead of printing an
+unverified "Ready to prepare". The server's `canSubmit` is the authoritative
+verdict — the locally computed deadline status (naive timestamps parsed as
+UTC) is display context and never overturns it. Normal output
 omits protocol fields and bearer token values; pass `--verbose` for raw API
 payloads.
 
@@ -320,7 +348,6 @@ uvp-executor jobs get <jobId> --jobs-file .uvp-executor-jobs.json
 uvp-executor jobs retry <jobId> \
   --jobs-file .uvp-executor-jobs.json \
   --rpc-url http://127.0.0.1:8545 \
-  --state-machine 0x0000000000000000000000000000000000000001 \
   --chain-id 31337 \
   --config uvp-executor-kit/package/fixtures/state-machine-executor.config.json \
   --operator ops@example.com \
@@ -337,10 +364,23 @@ Watcher job semantics:
   defaults to `true`). A job whose transaction was broadcast but not yet
   receipted stays in the non-terminal `submitted` state, so later scans or
   manual retries can observe the real on-chain outcome instead of trusting
-  the broadcast. When the receipt step itself fails after a successful
-  broadcast (reverted receipt, or waiting for the receipt throws), the error
-  carries the broadcast `txHash` and the job's `submissions` record keeps it,
-  so "already broadcast" transactions are never dropped from the audit trail.
+  the broadcast — a broadcast without an observed receipt is never recorded
+  as delivered (not even with `waitForReceipt: false`; the later scan
+  re-checks the receipt and adopts or refutes it). The receipt recheck, the
+  resend backoff, and the terminal-state computation cover BOTH submission
+  channels: signals returned by the handler and signals submitted through the
+  handler-context `submitSignal` channel. That context channel answers an
+  already-delivered signal from its recorded evidence instead of
+  rebroadcasting, and resolves with `{ deferredBroadcast: true }` when the
+  signal's prior broadcast has an unknown outcome or sits inside the resend
+  backoff window — handlers must treat that marker as "pending, do not retry
+  now", never as success or failure. When the receipt step itself fails after
+  a successful broadcast, the error carries the broadcast `txHash` and the
+  job's `submissions` record keeps it, so "already broadcast" transactions
+  are never dropped from the audit trail — and a failure recorded alongside a
+  broadcast whose outcome is unknown leaves the job open (`submitted`) for the
+  later-scan receipt recheck instead of dead-lettering it; only a receipt
+  actually observed as reverted terminalizes the failure.
 - Failures are classified from explicit machine-readable error codes first,
   then from well-known real-world error texts and contract revert data
   (for example `SignalAlreadyExists()`, `AccessControlUnauthorizedAccount`,
@@ -349,16 +389,20 @@ Watcher job semantics:
   `failed` when exhausted, which `jobs retry` still accepts; deterministic
   non-retryable failures and unrecognized errors dead-letter for human
   triage via `jobs dead-letter`. A duplicate-signal fact
-  (`SignalAlreadyExists`) is not a failure, and where it surfaces decides the
-  job state: a handler that itself throws the duplicate classification ends
-  the job as terminal `ignored`, while a duplicate answered by the chain
-  during `submitSignal` is recorded as a delivered dedupe fact and leaves the
-  job in the non-terminal `submitted` state (the signal is on chain but this
-  process never observed its receipt, so a later scan or retry can still
-  check the real outcome). `jobs retry` also accepts `confirmed` jobs: the
-  retry resubmits every signal, which is the manual recovery channel when a
-  reorg flipped a confirmation off the canonical chain (the on-chain
-  idempotency key absorbs the duplicate when the signal actually survived).
+  (`SignalAlreadyExists`) is not a failure: the contract's check on the
+  `(planId, orderId, sourceId, signalId)` tuple is itself the delivery
+  verdict, so a duplicate answered by the chain during `submitSignal` is
+  recorded as a delivered dedupe fact and — exactly like an observed success
+  receipt — completes the job as terminal `confirmed` once every signal is
+  delivered. (A handler that itself THROWS the duplicate classification still
+  ends the job as terminal `ignored`: the handler is asserting a failure, not
+  relaying a chain answer.) `jobs retry` also accepts `detected` jobs (crash
+  recovery: detection was persisted but the job never got a run) and
+  `confirmed` jobs: the retry resubmits every signal, which is the manual
+  recovery channel when a reorg flipped a confirmation off the canonical
+  chain (the contract's `SignalAlreadyExists` dedupe on
+  `(planId, orderId, sourceId, signalId)` absorbs the duplicate when the
+  signal actually survived).
 - HookReady-topic logs that fail to decode (e.g. from a mixed-version
   deployment) never crash the watcher: the scan skips them, records an
   `ignored` job with the raw log preserved, counts them in poll results and
@@ -378,7 +422,19 @@ Watcher job semantics:
   nonce })`: it fails closed on a missing timestamp/nonce, enforces an
   acceptance window (5 minutes by default), and `createWebhookReplayGuard`
   burns each nonce once inside the window — a captured `(body, signature)`
-  pair can no longer be replayed forever.
+  pair cannot be replayed past the window.
+- The `serve` HTTP server's callback egress is EXPLICIT ALLOWLIST ONLY: no
+  host — loopback included — is allowed by default, and starting the server
+  with an empty allowlist fails loudly. Allowlist callback hosts (including
+  `127.0.0.1` for a co-located local harness receiver) via the
+  `UVP_EXECUTOR_CALLBACK_HOST_ALLOWLIST` env var (comma-separated) or the
+  `callbackHostAllowlist` option. An implicitly loopback-open executor was a
+  probe proxy for the host's local services, with endpoint responses readable
+  back through the jobs API (delivery errors echo at most a bounded prefix of
+  the response body). A production callback dispatcher (real network policy,
+  credential handling, audit) is a separately designed and deployed
+  component — this allowlist is the kit's own fail-closed floor, not that
+  policy.
 
 ## SDK Surface
 
@@ -428,9 +484,9 @@ order-level authorization, participant wallet signatures, and contract checks.
 
 ## ABI Boundary
 
-`createStateMachineWatcher` uses the fixed `UVPStateMachine v0.9` compact-hook
+`createStateMachineWatcher` uses the fixed `UVPStateMachine v0.10` compact-hook
 ABI recorded in
-`uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.9.json`:
+`uvp-protocol/contracts/uvp-contracts/fixtures/uvp-state-machine.v0.10.json`:
 
 - `HookReady(bytes32 planId, bytes32 orderId, bytes32 hookId, bytes32 stageId, bytes32 hookName)`;
 - `submitSignal(bytes32 planId, bytes32 orderId, bytes32 sourceId, bytes32 signalId, bytes32 payloadHash, bytes32 idempotencyKey)`.
@@ -438,9 +494,21 @@ ABI recorded in
 `planId` is part of the event and submit boundary. It must be retained with the
 watcher job and never inferred from a bare `orderId`; the same state machine can
 contain the same order id under different plans. The watcher persists the
-planId decoded from each `HookReady` event on the job and uses it as the default
-for every signal that does not declare one; a handler-config signal may pin an
-explicit `planId` (`handlers.<key>.signals[].planId`) when it must diverge.
+planId decoded from each `HookReady` event on the job and uses it as the
+per-signal default; a handler-config signal may pin an explicit `planId`
+(`handlers.<key>.signals[].planId`) when it must diverge — one signal's pin
+never becomes the fallback for its siblings.
+
+On-chain dedupe is the contract's `SignalAlreadyExists` check on the
+`(planId, orderId, sourceId, signalId)` tuple, not the `idempotencyKey`
+argument. The kit's default key therefore hashes exactly that tuple, so the
+same logical signal keeps the same key even when its `HookReady` event is
+re-emitted in a new transaction after a deep reorg; a producer may still
+supply an explicit `idempotencyKey` for its own correlation needs. Off-chain
+metadata never participates in the verdict: the emitting `HookReady` event
+anchor (or any other off-chain correlation context) is not an input to the
+default key, and the kit deliberately exposes no `readyEventId` input surface
+on the CLI, the handler config, or the SDK signal type.
 
 There is no payload-reference input in this ABI, and the contract is frozen:
 `chain-signal --payload-ref` is rejected up front instead of silently dropping

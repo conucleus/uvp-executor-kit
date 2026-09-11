@@ -62,6 +62,13 @@ export interface ProductMcpSubmitSignalInput extends ProductMcpToolOptions {
   readonly taskId?: string;
   readonly prepareId?: string;
   readonly walletAddress?: Address | string;
+  /**
+   * 域锚（对齐浏览器端调用方）：操作方按部署配置声明的预期
+   * chainId/verifyingContract，签名前与 prepared typedData 域 fail-closed
+   * 比对——不从 prepared 载荷自身取值（那是对被验对象的循环信任）。
+   */
+  readonly expectedChainId?: number;
+  readonly expectedVerifyingContract?: Address | string;
 }
 
 export interface ProductMcpGetProofInput extends ProductMcpToolOptions {
@@ -159,6 +166,14 @@ export function createProductMcpAdapter(options: ProductMcpAdapterOptions): Prod
         prepared,
         privateKeyEnv: input.privateKeyEnv,
         ...(input.walletAddress ? { walletAddress: input.walletAddress } : {}),
+        ...(input.expectedChainId !== undefined || input.expectedVerifyingContract !== undefined
+          ? {
+              expectedDomain: {
+                ...(input.expectedChainId !== undefined ? { chainId: input.expectedChainId } : {}),
+                ...(input.expectedVerifyingContract !== undefined ? { verifyingContract: input.expectedVerifyingContract } : {}),
+              },
+            }
+          : {}),
       });
       const submission = await submitPreparedSignalContainer({
         ...clientOptions,

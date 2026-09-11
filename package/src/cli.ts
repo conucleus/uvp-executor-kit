@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFile, writeFile } from 'node:fs/promises';
+import { chmod, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Command } from 'commander';
@@ -41,6 +41,7 @@ import {
   DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV,
   FileStateMachineCursorStore,
   FileStateMachineJobStore,
+  acquireWatcherStateDirLock,
   createStateMachineHandlersFromConfig,
   createStateMachineWatcher,
   deadLetterStateMachineJob,
@@ -52,6 +53,7 @@ import {
   submitStateMachineSignal,
   type StateMachineCursorStore,
   type StateMachineJobStore,
+  type WatcherStateDirLock,
 } from './watcher.js';
 import {
   addressFromPrivateKey,
@@ -94,7 +96,6 @@ interface ChainSignalOptions {
   signalName: string;
   payloadHash?: string;
   payloadRef?: string;
-  readyEventId?: string;
   idempotencyKey?: string;
   dryRun?: boolean;
   waitForReceipt?: boolean;
@@ -149,6 +150,8 @@ interface ProductSubmitOptions extends ProductClientCliOptions {
   preparedFile: string;
   privateKeyEnv: string;
   walletAddress?: string;
+  expectedChainId?: string;
+  expectedVerifyingContract?: string;
 }
 
 type ProductProofOptions = ProductClientCliOptions;
@@ -157,11 +160,8 @@ interface ServeOptions {
   config: string;
   host: string;
   port: string;
-  executorToken?: string;
   executorTokenEnv: string;
-  callbackToken?: string;
   callbackTokenEnv: string;
-  callbackHmacSecret?: string;
   callbackHmacSecretEnv: string;
   readyJson?: boolean;
 }
@@ -347,6 +347,8 @@ export function buildProgram(): Command {
     .option('--wallet-address <address>', 'expected signer wallet; defaults to the private key address')
     .option('--principal-id <id>', 'optional Product API principal id header')
     .option('--auth-token-env <ENV_NAME>', 'env var containing Product API bearer token')
+    .option('--expected-chain-id <id>', 'expected chain id anchoring the prepared typedData domain; signing fails closed on mismatch')
+    .option('--expected-verifying-contract <address>', 'expected verifying contract anchoring the prepared typedData domain; signing fails closed on mismatch')
     .option('--verbose', 'include the raw Product API submission payload')
     .action(async (taskId: string, options: ProductSubmitOptions) => {
       const prepared = await readPreparedSignalContainerFile(options.preparedFile);
@@ -361,6 +363,16 @@ export function buildProgram(): Command {
         prepared,
         privateKeyEnv: options.privateKeyEnv,
         ...(options.walletAddress ? { walletAddress: options.walletAddress } : {}),
+        // 域锚（对齐浏览器端调用方）：锚来自操作方按部署配置声明的
+        // 选项，不从 prepared 载荷自取（循环信任）。
+        ...(options.expectedChainId !== undefined || options.expectedVerifyingContract !== undefined
+          ? {
+              expectedDomain: {
+                ...(options.expectedChainId !== undefined ? { chainId: parsePositiveInteger(options.expectedChainId, 'expectedChainId') } : {}),
+                ...(options.expectedVerifyingContract !== undefined ? { verifyingContract: options.expectedVerifyingContract } : {}),
+              },
+            }
+          : {}),
       });
       const submission = await submitPreparedSignalContainer({
         ...productClientOptions(options),
@@ -402,22 +414,22 @@ export function buildProgram(): Command {
     .requiredOption('--config <path>', 'executor config JSON path')
     .option('--host <host>', 'host to bind', '127.0.0.1')
     .option('--port <port>', 'port to bind', '0')
-    .option('--executor-token <token>', 'bearer token for executor dispatch API')
     .option('--executor-token-env <name>', 'env var containing executor dispatch bearer token', DEFAULT_EXECUTOR_TOKEN_ENV)
-    .option('--callback-token <token>', 'bearer token for executor callback endpoint')
     .option('--callback-token-env <name>', 'env var containing executor callback bearer token', DEFAULT_CALLBACK_TOKEN_ENV)
-    .option('--callback-hmac-secret <secret>', 'optional shared secret for signing callback bodies')
     .option('--callback-hmac-secret-env <name>', 'env var containing callback HMAC secret', DEFAULT_CALLBACK_HMAC_SECRET_ENV)
     .option('--ready-json', 'print a ready JSON line after the server starts')
     .action(async (options: ServeOptions) => {
       const config = await loadExecutorConfig(options.config);
-      const callbackHmacSecret = options.callbackHmacSecret ?? process.env[options.callbackHmacSecretEnv];
+      // Secrets come only from named env vars: a value passed as a flag is
+      // visible to every process listing command lines (ps).
       const handle = await startExecutorServer({
         executorId: config.executorId,
         handlers: createHandlersFromExecutorConfig(config),
-        executorToken: readSecret(options.executorToken, options.executorTokenEnv, 'executor token'),
-        callbackToken: readSecret(options.callbackToken, options.callbackTokenEnv, 'callback token'),
-        ...(callbackHmacSecret ? { callbackHmacSecret } : {}),
+        executorToken: readSecretFromEnv(options.executorTokenEnv, 'executor token'),
+        callbackToken: readSecretFromEnv(options.callbackTokenEnv, 'callback token'),
+        ...(process.env[options.callbackHmacSecretEnv]?.trim()
+          ? { callbackHmacSecret: process.env[options.callbackHmacSecretEnv]!.trim() }
+          : {}),
         host: options.host,
         port: parsePort(options.port),
       });
@@ -455,6 +467,12 @@ export function buildProgram(): Command {
     .option('--auth-token-env <ENV_NAME>', 'env var containing Product API bearer token')
     .option('--verbose', 'include raw Product API payloads in checks')
     .action(async (options: DoctorOptions) => {
+      if (options.taskId && !options.walletAddress) {
+        // The option help says --wallet-address is required with --task-id, and
+        // the readiness verdict is a lie without it: assignee ownership cannot
+        // be checked at all. Enforce instead of printing "Ready to prepare".
+        throw new ValidationError('--task-id requires --wallet-address so per-task readiness can verify assignee ownership');
+      }
       const report = await runProductDoctor({
         ...productClientOptions(options),
         ...(options.walletAddress ? { walletAddress: options.walletAddress } : {}),
@@ -505,10 +523,10 @@ export function buildProgram(): Command {
 
   jobs
     .command('retry <jobId>')
-    .description('retry a failed, callback-pending, or confirmed state-machine watcher job (confirmed retries resubmit for reorg recovery)')
+    .description('retry a detected, failed, callback-pending, submitted, or confirmed state-machine watcher job (confirmed retries resubmit for reorg recovery)')
     .requiredOption('--jobs-file <path>', 'state-machine watcher jobs JSON file')
     .requiredOption('--rpc-url <url>', 'EVM RPC URL')
-    .requiredOption('--state-machine <address>', 'UVPStateMachine contract address')
+    .option('--state-machine <address>', 'UVPStateMachine contract address; optional when config stateMachines[] is set')
     .requiredOption('--chain-id <id>', 'expected chain id')
     .requiredOption('--config <path>', 'state machine handler config JSON path')
     .requiredOption('--operator <id>', 'operator id recorded in the job audit trail')
@@ -518,7 +536,10 @@ export function buildProgram(): Command {
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (jobId: string, options: JobsRetryOptions) => {
-      const { watcher } = await buildStateMachineWatcherFromCli(options);
+      // README 承诺 file 模式下不停机手工重投：retry 不取 state-dir 启动锁
+      // （与运行中的 watcher 共存）。并发安全由任务级运行认领承担：正在被
+      // 其它执行器运行的任务会被拒绝，只有空闲或持有者已崩溃的任务可接管。
+      const { watcher } = await buildStateMachineWatcherFromCli(options, { holdStateDirLock: false });
       const result = await retryStateMachineJob(watcher, jobId, {
         operator: options.operator,
         ...(options.reason ? { reason: options.reason } : {}),
@@ -563,13 +584,17 @@ export function buildProgram(): Command {
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainWatchOptions) => {
-      const { watcher, storage } = await buildStateMachineWatcherFromCli(options);
-      const poll = await watcher.pollOnce();
-      console.log(stringifyForTransport({ watcher: watcher.describe(), storage, poll }));
-      // Honest exit code: submission errors folded into the poll result (or
-      // failed/dead-lettered jobs) must not masquerade as a successful run.
-      if (chainPollExecutionFailed(poll)) {
-        process.exitCode = 1;
+      const { watcher, storage, stateLock } = await buildStateMachineWatcherFromCli(options);
+      try {
+        const poll = await watcher.pollOnce();
+        console.log(stringifyForTransport({ watcher: watcher.describe(), storage, poll }));
+        // Honest exit code: submission errors folded into the poll result (or
+        // failed/dead-lettered jobs) must not masquerade as a successful run.
+        if (chainPollExecutionFailed(poll)) {
+          process.exitCode = 1;
+        }
+      } finally {
+        await stateLock?.release();
       }
     });
 
@@ -593,21 +618,27 @@ export function buildProgram(): Command {
     .option('--dry-run', 'build submitSignal tx requests without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainWatchOptions) => {
-      const { watcher, storage } = await buildStateMachineWatcherFromCli(options);
-      console.log(stringifyForTransport({ watcher: watcher.describe(), storage }));
-      const handle = await watcher.start();
+      const { watcher, storage, stateLock } = await buildStateMachineWatcherFromCli(options);
       try {
-        // handle.done resolves on stop(); persistent poll failures are
-        // reported through the watcher's onError (stderr) with capped
-        // exponential backoff instead of aborting the loop.
-        await Promise.race([
-          handle.done,
-          waitForShutdown(async () => {
-            await handle.stop();
-          }),
-        ]);
+        console.log(stringifyForTransport({ watcher: watcher.describe(), storage }));
+        const handle = await watcher.start();
+        try {
+          // handle.done resolves on stop(); persistent poll failures are
+          // reported through the watcher's onError (stderr) with capped
+          // exponential backoff instead of aborting the loop.
+          await Promise.race([
+            handle.done,
+            waitForShutdown(async () => {
+              await handle.stop();
+            }),
+          ]);
+        } finally {
+          await handle.stop();
+        }
       } finally {
-        await handle.stop();
+        // 取锁与 finally 之间的一切失败路径（describe/start 抛错）都必须
+        // 释放 state-dir 锁，否则泄漏的 watcher.lock 拒绝下一个进程。
+        await stateLock?.release();
       }
     });
 
@@ -625,14 +656,13 @@ export function buildProgram(): Command {
     .requiredOption('--signal-name <signalName>', 'signal name')
     .option('--payload-hash <bytes32>', 'off-chain payload hash')
     .option('--payload-ref <uri>', 'unsupported: rejected because submitSignal cannot carry an off-chain payload reference')
-    .option('--ready-event-id <bytes32>', 'HookReady event id')
     .option('--idempotency-key <key>', 'idempotency key')
     .option('--private-key-env <name>', 'environment variable containing the callback tx private key', DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV)
     .option('--dry-run', 'build the submitSignal tx request without broadcasting')
     .option('--wait-for-receipt', 'wait for tx receipt after broadcasting')
     .action(async (options: ChainSignalOptions) => {
       if (options.payloadRef) {
-        // The frozen UVPStateMachine v0.9 ABI has no payloadRef input, so this
+        // The frozen UVPStateMachine v0.10 ABI has no payloadRef input, so this
         // flag would be silently dropped and the operator would walk away with
         // a "submitted" success that never carried the reference. Fail loudly;
         // only the 32-byte payloadHash goes on chain.
@@ -655,7 +685,6 @@ export function buildProgram(): Command {
         stageIdentifier: options.stage,
         signalName: options.signalName,
         ...(options.payloadHash ? { payloadHash: options.payloadHash } : {}),
-        ...(options.readyEventId ? { readyEventId: options.readyEventId } : {}),
         ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
       });
       console.log(stringifyForTransport({ stateMachineSignal: result }));
@@ -691,6 +720,10 @@ function collectRepeatedOption(value: string, previous: string[] = []): string[]
 
 async function writePreparedSignalContainerFile(path: string, prepared: PreparedSignalContainer): Promise<void> {
   await writeFile(path, `${stringifyForTransport({ prepared })}\n`, { mode: 0o600 });
+  // writeFile's `mode` only applies to files it creates: overwriting an
+  // existing (possibly looser) prepared file must re-assert the owner-only
+  // mode, matching wallet.ts.
+  await chmod(path, 0o600);
 }
 
 async function readPreparedSignalContainerFile(path: string): Promise<PreparedSignalContainer> {
@@ -773,12 +806,35 @@ export function resolveWatcherStorage(
   };
 }
 
-async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Promise<{
+async function buildStateMachineWatcherFromCli(
+  options: ChainWatchOptions,
+  builderOptions: {
+    /**
+     * jobs retry 按 README 承诺与运行中的 watcher 共存：不取 state-dir
+     * 启动锁。并发安全由任务级运行认领承担——retry 拒绝正在被其它执行器
+     * 运行的任务（认领 pid 存活），只有在任务空闲或持有者已崩溃时才接管。
+     */
+    readonly holdStateDirLock?: boolean;
+  } = {},
+): Promise<{
   watcher: ReturnType<typeof createStateMachineWatcher>;
   storage: WatcherStorageSummary;
+  /** Held for the process lifetime in file mode; release on exit (including signal shutdown). */
+  stateLock?: WatcherStateDirLock | undefined;
 }> {
   const config = await loadStateMachineHandlerConfig(options.config);
   const configuredStateMachines = config.stateMachines ?? [];
+  if (options.stateMachine && configuredStateMachines.length > 0) {
+    // Coexistence of --state-machine and config stateMachines[] is ambiguous:
+    // a silent config override of the flag for the scan set would leave the
+    // operator believing machine A was watched while only the config set was
+    // scanned. Refuse and make the operator pick one source of truth instead
+    // of guessing.
+    throw new ValidationError(
+      `--state-machine ${options.stateMachine} conflicts with stateMachines[] in ${options.config}`
+      + ' (the flag would be silently ignored by the scan set); configure the scanned state machines in exactly one place',
+    );
+  }
   const stateMachineAddress = options.stateMachine
     ? normalizeAddress(options.stateMachine, 'stateMachine')
     : config.stateMachineAddress ?? configuredStateMachines[0]?.stateMachineAddress;
@@ -786,36 +842,57 @@ async function buildStateMachineWatcherFromCli(options: ChainWatchOptions): Prom
     throw new ValidationError('missing state machine address: pass --state-machine or set stateMachines[] in config');
   }
   const storage = resolveWatcherStorage(options);
-  const watcher = createStateMachineWatcher({
-    rpcUrl: options.rpcUrl,
-    stateMachineAddress,
-    stateMachines: configuredStateMachines.length > 0
-      ? configuredStateMachines
-      : [{ stateMachineAddress }],
-    chainId: parsePositiveInteger(options.chainId, 'chainId'),
-    ...(config.supplierId ?? config.executorId ? { supplierId: config.supplierId ?? config.executorId } : {}),
-    ...(options.walletAddress ? { walletAddress: normalizeAddress(options.walletAddress, 'walletAddress') } : config.walletAddress ? { walletAddress: config.walletAddress } : {}),
-    privateKeyEnv: options.privateKeyEnv,
-    handlers: createStateMachineHandlersFromConfig(config),
-    ...(config.artifact ? { artifact: config.artifact } : {}),
-    ...(config.retry ? { retry: config.retry } : {}),
-    ...(storage.jobStore ? { jobStore: storage.jobStore } : {}),
-    ...(storage.cursorStore ? { cursorStore: storage.cursorStore } : {}),
-    dryRun: options.dryRun ?? config.dryRun ?? false,
-    ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
-    ...(options.fromBlock ? { fromBlock: options.fromBlock } : {}),
-    ...(options.pollIntervalMs ? { pollIntervalMs: parsePositiveInteger(options.pollIntervalMs, 'pollIntervalMs') } : {}),
-    ...(options.confirmations !== undefined ? { confirmations: parseNonNegativeIntegerOption(options.confirmations, 'confirmations') } : {}),
-    ...(options.reorgWindow !== undefined ? { reorgWindow: parsePositiveInteger(options.reorgWindow, 'reorgWindow') } : {}),
-    ...(options.getLogsBlockSpan !== undefined ? { getLogsBlockSpan: parsePositiveInteger(options.getLogsBlockSpan, 'getLogsBlockSpan') } : {}),
-    onPoll: (poll) => {
-      console.log(stringifyForTransport({ poll }));
-    },
-    onError: (error) => {
-      console.error(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
-    },
-  });
-  return { watcher, storage: storage.summary };
+  // File 模式下 state-dir 由一个 watcher 进程独占：启动即取进程锁，
+  // 既有锁的持有进程存活时直接拒绝（fail-closed），崩溃残留锁接管。
+  const stateLock = storage.summary.mode === 'file' && builderOptions.holdStateDirLock !== false
+    ? await acquireWatcherStateDirLock(storage.summary.stateDir)
+    : undefined;
+  try {
+    const effectiveDryRun = options.dryRun ?? config.dryRun ?? false;
+    if (options.dryRun === undefined && config.dryRun === true) {
+      // The config-level dryRun silently overrides the documented "real
+      // execution is the default" contract for every invocation that omits the
+      // flag; make the effective mode visible instead.
+      console.error(
+        `warning: dryRun:true in ${options.config} is active; nothing is broadcast until it is removed or --dry-run is passed explicitly`,
+      );
+    }
+    const watcher = createStateMachineWatcher({
+      rpcUrl: options.rpcUrl,
+      stateMachineAddress,
+      stateMachines: configuredStateMachines.length > 0
+        ? configuredStateMachines
+        : [{ stateMachineAddress }],
+      chainId: parsePositiveInteger(options.chainId, 'chainId'),
+      ...(config.supplierId ?? config.executorId ? { supplierId: config.supplierId ?? config.executorId } : {}),
+      ...(options.walletAddress ? { walletAddress: normalizeAddress(options.walletAddress, 'walletAddress') } : config.walletAddress ? { walletAddress: config.walletAddress } : {}),
+      privateKeyEnv: options.privateKeyEnv,
+      handlers: createStateMachineHandlersFromConfig(config),
+      ...(config.artifact ? { artifact: config.artifact } : {}),
+      ...(config.retry ? { retry: config.retry } : {}),
+      ...(storage.jobStore ? { jobStore: storage.jobStore } : {}),
+      ...(storage.cursorStore ? { cursorStore: storage.cursorStore } : {}),
+      dryRun: effectiveDryRun,
+      ...(options.waitForReceipt !== undefined ? { waitForReceipt: options.waitForReceipt } : {}),
+      ...(options.fromBlock ? { fromBlock: options.fromBlock } : {}),
+      ...(options.pollIntervalMs ? { pollIntervalMs: parsePositiveInteger(options.pollIntervalMs, 'pollIntervalMs') } : {}),
+      ...(options.confirmations !== undefined ? { confirmations: parseNonNegativeIntegerOption(options.confirmations, 'confirmations') } : {}),
+      ...(options.reorgWindow !== undefined ? { reorgWindow: parsePositiveInteger(options.reorgWindow, 'reorgWindow') } : {}),
+      ...(options.getLogsBlockSpan !== undefined ? { getLogsBlockSpan: parsePositiveInteger(options.getLogsBlockSpan, 'getLogsBlockSpan') } : {}),
+      onPoll: (poll) => {
+        console.log(stringifyForTransport({ poll }));
+      },
+      onError: (error) => {
+        console.error(error instanceof Error ? `${error.name}: ${error.message}` : String(error));
+      },
+    });
+    return { watcher, storage: storage.summary, stateLock };
+  } catch (error) {
+    // 取锁之后的任何构造/参数解析失败都必须先释放锁再抛出——泄漏的
+    // watcher.lock 会把下一个进程（含同主机的手工 jobs retry）拒之门外。
+    await stateLock?.release();
+    throw error;
+  }
 }
 
 async function validateConfigFromCli(options: ConfigValidateOptions): Promise<Record<string, unknown>> {
@@ -929,10 +1006,10 @@ function summarizeHttpExecutorConfig(config: Awaited<ReturnType<typeof loadExecu
   };
 }
 
-function readSecret(value: string | undefined, envName: string, label: string): string {
-  const secret = value ?? process.env[envName];
+function readSecretFromEnv(envName: string, label: string): string {
+  const secret = process.env[envName];
   if (!secret || secret.trim().length === 0) {
-    throw new ValidationError(`missing ${label}: pass --${label.replaceAll(' ', '-')} or set ${envName}`);
+    throw new ValidationError(`missing ${label}: set ${envName}`);
   }
   return secret;
 }

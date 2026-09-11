@@ -24,3 +24,14 @@ signed by authorized participant keys.
 Executor-kit is the non-browser signal-container producer boundary. It consumes
 Product DTO/Product API actions and produces signed executor signals through
 the same prepare/sign/submit/proof flow as the browser Order App.
+
+## Signal Signing
+
+`signPreparedSignalContainer` accepts an optional
+`expectedDomain: { chainId?, verifyingContract? }` anchor set. When provided,
+each anchor is checked against the prepared payload's EIP-712 domain and any
+mismatch fails closed with a `ValidationError` before a signature exists.
+Omitting it keeps signing fully driven by the prepared payload; production
+callers should pass both anchors so a compromised prepare response cannot
+redirect a signature to another chain or state machine deployment (the same
+boundary the browser Order App enforces before `eth_signTypedData_v4`).

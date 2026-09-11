@@ -44,8 +44,7 @@ describe('participant entrypoint', () => {
     });
 
     // UVPStateMachineSignal is plan-scoped — planId is the first
-    // field of the signed message and callers must pass the real order planId
-    // instead of relying on the builder's zero placeholder default.
+    // field of the signed message and callers must pass the real order planId.
     expect(typedData).toEqual({
       domain: {
         name: 'UVPStateMachine',
@@ -79,12 +78,12 @@ describe('participant entrypoint', () => {
     });
   });
 
-  it('rejects typed data built from the zero planId placeholder for real signing', () => {
-    // The protocol-bindings builder tolerates an absent planId as a zero
-    // placeholder for shape-checking gates; a signer must not accept that
-    // placeholder because it can never pass the on-chain (planId, orderId)
-    // existence check.
-    const zeroPlanTypedData = buildProductSubmitTypedData({
+  it('rejects typed data built without a planId for real signing', () => {
+    // The signed message is plan-scoped: a submission without a real planId
+    // could never pass the on-chain (planId, orderId) existence check, so the
+    // builder refuses to produce typed data for it instead of handing the
+    // signer a zero placeholder.
+    expect(() => buildProductSubmitTypedData({
       chainId: 31337,
       verifyingContract,
       orderId,
@@ -94,8 +93,7 @@ describe('participant entrypoint', () => {
       idempotencyKey,
       submitter,
       deadline,
-    });
-    expect(zeroPlanTypedData.message.planId).toBe(`0x${'0'.repeat(64)}`);
+    } as Parameters<typeof buildProductSubmitTypedData>[0])).toThrow(/planId must be a 32-byte hex value/u);
   });
 
   it('recovers the signer for a Product submit signature', async () => {
