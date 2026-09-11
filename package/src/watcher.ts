@@ -1380,15 +1380,24 @@ export class StateMachineWatcher {
     // aliasing returned-signal indexes in the resume/backoff machinery.
     // The channel also honors the same replay rules as the returned-signal
     // lane: an already-delivered signal is answered from its recorded evidence
-    // instead of rebroadcast, and an unresolved prior broadcast is settled by
-    // its receipt (or deferred under the resend backoff) before any new
-    // transaction goes out.
+    // instead of rebroadcast (unless the run resubmits delivered signals —
+    // the manual reorg-recovery channel), and an unresolved prior broadcast
+    // is settled by its receipt (or deferred under the resend backoff) before
+    // any new transaction goes out.
     let contextSubmissionCount = 0;
     let deferredResend = false;
+    // Negative indexes continue across runs instead of restarting at -1: the
+    // delivery-evidence set and the terminal-status computation treat the
+    // index as the context signal's identity, so a recycled index would let a
+    // re-run's different context signal inherit a prior signal's delivery
+    // evidence and mask its own unresolved broadcast.
+    const priorContextSignalCount = new Set(
+      jobSubmissions.filter((submission) => submission.signalIndex < 0).map((submission) => submission.signalIndex),
+    ).size;
     const context: StateMachineHookReadyHandlerContext = {
       matchedKey: resolved.key,
       submitSignal: async (signal, overrides) => {
-        const signalIndex = -1 - contextSubmissionCount;
+        const signalIndex = -1 - priorContextSignalCount - contextSubmissionCount;
         contextSubmissionCount += 1;
         const attempt = contextSubmissionCount;
         const submitConfig = normalizeSubmitConfig({ ...eventSubmitConfig, ...overrides });
@@ -1397,12 +1406,16 @@ export class StateMachineWatcher {
         // so equal data across runs means the same logical signal.
         const identityRequest = buildSubmitStateMachineSignalCall(submitConfig, signal);
         const priorRecords = jobSubmissions.filter((submission) => submission.request?.data === identityRequest.data);
-        const deliveredPrior = priorRecords.find((submission) =>
-          submission.error?.kind === 'duplicate_signal'
-          || (!submission.error && submission.dryRun === false && submission.confirmed === true));
+        const deliveredPrior = options?.resubmitDelivered
+          ? undefined
+          : priorRecords.find((submission) =>
+            submission.error?.kind === 'duplicate_signal'
+            || (!submission.error && submission.dryRun === false && submission.confirmed === true));
         if (deliveredPrior?.txHash !== undefined && !deliveredPrior.dryRun) {
           // The chain already carries this signal by this job's own recorded
-          // evidence; rebroadcasting could only collect another revert.
+          // evidence; rebroadcasting could only collect another revert. Under
+          // resubmitDelivered the operator declared that evidence invalid
+          // (reorg), so the shortcut must not answer from it.
           return {
             dryRun: false,
             request: deliveredPrior.request ?? identityRequest,
@@ -1418,7 +1431,14 @@ export class StateMachineWatcher {
           // broadcast's outcome is unknown until its receipt says otherwise.
           const recovered = await this.recoverBroadcastSubmission(submitConfig, signal, unresolvedPrior.txHash);
           if (recovered) {
-            appendJobSubmission(jobSubmissions, toJobSubmission(signalIndex, attempt, recovered));
+            // The recovered record keeps the prior broadcast's index: one
+            // logical signal, one index in the history the terminal-status
+            // computation intersects over.
+            appendJobSubmission(jobSubmissions, toJobSubmission(
+              unresolvedPrior.signalIndex,
+              nextSubmissionAttempt(jobSubmissions, unresolvedPrior.signalIndex),
+              recovered,
+            ));
             currentJob = await this.updateJob(job.id, {
               updatedAt: this.config.now(),
               submissions: jobSubmissions,
@@ -1519,7 +1539,7 @@ export class StateMachineWatcher {
           await delay(this.config.retry.baseDelayMs * attemptForHandler);
           continue;
         }
-        const failed = await this.updateJob(job.id, {
+        const failed = await this.concludeRun(job.id, {
           status: statusForTerminalError(error, classified, jobSubmissions),
           updatedAt: this.config.now(),
           attempts,
@@ -1589,11 +1609,11 @@ export class StateMachineWatcher {
       } catch (error) {
         const classified = classifyExecutorKitError(error);
         attempts += 1;
-        // Unlike the other terminal decisions this path only fires on a
-        // receipt actually observed with a non-success status — a known
-        // reverted outcome — so dead_letter/failed here never freezes a
-        // broadcast whose outcome is unknown.
-        const failed = await this.updateJob(job.id, {
+        // This path only fires on a receipt actually observed as 'reverted' —
+        // the one receipt outcome lookupBroadcastReceipt treats as terminal —
+        // so dead_letter/failed here never freezes a broadcast whose outcome
+        // is unknown.
+        const failed = await this.concludeRun(job.id, {
           status: jobStatusForError(classified),
           updatedAt: this.config.now(),
           attempts,
@@ -1682,7 +1702,7 @@ export class StateMachineWatcher {
           deliveredSignalIndexes.add(index);
           continue;
         }
-        const failed = await this.updateJob(job.id, {
+        const failed = await this.concludeRun(job.id, {
           status: statusForTerminalError(error, classified, jobSubmissions),
           updatedAt: this.config.now(),
           attempts,
@@ -1710,14 +1730,14 @@ export class StateMachineWatcher {
     if (deferredResend) {
       // A deferred signal keeps the job open. Preserve updatedAt: rewriting
       // now() would restart the backoff clock on every deferred round.
-      currentJob = await this.updateJob(job.id, {
+      currentJob = await this.concludeRun(job.id, {
         status: finalStatus === 'matched' ? 'submitted' : finalStatus,
         updatedAt: currentJob.updatedAt,
         attempts,
         submissions: jobSubmissions,
       });
     } else {
-      currentJob = await this.updateJob(job.id, {
+      currentJob = await this.concludeRun(job.id, {
         status: finalStatus,
         updatedAt: this.config.now(),
         attempts,
@@ -1791,18 +1811,33 @@ export class StateMachineWatcher {
   }
 
   private async updateJob(jobId: Hex, patch: StateMachineJobPatch): Promise<StateMachineWatcherJob> {
-    // 结论性状态写入释放运行认领：只有 `matched` 是运行中的占位状态，
-    // 其余状态都意味着本轮运行已结束（含 submitted——回执未知但本轮不再
-    // 推进，后续扫描重跑时会重新认领）。
-    const withClaimRelease =
-      patch.status !== undefined && patch.status !== 'matched' && patch.claim === undefined
-        ? { ...patch, claim: null }
-        : patch;
-    const updated = await this.config.jobStore.update(jobId, withClaimRelease);
+    const updated = await this.config.jobStore.update(jobId, withConclusiveClaimRelease(patch));
     if (!updated) {
       throw new ValidationError(`job ${jobId} not found`);
     }
     return updated;
+  }
+
+  /**
+   * Run-concluding write for a claimed run: the status only lands while the
+   * job is still in this run's `matched` state. A CAS miss means a concurrent
+   * verdict (operator dead-letter racing the claim gate) landed first — that
+   * write wins, so the run reports the stored job instead of overwriting its
+   * status or clearing its reason.
+   */
+  private async concludeRun(jobId: Hex, patch: StateMachineJobPatch): Promise<StateMachineWatcherJob> {
+    const concluded = await this.config.jobStore.update(jobId, {
+      ...withConclusiveClaimRelease(patch),
+      expectStatus: 'matched',
+    });
+    if (concluded) {
+      return concluded;
+    }
+    const current = await this.config.jobStore.get(jobId);
+    if (!current) {
+      throw new ValidationError(`job ${jobId} not found`);
+    }
+    return current;
   }
 
   /**
@@ -1858,8 +1893,10 @@ export class StateMachineWatcher {
   /**
    * Direct receipt lookup shared by both recheck lanes. Resolves 'success' or
    * 'reverted' for a mined transaction, and undefined when the receipt cannot
-   * be obtained (lookup threw, client cannot look receipts up, or the tx is not
-   * mined yet) — "unavailable" is not provable absence, so callers must NOT
+   * be obtained (lookup threw, client cannot look receipts up, the tx is not
+   * mined yet, or the receipt carries a status string the kit does not
+   * recognize — an unrecognized value is an unknown outcome, not evidence of
+   * a revert) — "unavailable" is not provable absence, so callers must NOT
    * rebroadcast on it.
    */
   private async lookupBroadcastReceipt(
@@ -1879,7 +1916,7 @@ export class StateMachineWatcher {
     if (!receipt) {
       return undefined;
     }
-    if (receipt.status && receipt.status !== 'success') {
+    if (receipt.status === 'reverted') {
       throw new SubmitSignalReceiptError(txHash, `submitSignal transaction receipt status ${receipt.status}`, { reverted: true });
     }
     return receipt.status === 'success' ? 'success' : undefined;
@@ -1891,13 +1928,13 @@ export class StateMachineWatcher {
    *
    * - receipt mined with status success: returns a confirmed submission result
    *   built from the recovered tx, so no second transaction is sent;
-   * - receipt mined with a non-success status: the broadcast definitively
+   * - receipt mined with status 'reverted': the broadcast definitively
    *   reverted, so rebroadcasting is pointless — throws the same
    *   non-retryable receipt error as the direct receipt path;
-   * - receipt unavailable: returns undefined. "Unavailable" is not provable
-   *   absence, so callers must NOT rebroadcast on it — the in-run retry defers
-   *   the signal and later scans re-check this receipt (under the resend
-   *   backoff) until it resolves.
+   * - receipt unavailable (or carrying an unrecognized status): returns
+   *   undefined. "Unavailable" is not provable absence, so callers must NOT
+   *   rebroadcast on it — the in-run retry defers the signal and later scans
+   *   re-check this receipt (under the resend backoff) until it resolves.
    */
   private async recoverBroadcastSubmission(
     config: NormalizedSubmitConfig,
@@ -1979,11 +2016,14 @@ export class StateMachineWatcher {
   /**
    * Later-scan pass over open jobs whose blocks are already behind the scan
    * cursor: `detected` jobs stranded by a crash between detection and
-   * processing, and `submitted` jobs whose broadcast was never confirmed.
+   * processing, `submitted` jobs whose broadcast was never confirmed, and
+   * `matched` jobs stranded by a crash between the claim and the conclusive
+   * status write — their claim holder is dead, so no run is in flight.
    * README watcher semantics promise these are replayed/rechecked on later
    * scans; without this pass the cursor moving past their block made that
    * promise unreachable (handleLog only ever ran for logs inside the current
-   * poll window or via manual retry). Cost is bounded: handleLog resolves the
+   * poll window or via manual retry). A live claim keeps the job out: that
+   * run is in flight right now. Cost is bounded: handleLog resolves the
    * receipt of an unconfirmed broadcast before anything else and the resend
    * backoff throttles rebroadcasts.
    */
@@ -1991,7 +2031,8 @@ export class StateMachineWatcher {
     const jobs = await this.config.jobStore.list();
     const watched = new Set(this.config.stateMachines.map((deployment) => deployment.stateMachineAddress.toLowerCase()));
     const open = jobs.filter((job) => {
-      if (job.status !== 'detected' && job.status !== 'submitted') {
+      const strandedMatched = job.status === 'matched' && !isHeldRunClaim(job.claim);
+      if (job.status !== 'detected' && job.status !== 'submitted' && !strandedMatched) {
         return false;
       }
       if (!job.raw) {
@@ -2162,6 +2203,7 @@ export async function retryStateMachineJob(
       lastError: error,
       claim: null,
       expectStatus: job.status,
+      expectClaimPid: job.claim?.pid ?? null,
     });
     if (!deadLetter) {
       throw await conflictRetryError(normalizedJobId, watcher);
@@ -2174,8 +2216,8 @@ export async function retryStateMachineJob(
     };
   }
 
-  // CAS 重开：仅当任务仍处于读取时的状态才写回 detected。读取与写入之间
-  // 若 watcher 已推进（detected→matched 等），这里失败而不是覆盖——覆盖
+  // CAS 重开：仅当任务仍处于读取时的状态与认领时才写回 detected。读取与
+  // 写入之间若 watcher 已推进（认领了运行），这里失败而不是覆盖——覆盖
   // 会把进行中的运行打回 detected，形成同一 handler 的并发二次执行。
   const reopened = await watcher.config.jobStore.update(normalizedJobId, {
     status: 'detected',
@@ -2185,6 +2227,7 @@ export async function retryStateMachineJob(
     clearLastError: true,
     claim: null,
     expectStatus: job.status,
+    expectClaimPid: job.claim?.pid ?? null,
   });
   if (!reopened) {
     throw await conflictRetryError(normalizedJobId, watcher);
@@ -2224,6 +2267,14 @@ export async function deadLetterStateMachineJob(
   if (job.status === 'confirmed' || job.status === 'submitted') {
     throw new ValidationError(`job ${normalizedJobId} cannot be dead-lettered from status ${job.status}`);
   }
+  if (isHeldRunClaim(job.claim)) {
+    // dead_letter 附带 claim:null：在一个运行中的任务上落它会清掉执行者的
+    // 活认领，等于把进行中的 handler 变成无主运行。与 retry 入口同一条闸。
+    throw new ExecutorKitError(
+      `job ${normalizedJobId} is being processed by executor pid ${job.claim?.pid}` +
+        ` (claimed at ${job.claim?.at}); wait for that run to finish or stop its process, then dead-letter`,
+    );
+  }
 
   const at = (options.now ?? (() => new Date().toISOString()))();
   const reason = asNonEmptyString(options.reason, 'reason');
@@ -2243,6 +2294,7 @@ export async function deadLetterStateMachineJob(
     }),
     claim: null,
     expectStatus: job.status,
+    expectClaimPid: job.claim?.pid ?? null,
   });
   if (!updated) {
     throw new ExecutorKitError(
@@ -2453,13 +2505,14 @@ export function buildSubmitStateMachineSignalCall(
 
 /**
  * Thrown after a submitSignal transaction was already broadcast but its receipt
- * could not be confirmed: either the receipt came back non-success (reverted)
+ * could not be confirmed: either the receipt came back with status 'reverted'
  * or waiting for the receipt itself failed (timeout, RPC fault). The broadcast
  * txHash rides on the error so callers can keep the already-broadcast
  * transaction in the job audit trail instead of losing it to a retry.
- * `reverted` separates the two cases: only a receipt actually observed with a
- * non-success status is a known outcome; a receipt that could not be obtained
- * leaves the broadcast's outcome unknown and must never terminalize the job.
+ * `reverted` separates the two cases: only a receipt actually observed as
+ * 'reverted' is a known outcome; a receipt that could not be obtained (or
+ * carries a status string the kit does not recognize) leaves the broadcast's
+ * outcome unknown and must never terminalize the job.
  */
 export class SubmitSignalReceiptError extends Error {
   readonly txHash: Hex;
@@ -2528,7 +2581,7 @@ export async function submitStateMachineSignal(
       const detail = error instanceof Error ? error.message : String(error);
       throw new SubmitSignalReceiptError(txHash, `submitSignal transaction receipt wait failed for ${txHash}: ${detail}`, { cause: error });
     }
-    if (receipt.status && receipt.status !== 'success') {
+    if (receipt.status === 'reverted') {
       throw new SubmitSignalReceiptError(txHash, `submitSignal transaction receipt status ${receipt.status}`, { reverted: true });
     }
     confirmed = receipt.status === 'success';
@@ -3227,7 +3280,7 @@ function hasUnresolvedBroadcast(submissions: readonly StateMachineJobSubmission[
     && !provenDelivered.has(submission.signalIndex));
 }
 
-/** True when the error chain proves a receipt was observed with a non-success status. */
+/** True when the error chain proves a receipt was observed as 'reverted'. */
 function carriesKnownRevert(error: unknown): boolean {
   return [...walkSubmissionErrorChain(error)].some(
     (current) => current instanceof SubmitSignalReceiptError && current.reverted,
@@ -3588,6 +3641,17 @@ function delay(ms: number): Promise<void> {
 
 function cloneJob(job: StateMachineWatcherJob): StateMachineWatcherJob {
   return structuredClone(job) as StateMachineWatcherJob;
+}
+
+/**
+ * 结论性状态写入释放运行认领：只有 `matched` 是运行中的占位状态，其余状
+ * 态都意味着本轮运行已结束（含 submitted——回执未知但本轮不再推进，后续
+ * 扫描重跑时会重新认领）。
+ */
+function withConclusiveClaimRelease(patch: StateMachineJobPatch): StateMachineJobPatch {
+  return patch.status !== undefined && patch.status !== 'matched' && patch.claim === undefined
+    ? { ...patch, claim: null }
+    : patch;
 }
 
 function patchCasMatches(

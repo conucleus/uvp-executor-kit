@@ -2185,15 +2185,179 @@ describe('state machine chain watcher', () => {
       const second = await watcher.handleLog(hookReadyLog());
       // The context channel consults the prior broadcast's receipt before
       // sending again, so the mined success is adopted without a second
-      // transaction, and the run finishes. Context submissions are numbered
-      // per run, so the recovered record and the recheck-adopted record both
-      // sit on slot -1.
+      // transaction, and the run finishes. Recovery and recheck keep the
+      // prior broadcast's signal index, so both adopted records sit on slot -1.
       expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
       expect(second.job?.status).toBe('confirmed');
       const submissions = second.job?.submissions ?? [];
       expect(submissions).toHaveLength(3);
       expect(submissions[1]).toMatchObject({ signalIndex: -1, dryRun: false, txHash: TX_HASH, confirmed: true });
       expect(submissions[2]).toMatchObject({ signalIndex: -1, dryRun: false, txHash: TX_HASH, confirmed: true });
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('keeps a job open when a later-scan receipt carries an unrecognized status instead of clipping it to reverted', async () => {
+    // Only a receipt observed as 'reverted' is a known revert. A node may
+    // return a status string outside the kit's vocabulary; clipping every
+    // non-success value to reverted terminalized broadcasts whose outcome was
+    // merely unknown.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      let receipt: { readonly status?: string } | null = null;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        waitForReceipt: false,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getTransactionReceipt() {
+            return receipt;
+          },
+        },
+        artifact: artifactIndex(),
+        handlers: {
+          '*': async (event, context) => {
+            await context.submitSignal({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: PAYLOAD_HASH,
+            });
+          },
+        },
+      });
+
+      const first = await watcher.handleLog(hookReadyLog());
+      expect(first.job?.status).toBe('submitted');
+
+      receipt = { status: '0xout-of-vocabulary' };
+      const second = await watcher.handleLog(hookReadyLog());
+      expect(second.job?.status).toBe('submitted');
+      expect(second.error).toBeUndefined();
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(1);
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('resubmits a delivered handler-context signal when the manual retry declares the confirmation invalid', async () => {
+    // retry out of `confirmed` passes resubmitDelivered: the recorded delivery
+    // evidence is exactly what the operator declared invalid (reorg), so the
+    // context channel must rebroadcast instead of answering from evidence.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      let handlerRuns = 0;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        publicClient: fakeReceiptClient(31_337, { status: 'success' }),
+        artifact: artifactIndex(),
+        handlers: {
+          '*': async (event, context) => {
+            handlerRuns += 1;
+            await context.submitSignal({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: PAYLOAD_HASH,
+            });
+          },
+        },
+      });
+
+      const first = await watcher.handleLog(hookReadyLog());
+      expect(first.job?.status).toBe('confirmed');
+
+      const retried = await retryStateMachineJob(watcher, first.job!.id, { operator: 'ops@example.com' });
+      expect(handlerRuns).toBe(2);
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(2);
+      expect(retried.job?.status).toBe('confirmed');
+    } finally {
+      await stub.close();
+      delete process.env[KEY_ENV];
+    }
+  });
+
+  it('continues context signal numbering across runs so a re-run signal never inherits a prior signal slot', async () => {
+    // Context indexes are the signal identity for the delivery-evidence set
+    // and the terminal-status intersection. Restarting at -1 every run let a
+    // re-run's new context signal adopt the prior signal's delivery evidence
+    // and land the job a false `confirmed` while its own broadcast was
+    // unobserved.
+    process.env[KEY_ENV] = TEST_PRIVATE_KEY;
+    const stub = await startJsonRpcStub();
+    try {
+      let receiptLookups = 0;
+      let payload = PAYLOAD_HASH;
+      const watcher = createStateMachineWatcher({
+        rpcUrl: stub.url,
+        stateMachineAddress: STATE_MACHINE,
+        chainId: 31_337,
+        privateKeyEnv: KEY_ENV,
+        waitForReceipt: false,
+        publicClient: {
+          async getChainId() {
+            return 31_337;
+          },
+          async getBlockNumber() {
+            return 12n;
+          },
+          async getLogs() {
+            return [];
+          },
+          async getTransactionReceipt() {
+            receiptLookups += 1;
+            return receiptLookups === 1 ? { status: 'success' } : null;
+          },
+        },
+        artifact: artifactIndex(),
+        handlers: {
+          '*': async (event, context) => {
+            await context.submitSignal({
+              planId: PLAN_ID,
+              orderId: event.orderId,
+              source: 'buyer',
+              signalName: 'exec.main.cmp',
+              payloadHash: payload,
+            });
+          },
+        },
+      });
+
+      // First run: the context broadcast is resolved as success by the
+      // recheck, so the job lands `confirmed` with slot -1 delivered.
+      const first = await watcher.handleLog(hookReadyLog());
+      expect(first.job?.status).toBe('confirmed');
+      expect(first.job?.submissions.map((submission) => submission.signalIndex)).toEqual([-1, -1]);
+
+      // Manual retry emits a DIFFERENT context signal; its own receipt stays
+      // unobserved (lookup #2 returns null), so the job must remain open.
+      payload = `0x${'45'.repeat(32)}` as Hex;
+      const retried = await retryStateMachineJob(watcher, first.job!.id, { operator: 'ops@example.com' });
+      expect(stub.methods.filter((method) => method === 'eth_sendRawTransaction')).toHaveLength(2);
+      const indexes = retried.job?.submissions.map((submission) => submission.signalIndex) ?? [];
+      expect(indexes).toEqual([-1, -1, -2]);
+      expect(retried.job?.status).toBe('submitted');
     } finally {
       await stub.close();
       delete process.env[KEY_ENV];

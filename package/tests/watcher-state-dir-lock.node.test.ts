@@ -9,6 +9,7 @@ import { describe, it } from 'node:test';
 import {
   acquireWatcherStateDirLock,
   createStateMachineWatcher,
+  deadLetterStateMachineJob,
   decodeHookReadyLog,
   FileStateMachineJobStore,
   InMemoryStateMachineJobStore,
@@ -381,6 +382,156 @@ describe('watcher 任务级运行认领', () => {
       const retried = await retryStateMachineJob(watcher, jobId, { operator: 'claim-test' });
       assert.equal(retried.status, 'handled', 'a dead claim must not block the manual recovery channel');
       assert.equal(effects, 2, 'the retry runs the handler exactly once more');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('handler 运行中手工 dead-letter 被拒：dead_letter 附带 claim:null 不得清掉活认领', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-run-claim-deadletter-'));
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolveStarted) => { entered = resolveStarted; });
+    const blocked = new Promise<void>((resolveBlocked) => { release = resolveBlocked; });
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:1',
+      stateMachineAddress: machine,
+      chainId: 31_337,
+      walletAddress: wallet,
+      privateKeyEnv: 'UVP_RUN_CLAIM_UNUSED_KEY',
+      dryRun: true,
+      jobStore: new FileStateMachineJobStore(join(dir, 'jobs.json')),
+      handlers: { '*': async () => { entered(); await blocked; } },
+    });
+    try {
+      const log = await hookReadyLog();
+      const active = watcher.handleLog(log);
+      await started;
+
+      const jobId = stateMachineJobId(decodeHookReadyLog(log));
+      await assert.rejects(
+        deadLetterStateMachineJob(watcher.config.jobStore, jobId, {
+          operator: 'claim-test',
+          reason: 'operator verdict',
+        }),
+        (error: unknown) => {
+          assert.match(String((error as Error).message), /being processed by executor pid/u);
+          return true;
+        },
+      );
+      const duringRun = await watcher.config.jobStore.get(jobId);
+      assert.ok(duringRun?.claim, 'the refused dead-letter must leave the live claim intact');
+
+      release();
+      const settled = await active;
+      assert.equal(settled.job?.status, 'matched', 'the dry-run run still concludes its own outcome');
+    } finally {
+      release?.();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('运行收尾终态写入不得覆盖并发落下的操作员 dead-letter 裁决', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-run-claim-finalize-'));
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolveStarted) => { entered = resolveStarted; });
+    const blocked = new Promise<void>((resolveBlocked) => { release = resolveBlocked; });
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:1',
+      stateMachineAddress: machine,
+      chainId: 31_337,
+      walletAddress: wallet,
+      privateKeyEnv: 'UVP_RUN_CLAIM_UNUSED_KEY',
+      dryRun: true,
+      jobStore: new FileStateMachineJobStore(join(dir, 'jobs.json')),
+      handlers: { '*': async () => { entered(); await blocked; } },
+    });
+    try {
+      const log = await hookReadyLog();
+      const active = watcher.handleLog(log);
+      await started;
+
+      // 模拟认领闸读取后、运行结束前落进来的操作员裁决（读-写竞态窗口）：
+      // 直接写 store，绕过已被活认领挡住的入口。
+      const jobId = stateMachineJobId(decodeHookReadyLog(log));
+      const operatorAt = new Date().toISOString();
+      await watcher.config.jobStore.update(jobId, {
+        status: 'dead_letter',
+        updatedAt: operatorAt,
+        lastError: { kind: 'unknown', message: 'operator verdict', retryable: false },
+        claim: null,
+      });
+
+      release();
+      const settled = await active;
+      assert.equal(settled.job?.status, 'dead_letter', 'the run must not overwrite the operator verdict');
+      const stored = await watcher.config.jobStore.get(jobId);
+      assert.equal(stored?.status, 'dead_letter');
+      assert.equal(stored?.lastError?.message, 'operator verdict', 'the operator reason must survive the run');
+    } finally {
+      release?.();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('搁浅的 matched（认领持有者已死）被后续扫描自动接管重跑，而非仅剩人工 retry', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'uvp-run-claim-stranded-'));
+    let effects = 0;
+    const store = new FileStateMachineJobStore(join(dir, 'jobs.json'));
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:1',
+      stateMachineAddress: machine,
+      chainId: 31_337,
+      walletAddress: wallet,
+      privateKeyEnv: 'UVP_RUN_CLAIM_UNUSED_KEY',
+      dryRun: true,
+      jobStore: store,
+      fromBlock: 13n,
+      publicClient: {
+        async getChainId() {
+          return 31_337;
+        },
+        async getBlockNumber() {
+          return 100n;
+        },
+        async getLogs() {
+          return [];
+        },
+      },
+      handlers: {
+        '*': (event) => {
+          effects += 1;
+          return [{ orderId: event.orderId, source: 'buyer', signalName: 'cmp' }];
+        },
+      },
+    });
+    try {
+      const log = await hookReadyLog();
+      const event = decodeHookReadyLog(log);
+      if (!event) {
+        throw new Error('test fixture log must decode as HookReady');
+      }
+      const created = await store.upsertDetected(event, { now: new Date().toISOString(), maxAttempts: 3 });
+      // 模拟崩溃残留：matched + 认领写入后、结论性写入前进程死亡。
+      await store.update(created.id, {
+        status: 'matched',
+        updatedAt: new Date().toISOString(),
+        matchedKey: '*',
+        claim: { pid: await deadPid(), at: new Date().toISOString() },
+        expectStatus: 'detected',
+      });
+
+      await watcher.pollOnce();
+
+      assert.equal(effects, 1, 'the later-scan pass must take over the stranded matched job');
+      const revived = await store.get(created.id);
+      assert.equal(revived?.submissions.length, 1, 'the takeover run records its dry-run submission');
+      assert.ok(!revived?.claim, 'the concluded run releases the claim');
+
+      // dry-run 收敛：后续扫描不再重跑 handler。
+      await watcher.pollOnce();
+      assert.equal(effects, 1);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

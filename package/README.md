@@ -124,8 +124,10 @@ configurable parameters (`--confirmations`, `--reorg-window`,
   off exponentially (capped at 8x the interval), returning to the configured
   cadence on the first successful round.
 - **Resend backoff and later scans**: open jobs behind the cursor — `detected`
-  leftovers from a crash between detection and processing, and `submitted`
-  jobs with an unconfirmed broadcast — are revisited on later scans. A signal
+  leftovers from a crash between detection and processing, `submitted`
+  jobs with an unconfirmed broadcast, and `matched` jobs stranded by a crash
+  between the run claim and the conclusive status write (the claim holder is
+  dead, so no run is in flight) — are revisited on later scans. A signal
   whose prior broadcast was never confirmed is settled by evidence first: the
   scan re-checks the receipt and adopts a mined success without rebroadcasting
   (a mined revert ends the job as a visible failure instead of silently
