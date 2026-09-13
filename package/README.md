@@ -109,7 +109,11 @@ configurable parameters (`--confirmations`, `--reorg-window`,
 - **Finality buffer**: each round scans only up to `head - confirmations`
   (default 1), so a short reorg cannot flip already-processed logs and their
   confirmed submissions behind the cursor. `--confirmations 0` restores tip
-  scanning for throwaway local chains.
+  scanning for throwaway local chains. The silent default is local-only:
+  declaring a non-local runtime with `--runtime-env <env>` on
+  `chain-once`/`chain-watch` (or `UVP_EXECUTOR_RUNTIME_ENV`) makes an explicit
+  positive `--confirmations` mandatory — the same caliber as chain-services
+  requiring an explicit `UVP_FINALITY_CONFIRMATIONS` outside local.
 - **Cursor block-hash continuity**: each successful round remembers the
   canonical hash of its last scanned block (plus exponentially spaced anchors
   inside the reorg window, default 64 blocks). The next round verifies the
@@ -138,6 +142,12 @@ configurable parameters (`--confirmations`, `--reorg-window`,
   unknown. Dedupe on chain is the contract's `SignalAlreadyExists` check on
   the `(planId, orderId, sourceId, signalId)` tuple; the backoff only stops
   the per-round gas burn. Manual `jobs retry` bypasses the throttle.
+- **Run-claim release retries**: a run-claim release whose store write fails
+  is reported through the error channel and retried on every poll round. A
+  live pid's claim blocks both scans and manual retries, so a silently stuck
+  release would park the job in this process forever — the release path gets
+  the same recovery guarantee the dead-holder pid check gives crashed
+  processes.
 
 Build or submit one state-machine signal:
 

@@ -52,6 +52,7 @@ import {
   summarizeSupplierOps,
   submitStateMachineSignal,
   type StateMachineCursorStore,
+  type StateMachineRuntimeEnvironment,
   type StateMachineJobStore,
   type WatcherStateDirLock,
 } from './watcher.js';
@@ -73,6 +74,8 @@ interface ChainWatchOptions {
   fromBlock?: string;
   pollIntervalMs?: string;
   confirmations?: string;
+  /** Declared runtime environment; non-local values make --confirmations mandatory (no silent default 1). */
+  runtimeEnv?: string;
   reorgWindow?: string;
   getLogsBlockSpan?: string;
   jobsFile?: string;
@@ -575,7 +578,8 @@ export function buildProgram(): Command {
     .option('--wallet-address <address>', 'executor wallet address shown as submitSignal sender in dry-run')
     .option('--private-key-env <name>', 'environment variable containing the callback tx private key', DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV)
     .option('--from-block <uint>', 'first block to scan; on restart a persisted scan cursor takes precedence')
-    .option('--confirmations <n>', 'finality buffer in blocks: scan only up to head - n (0 restores tip scanning)', '1')
+    .option('--confirmations <n>', 'finality buffer in blocks: scan only up to head - n (0 restores tip scanning); defaults to 1 only for local/undeclared runtime envs and must be passed explicitly for non-local ones')
+    .option('--runtime-env <env>', `declared runtime environment (local, testnet, staging, production); non-local values make an explicit --confirmations mandatory (default: $${EXECUTOR_RUNTIME_ENV} or local caliber)`)
     .option('--reorg-window <blocks>', 'bounded reorg checkpoint window for the common-ancestor rollback', '64')
     .option('--max-get-logs-block-span <blocks>', 'max blocks per eth_getLogs request; deeper ranges are chunked', '9999')
     .option('--jobs-file <path>', 'watcher jobs JSON file (default: <state-dir>/jobs.json)')
@@ -609,7 +613,8 @@ export function buildProgram(): Command {
     .option('--private-key-env <name>', 'environment variable containing the callback tx private key', DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV)
     .option('--from-block <uint>', 'first block to scan; on restart a persisted scan cursor takes precedence')
     .option('--poll-interval-ms <ms>', 'polling interval in milliseconds')
-    .option('--confirmations <n>', 'finality buffer in blocks: scan only up to head - n (0 restores tip scanning)', '1')
+    .option('--confirmations <n>', 'finality buffer in blocks: scan only up to head - n (0 restores tip scanning); defaults to 1 only for local/undeclared runtime envs and must be passed explicitly for non-local ones')
+    .option('--runtime-env <env>', `declared runtime environment (local, testnet, staging, production); non-local values make an explicit --confirmations mandatory (default: $${EXECUTOR_RUNTIME_ENV} or local caliber)`)
     .option('--reorg-window <blocks>', 'bounded reorg checkpoint window for the common-ancestor rollback', '64')
     .option('--max-get-logs-block-span <blocks>', 'max blocks per eth_getLogs request; deeper ranges are chunked', '9999')
     .option('--jobs-file <path>', 'watcher jobs JSON file (default: <state-dir>/jobs.json)')
@@ -747,6 +752,31 @@ async function readPreparedSignalContainerFile(path: string): Promise<PreparedSi
 export const DEFAULT_WATCHER_STATE_DIR = './uvp-watcher-state';
 /** Env var overriding the default watcher state directory (the --state-dir flag wins over it). */
 export const WATCHER_STATE_DIR_ENV = 'UVP_WATCHER_STATE_DIR';
+/**
+ * Declared runtime environment for watcher invocations (local, testnet,
+ * staging, production) — same value set as chain-services
+ * CHAIN_SERVICES_RUNTIME_ENV. Non-local values forbid the silent finality
+ * default of 1 confirmation.
+ */
+export const EXECUTOR_RUNTIME_ENV = 'UVP_EXECUTOR_RUNTIME_ENV';
+
+/**
+ * Resolve the declared runtime environment: --runtime-env wins over the env
+ * var; neither set keeps the local caliber (default finality allowed).
+ */
+export function resolveRuntimeEnvironment(
+  flagValue: string | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): StateMachineRuntimeEnvironment | undefined {
+  const raw = (flagValue ?? env[EXECUTOR_RUNTIME_ENV])?.trim().toLowerCase();
+  if (!raw) {
+    return undefined;
+  }
+  if (raw === 'local' || raw === 'testnet' || raw === 'staging' || raw === 'production') {
+    return raw;
+  }
+  throw new ValidationError(`--runtime-env / ${EXECUTOR_RUNTIME_ENV} must be local, testnet, staging, or production (got ${raw})`);
+}
 
 /**
  * What the CLI builds for watcher state. `file` (default) persists both
@@ -842,6 +872,9 @@ async function buildStateMachineWatcherFromCli(
     throw new ValidationError('missing state machine address: pass --state-machine or set stateMachines[] in config');
   }
   const storage = resolveWatcherStorage(options);
+  // 非 local 声明会禁止 finality 静默默认（watcher 强检）：环境口径在取锁
+  // 之前解析，非法值直接拒绝。
+  const runtimeEnvironment = resolveRuntimeEnvironment(options.runtimeEnv);
   // File 模式下 state-dir 由一个 watcher 进程独占：启动即取进程锁，
   // 既有锁的持有进程存活时直接拒绝（fail-closed），崩溃残留锁接管。
   const stateLock = storage.summary.mode === 'file' && builderOptions.holdStateDirLock !== false
@@ -877,6 +910,7 @@ async function buildStateMachineWatcherFromCli(
       ...(options.fromBlock ? { fromBlock: options.fromBlock } : {}),
       ...(options.pollIntervalMs ? { pollIntervalMs: parsePositiveInteger(options.pollIntervalMs, 'pollIntervalMs') } : {}),
       ...(options.confirmations !== undefined ? { confirmations: parseNonNegativeIntegerOption(options.confirmations, 'confirmations') } : {}),
+      ...(runtimeEnvironment ? { runtimeEnvironment } : {}),
       ...(options.reorgWindow !== undefined ? { reorgWindow: parsePositiveInteger(options.reorgWindow, 'reorgWindow') } : {}),
       ...(options.getLogsBlockSpan !== undefined ? { getLogsBlockSpan: parsePositiveInteger(options.getLogsBlockSpan, 'getLogsBlockSpan') } : {}),
       onPoll: (poll) => {

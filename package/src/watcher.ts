@@ -191,6 +191,14 @@ export type StateMachineHookReadyHandler = (
   context: StateMachineHookReadyHandlerContext,
 ) => StateMachineHookReadyHandlerResult | Promise<StateMachineHookReadyHandlerResult>;
 
+/**
+ * Runtime environment declaration, same value set as chain-services
+ * CHAIN_SERVICES_RUNTIME_ENV. Non-local environments forbid the silent
+ * finality default (see confirmations) — the same caliber as chain-services
+ * requiring an explicit UVP_FINALITY_CONFIRMATIONS outside local.
+ */
+export type StateMachineRuntimeEnvironment = 'local' | 'testnet' | 'staging' | 'production';
+
 export interface StateMachineWatcherConfig extends SubmitStateMachineSignalConfig {
   readonly supplierId?: string;
   readonly stateMachines?: readonly StateMachineDeploymentWatcherConfig[];
@@ -205,9 +213,18 @@ export interface StateMachineWatcherConfig extends SubmitStateMachineSignalConfi
   /**
    * Finality buffer in blocks (default DEFAULT_FINALITY_CONFIRMATIONS): each
    * round scans only up to head - confirmations. 0 restores tip scanning for
-   * throwaway local chains.
+   * throwaway local chains. The silent default is only allowed for local (or
+   * undeclared) runtime environments: with runtimeEnvironment set to a
+   * non-local value, confirmations must be set explicitly to a positive
+   * integer — a silent 1-block buffer lets a single-block reorg flip
+   * already-processed logs past the cursor.
    */
   readonly confirmations?: number | string;
+  /**
+   * Declared runtime environment (default: local caliber). Non-local values
+   * make an explicit confirmations setting mandatory.
+   */
+  readonly runtimeEnvironment?: StateMachineRuntimeEnvironment;
   /**
    * Bounded reorg checkpoint window (default DEFAULT_REORG_WINDOW_BLOCKS):
    * recent scanned block hashes kept for the common-ancestor rollback when a
@@ -961,6 +978,14 @@ export class StateMachineWatcher {
   /** Canonical hash of block nextBlock - 1 from the last successful round, when readable. */
   private cursorBlockHash: string | undefined;
   private checkpoints: StateMachineCursorCheckpoint[] = [];
+  /**
+   * Run claims whose release write failed (store fault): retried every poll
+   * round. A same-pid claim is always "held" for isHeldRunClaim, so a stuck
+   * release silently excludes the job from this process's scans and from
+   * manual retries forever — the opposite of the dead-holder takeover the
+   * pid check provides for crashed processes.
+   */
+  private pendingClaimReleases = new Set<Hex>();
 
   constructor(config: StateMachineWatcherConfig) {
     this.config = normalizeStateMachineWatcherConfig(config);
@@ -980,6 +1005,7 @@ export class StateMachineWatcher {
       nextBlock: this.nextBlock?.toString(),
       pollIntervalMs: this.config.pollIntervalMs,
       confirmations: this.config.confirmations,
+      ...(this.config.runtimeEnvironment ? { runtimeEnvironment: this.config.runtimeEnvironment } : {}),
       reorgWindow: this.config.reorgWindow,
       getLogsBlockSpan: this.config.getLogsBlockSpan,
       handlerKeys: Object.keys(this.config.handlers),
@@ -1038,6 +1064,10 @@ export class StateMachineWatcher {
   }
 
   async pollOnce(): Promise<StateMachinePollResult> {
+    // Claim-release retries run before any early return of the round: a stuck
+    // release must not wait for new blocks (the finality-lag path returns
+    // before scanning).
+    await this.retryPendingClaimReleases();
     const client = getPublicClient(this.config);
     await ensureChainId(client, this.config.chainId);
     await this.restoreCursor(client);
@@ -1881,13 +1911,53 @@ export class StateMachineWatcher {
     return { outcome: 'lost' };
   }
 
-  /** Release this process's run claim; a no-op when the conclusive status write already released it. */
+  /**
+   * Release this process's run claim; a no-op when the conclusive status write
+   * already released it (the CAS guard loses, which is fine). A release write
+   * that REJECTS is not fine: the claim stays held by this live pid, so it is
+   * queued for {@link retryPendingClaimReleases} and reported through onError.
+   */
   private async releaseRunClaim(jobId: Hex): Promise<void> {
-    await this.config.jobStore.update(jobId, {
-      updatedAt: this.config.now(),
-      claim: null,
-      expectClaimPid: process.pid,
-    }).catch(() => undefined);
+    try {
+      await this.config.jobStore.update(jobId, {
+        updatedAt: this.config.now(),
+        claim: null,
+        expectClaimPid: process.pid,
+      });
+    } catch (error) {
+      this.pendingClaimReleases.add(jobId);
+      this.config.onError?.(new ExecutorKitError(
+        `failed to release the run claim for job ${jobId} (${describeError(error)});`
+          + ` the job stays claimed by pid ${process.pid} and is excluded from scans and manual retries until the release succeeds; the release is retried every poll round`,
+      ));
+    }
+  }
+
+  /**
+   * Periodic retry of failed claim releases (each poll round, before any early
+   * return). A lost CAS race also counts as released: the claim is then no
+   * longer held by this process (conclusive write released it, or an operator
+   * cleared it).
+   */
+  private async retryPendingClaimReleases(): Promise<void> {
+    if (this.pendingClaimReleases.size === 0) {
+      return;
+    }
+    for (const jobId of [...this.pendingClaimReleases]) {
+      try {
+        await this.config.jobStore.update(jobId, {
+          updatedAt: this.config.now(),
+          claim: null,
+          expectClaimPid: process.pid,
+        });
+        this.pendingClaimReleases.delete(jobId);
+      } catch (error) {
+        this.config.onError?.(new ExecutorKitError(
+          `releasing the run claim for job ${jobId} failed again (${describeError(error)});`
+            + ` the job remains claimed by pid ${process.pid} and excluded from scans and manual retries`,
+        ));
+      }
+    }
   }
 
   /**
@@ -2645,6 +2715,7 @@ interface NormalizedStateMachineWatcherConfig extends NormalizedSubmitConfig {
   readonly fromBlock?: bigint;
   readonly pollIntervalMs: number;
   readonly confirmations: number;
+  readonly runtimeEnvironment?: StateMachineRuntimeEnvironment;
   readonly reorgWindow: number;
   readonly getLogsBlockSpan: number;
   readonly retry: NormalizedStateMachineRetryConfig;
@@ -2679,6 +2750,29 @@ function normalizeStateMachineWatcherConfig(config: StateMachineWatcherConfig): 
   if (!defaultStateMachineAddress) {
     throw new ValidationError('state machine watcher requires stateMachineAddress or stateMachines[]');
   }
+  const runtimeEnvironment = normalizeRuntimeEnvironment(config.runtimeEnvironment);
+  const confirmations = config.confirmations !== undefined
+    ? parseNonNegativeSafeInteger(asNumberOrString(config.confirmations, 'confirmations'), 'confirmations')
+    : undefined;
+  if (runtimeEnvironment !== undefined && runtimeEnvironment !== 'local') {
+    // Same caliber as chain-services env.ts: outside local the finality buffer
+    // must be an explicit positive integer. The silent default 1 (and the
+    // explicit 0 tip-scanning opt-in) are local throwaway-chain conveniences
+    // that must not leak into shared environments.
+    if (confirmations === undefined) {
+      throw new ValidationError(
+        `confirmations must be explicitly configured when runtimeEnvironment is ${runtimeEnvironment}:`
+          + ` the default ${DEFAULT_FINALITY_CONFIRMATIONS}-block finality buffer lets a single-block reorg flip already-processed logs past the scan cursor`
+          + ' (same caliber as chain-services UVP_FINALITY_CONFIRMATIONS)',
+      );
+    }
+    if (confirmations === 0) {
+      throw new ValidationError(
+        `confirmations must be a positive integer when runtimeEnvironment is ${runtimeEnvironment};`
+          + ' 0 (tip scanning) is only for local throwaway chains',
+      );
+    }
+  }
   const normalized = normalizeSubmitConfig({
     ...config,
     stateMachineAddress: defaultStateMachineAddress,
@@ -2690,12 +2784,11 @@ function normalizeStateMachineWatcherConfig(config: StateMachineWatcherConfig): 
     handlers: config.handlers,
     ...(config.artifact ? { artifact: normalizeArtifactIndex(config.artifact) } : {}),
     ...(config.fromBlock !== undefined ? { fromBlock: parseBigNumberish(config.fromBlock, 'fromBlock') } : {}),
+    ...(runtimeEnvironment ? { runtimeEnvironment } : {}),
     pollIntervalMs: config.pollIntervalMs !== undefined
       ? parsePositiveInteger(config.pollIntervalMs, 'pollIntervalMs')
       : DEFAULT_STATE_MACHINE_POLL_INTERVAL_MS,
-    confirmations: config.confirmations !== undefined
-      ? parseNonNegativeSafeInteger(asNumberOrString(config.confirmations, 'confirmations'), 'confirmations')
-      : DEFAULT_FINALITY_CONFIRMATIONS,
+    confirmations: confirmations ?? DEFAULT_FINALITY_CONFIRMATIONS,
     reorgWindow: config.reorgWindow !== undefined
       ? parsePositiveInteger(asNumberOrString(config.reorgWindow, 'reorgWindow'), 'reorgWindow')
       : DEFAULT_REORG_WINDOW_BLOCKS,
@@ -3627,6 +3720,16 @@ function normalizeCallbackMode(value: string): ExecutorCallbackMode {
   throw new ValidationError('callbackMode must be manual, auto, or webhook');
 }
 
+function normalizeRuntimeEnvironment(value: StateMachineRuntimeEnvironment | undefined): StateMachineRuntimeEnvironment | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === 'local' || value === 'testnet' || value === 'staging' || value === 'production') {
+    return value;
+  }
+  throw new ValidationError(`runtimeEnvironment must be local, testnet, staging, or production (got ${String(value)})`);
+}
+
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && 'code' in error;
 }
@@ -3690,13 +3793,6 @@ function applyJobPatch(
   return resolvedClaim !== undefined && resolvedClaim !== null
     ? { ...next, claim: resolvedClaim }
     : next;
-}
-
-/** A claim held by another live process: the run is in flight right now. */
-function isLiveForeignClaim(
-  claim: { readonly pid: number; readonly at: string } | undefined,
-): boolean {
-  return claim !== undefined && claim.pid !== process.pid && isProcessAlive(claim.pid);
 }
 
 /**

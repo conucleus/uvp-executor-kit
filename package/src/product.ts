@@ -913,7 +913,10 @@ function requiredText(value: string, fieldName: string): string {
 
 function requireStringList(value: readonly string[], label: string): readonly string[] {
   if (!Array.isArray(value) || !value.every((item) => typeof item === 'string' && item.trim().length > 0)) {
-    throw new ValidationError(`${label} must be a non-empty array of strings`);
+    // An empty list is valid on purpose: prepare-submit with no evidenceIds is
+    // the pure-confirmation submission. Only non-string/blank entries are
+    // rejected — the old "non-empty array" wording contradicted the [] pass.
+    throw new ValidationError(`${label} must be an array of non-empty strings (an empty array is valid and submits as a pure confirmation without evidence)`);
   }
   return value.map((item) => item.trim());
 }
