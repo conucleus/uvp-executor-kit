@@ -36,6 +36,43 @@ and nothing republishes it automatically when `src/` changes: run the build
 before invoking the installed `uvp-executor` bin. Workspace consumers import
 the TypeScript sources through the package `exports` and never need `dist`.
 
+## Source Layout
+
+The watcher code is organized by scan-and-delivery lifecycle (B2 治理结构); all
+modules below are internal wiring behind the unchanged SDK surface re-exported
+by `src/index.ts`:
+
+```text
+package/src/
+├── index.ts                   # SDK 公共出口（export * 面保持稳定）
+├── cli.ts                     # CLI 入口：main/buildProgram 与 bin（dist/cli.js）
+├── cli/
+│   ├── commands/              # 命令分发：wallet/product/serve/config/doctor/jobs/chain
+│   ├── options.ts             # 选项类型与参数解析辅助
+│   ├── output.ts              # ExecutorJobDTO 等 DTO 映射与退出码适配
+│   └── watcher.ts             # CLI 装配 watcher（state-dir 锁、存储选择、runtime env）
+├── watcher/
+│   ├── index.ts               # watcher 域公共面（原 src/watcher.ts 的导出集）
+│   ├── watcher.ts             # 扫描与执行编排（StateMachineWatcher 及配置归一化）
+│   ├── scan/logs.ts           # 日志扫描：区块分段与日志排序
+│   ├── scan/reorg.ts          # 重组回退：finality 缓冲、checkpoint 锚点、回滚证据
+│   ├── jobs/model.ts          # job 数据模型、store 契约与 patch/CAS 机制
+│   ├── jobs/claim.ts          # 任务级运行认领（isHeldRunClaim、结论性写入释放）
+│   ├── jobs/retry.ts          # 手工重试、重试/重发回退配置
+│   ├── jobs/deadletter.ts     # 手工 dead-letter
+│   ├── storage/memory.ts      # 内存 job store
+│   ├── storage/file.ts        # jobs.json 持久化（原子写、损坏隔离、复活）
+│   ├── storage/cursor.ts      # cursor.json 持久化与身份校验
+│   ├── storage/lock.ts        # jobs 文件锁与 state-dir 进程锁
+│   ├── execution/handler.ts   # handler 配置、解析与装配
+│   └── execution/receipt.ts   # 交付/回执判定：确认、未决广播与终态规则
+├── signal/
+│   ├── decode.ts              # HookReady 事件解码与 artifact 元数据
+│   ├── build.ts               # submitSignal 调用构建与配置归一化
+│   └── submit.ts              # 交易提交、签名账户与链客户端
+└── participant/               # 参与者侧（浏览器/Order App）导出，子路径不变
+```
+
 ## CLI
 
 Create or inspect a local wallet env file:

@@ -7,6 +7,11 @@ import { encodeAbiParameters, keccak256, stringToBytes, stringToHex, type Hex } 
 import { describe, expect, it, vi } from 'vitest';
 import { classifyExecutorKitError, CodedExecutorKitError } from '../src/errors.js';
 import {
+  stateMachineHandlerConfigToExecutorConfigDTO,
+  stateMachineJobToExecutorJobDTO,
+  summarizeSupplierOps,
+} from '../src/cli/output.js';
+import {
   buildSubmitStateMachineSignalCall,
   createStateMachineHandlersFromConfig,
   createStateMachineWatcher,
@@ -20,14 +25,11 @@ import {
   retryStateMachineJob,
   submitStateMachineSignal,
   SubmitSignalReceiptError,
-  stateMachineHandlerConfigToExecutorConfigDTO,
-  stateMachineJobToExecutorJobDTO,
   stateMachineJobId,
-  summarizeSupplierOps,
   type StateMachineJobStore,
   type StateMachinePublicClient,
   type StateMachineRawLog,
-} from '../src/watcher.js';
+} from '../src/watcher/index.js';
 import { ValidationError } from '../src/validation.js';
 
 const STATE_MACHINE = '0x0000000000000000000000000000000000000001';

@@ -11,7 +11,7 @@ import {
 } from '../src/errors.js';
 import { ValidationError } from '../src/validation.js';
 import { chainPollExecutionFailed } from '../src/cli.js';
-import { SubmitSignalReceiptError } from '../src/watcher.js';
+import { SubmitSignalReceiptError } from '../src/watcher/index.js';
 import type { Hex } from '../src/constants.js';
 
 const TX_HASH: Hex = '0x' + 'ab'.repeat(32);
