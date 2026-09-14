@@ -2,7 +2,7 @@ import { encodeFunctionData, keccak256, stringToBytes, type Address, type Hex } 
 import { STATE_MACHINE_ABI } from '@uvp-eth/protocol-bindings';
 import { DEFAULT_SIGNING_KEY_ENV } from '../signing.js';
 import {
-  normalizeAddress,
+  normalizeAddressChecksummed,
   normalizeBytes32,
   parsePositiveInteger,
   ValidationError,
@@ -133,9 +133,9 @@ export function normalizeSubmitConfig(config: SubmitStateMachineSignalConfig): N
   }
   return {
     rpcUrl: config.rpcUrl,
-    stateMachineAddress: normalizeAddress(config.stateMachineAddress, 'stateMachineAddress'),
+    stateMachineAddress: normalizeAddressChecksummed(config.stateMachineAddress, 'stateMachineAddress'),
     chainId: parsePositiveInteger(config.chainId, 'chainId'),
-    ...(config.walletAddress ? { walletAddress: normalizeAddress(config.walletAddress, 'walletAddress') } : {}),
+    ...(config.walletAddress ? { walletAddress: normalizeAddressChecksummed(config.walletAddress, 'walletAddress') } : {}),
     privateKeyEnv: config.privateKeyEnv ?? DEFAULT_STATE_MACHINE_PRIVATE_KEY_ENV,
     dryRun: config.dryRun ?? false,
     // Default ON: a broadcast whose receipt is never observed cannot be told

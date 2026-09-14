@@ -1,6 +1,6 @@
 import { decodeEventLog, encodeAbiParameters, keccak256, stringToBytes, type Address, type Hex } from 'viem';
 import { STATE_MACHINE_ABI } from '@uvp-eth/protocol-bindings';
-import { normalizeAddress, normalizeBytes32, ValidationError } from '../validation.js';
+import { normalizeAddressChecksummed, normalizeBytes32, ValidationError } from '../validation.js';
 import { asString, describeError } from '../watcher/internal.js';
 
 export const HOOK_READY_TOPIC = keccak256(stringToBytes('HookReady(bytes32,bytes32,bytes32,bytes32,bytes32)'));
@@ -79,7 +79,7 @@ export function decodeHookReadyLog(
   const logIndex = normalizeLogIndex(log.logIndex);
   const hookId = normalizeBytes32(asString(args.hookId, 'hookId'), 'hookId');
   const metadata = artifact?.hooksByHookId?.[hookId];
-  const stateMachineAddress = log.address ? normalizeAddress(log.address, 'log.address') : undefined;
+  const stateMachineAddress = log.address ? normalizeAddressChecksummed(log.address, 'log.address') : undefined;
 
   return {
     type: 'HookReady',
@@ -146,7 +146,7 @@ export function tryNormalizeStateMachineAddress(address: Address | string | unde
     return undefined;
   }
   try {
-    return normalizeAddress(address, 'log.address');
+    return normalizeAddressChecksummed(address, 'log.address');
   } catch {
     return undefined;
   }

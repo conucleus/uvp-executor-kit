@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import type { Address, Hex } from 'viem';
 import { ZERO_BYTES32 } from '../../constants.js';
 import {
-  normalizeAddress,
+  normalizeAddressChecksummed,
   normalizeBytes32,
   parsePositiveInteger,
   ValidationError,
@@ -163,10 +163,10 @@ function normalizeStateMachineHandlerConfig(value: unknown): StateMachineHandler
   return {
     ...(typeof value.supplierId === 'string' ? { supplierId: asNonEmptyString(value.supplierId, 'supplierId') } : {}),
     ...(typeof value.executorId === 'string' ? { executorId: asNonEmptyString(value.executorId, 'executorId') } : {}),
-    ...(typeof value.walletAddress === 'string' ? { walletAddress: normalizeAddress(value.walletAddress, 'walletAddress') } : {}),
+    ...(typeof value.walletAddress === 'string' ? { walletAddress: normalizeAddressChecksummed(value.walletAddress, 'walletAddress') } : {}),
     ...(value.chainId !== undefined ? { chainId: parsePositiveInteger(asNumberOrString(value.chainId, 'chainId'), 'chainId') } : {}),
     ...(typeof value.stateMachineAddress === 'string'
-      ? { stateMachineAddress: normalizeAddress(value.stateMachineAddress, 'stateMachineAddress') }
+      ? { stateMachineAddress: normalizeAddressChecksummed(value.stateMachineAddress, 'stateMachineAddress') }
       : {}),
     ...(Array.isArray(value.stateMachines)
       ? { stateMachines: value.stateMachines.map((deployment, index) => normalizeRawStateMachineDeploymentConfig(deployment, `stateMachines[${index}]`)) }
@@ -211,7 +211,7 @@ function normalizeRawStateMachineDeploymentConfig(value: unknown, path: string):
     throw new ValidationError(`${path}.status must be active, deprecated, canary, candidate, or retired`);
   }
   const normalized: StateMachineDeploymentWatcherConfig = {
-    stateMachineAddress: normalizeAddress(value.stateMachineAddress, `${path}.stateMachineAddress`),
+    stateMachineAddress: normalizeAddressChecksummed(value.stateMachineAddress, `${path}.stateMachineAddress`),
   };
   if (typeof value.deploymentId === 'string') {
     (normalized as { deploymentId?: Hex }).deploymentId = normalizeBytes32(value.deploymentId, `${path}.deploymentId`);

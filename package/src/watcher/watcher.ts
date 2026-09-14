@@ -3,6 +3,7 @@ import {
   ExecutorKitError,
   ValidationError,
   normalizeAddress,
+  normalizeAddressChecksummed,
   normalizeBytes32,
   parseBigNumberish,
   parsePositiveInteger,
@@ -1337,7 +1338,7 @@ export class StateMachineWatcher {
    */
   private async revisitOpenJobs(fromBlock: bigint): Promise<readonly StateMachineLogProcessResult[]> {
     const jobs = await this.config.jobStore.list();
-    const watched = new Set(this.config.stateMachines.map((deployment) => deployment.stateMachineAddress.toLowerCase()));
+    const watched = new Set(this.config.stateMachines.map((deployment) => normalizeAddress(deployment.stateMachineAddress, 'stateMachines[].stateMachineAddress')));
     const open = jobs.filter((job) => {
       const strandedMatched = job.status === 'matched' && !isHeldRunClaim(job.claim);
       if (job.status !== 'detected' && job.status !== 'submitted' && !strandedMatched) {
@@ -1351,7 +1352,7 @@ export class StateMachineWatcher {
         // it this round, so the pass must not double-process it.
         return false;
       }
-      if (job.stateMachineAddress && !watched.has(job.stateMachineAddress.toLowerCase())) {
+      if (job.stateMachineAddress && !watched.has(normalizeAddress(job.stateMachineAddress, 'job.stateMachineAddress'))) {
         // Belongs to a state machine this watcher no longer scans; its signals
         // are not this deployment's to submit.
         return false;
@@ -1553,7 +1554,7 @@ function normalizeStateMachineDeployments(
     if (normalized.status === 'retired') {
       continue;
     }
-    const key = normalized.stateMachineAddress.toLowerCase();
+    const key = normalizeAddress(normalized.stateMachineAddress, 'stateMachines.stateMachineAddress');
     if (seen.has(key)) {
       continue;
     }
@@ -1575,7 +1576,7 @@ export function normalizeStateMachineDeploymentConfig(
     throw new ValidationError(`${path}.status must be active, deprecated, canary, candidate, or retired`);
   }
   return {
-    stateMachineAddress: normalizeAddress(deployment.stateMachineAddress, `${path}.stateMachineAddress`),
+    stateMachineAddress: normalizeAddressChecksummed(deployment.stateMachineAddress, `${path}.stateMachineAddress`),
     ...(deployment.deploymentId ? { deploymentId: normalizeBytes32(deployment.deploymentId, `${path}.deploymentId`) } : {}),
     ...(status ? { status } : {}),
   };

@@ -5,7 +5,7 @@ import type { Hex } from 'viem';
 import type { StateMachineHookReady, StateMachineRawLog } from '../../signal/decode.js';
 import { ZERO_BYTES32 } from '../../constants.js';
 import {
-  normalizeAddress,
+  normalizeAddressChecksummed,
   normalizeBytes32,
   parseBigNumberish,
   ValidationError,
@@ -198,7 +198,7 @@ function reviveStoredStateMachineJob(value: unknown): StateMachineWatcherJob {
     ...job,
     id: normalizeBytes32(job.id, 'job.id'),
     eventId: normalizeBytes32(job.eventId, 'job.eventId'),
-    ...(job.stateMachineAddress ? { stateMachineAddress: normalizeAddress(job.stateMachineAddress, 'job.stateMachineAddress') } : {}),
+    ...(job.stateMachineAddress ? { stateMachineAddress: normalizeAddressChecksummed(job.stateMachineAddress, 'job.stateMachineAddress') } : {}),
     orderId: normalizeBytes32(job.orderId, 'job.orderId'),
     hookId: normalizeBytes32(job.hookId, 'job.hookId'),
     stageId: normalizeBytes32(job.stageId, 'job.stageId'),

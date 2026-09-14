@@ -11,7 +11,7 @@ import { loadPrivateKeyFromEnv } from './signing.js';
 import { UnsupportedChainTargetError, type ChainTarget } from './chain-target.js';
 import {
   ExecutorKitError,
-  normalizeAddress,
+  normalizeAddressChecksummed,
   normalizeBytes32,
   ValidationError,
 } from './validation.js';
@@ -289,7 +289,7 @@ export class ProductApiError extends ExecutorKitError {
 }
 
 export async function listSignalContainers(input: ListSignalContainersInput): Promise<readonly ProductSignalContainer[]> {
-  const walletAddress = normalizeAddress(input.walletAddress, 'walletAddress');
+  const walletAddress = normalizeAddressChecksummed(input.walletAddress, 'walletAddress');
   const { body, requestId } = await requestProductApiJson(input, 'GET', '/product/tasks', undefined, {
     assignee: walletAddress,
     ...(input.orderId ? { orderId: input.orderId } : {}),
@@ -307,7 +307,7 @@ export async function listSignalContainers(input: ListSignalContainersInput): Pr
 
 export async function getSignalContainer(input: GetSignalContainerInput): Promise<ProductSignalContainer> {
   if (input.walletAddress) {
-    normalizeAddress(input.walletAddress, 'walletAddress');
+    normalizeAddressChecksummed(input.walletAddress, 'walletAddress');
   }
   const { body, requestId } = await requestProductApiJson(input, 'GET', `/product/tasks/${encodeURIComponent(requiredText(input.taskId, 'taskId'))}`);
   const record = requireRecord(body, 'Product task response');
@@ -319,7 +319,7 @@ export async function hashContainerEvidence(input: HashContainerEvidenceInput): 
 }
 
 export async function prepareSignalContainer(input: PrepareSignalContainerInput): Promise<PreparedSignalContainer> {
-  const walletAddress = normalizeAddress(input.walletAddress, 'walletAddress');
+  const walletAddress = normalizeAddressChecksummed(input.walletAddress, 'walletAddress');
   const { body, requestId } = await requestProductApiJson(
     input,
     'POST',
@@ -342,9 +342,9 @@ export async function signPreparedSignalContainer(
   const prepared = parsePreparedSignalContainer(input.prepared, 'prepared submission');
   const privateKey = loadProductPrivateKeyFromEnv(input.privateKeyEnv);
   const account = privateKeyToAccount(privateKey);
-  const signerAddress = normalizeAddress(account.address, 'privateKeyEnv signer');
-  const configuredWallet = normalizeAddress(input.walletAddress ?? signerAddress, 'walletAddress');
-  const submitter = normalizeAddress(prepared.typedData.message.submitter, 'typedData.message.submitter');
+  const signerAddress = normalizeAddressChecksummed(account.address, 'privateKeyEnv signer');
+  const configuredWallet = normalizeAddressChecksummed(input.walletAddress ?? signerAddress, 'walletAddress');
+  const submitter = normalizeAddressChecksummed(prepared.typedData.message.submitter, 'typedData.message.submitter');
 
   if (submitter !== configuredWallet) {
     throw new ValidationError('typedData.message.submitter does not match configured wallet');
@@ -361,7 +361,7 @@ export async function signPreparedSignalContainer(
     );
   }
   if (input.expectedDomain?.verifyingContract !== undefined) {
-    const expectedContract = normalizeAddress(input.expectedDomain.verifyingContract, 'expectedDomain.verifyingContract');
+    const expectedContract = normalizeAddressChecksummed(input.expectedDomain.verifyingContract, 'expectedDomain.verifyingContract');
     if (prepared.typedData.domain.verifyingContract !== expectedContract) {
       throw new ValidationError(
         `prepared typedData.domain.verifyingContract ${prepared.typedData.domain.verifyingContract} does not match expected verifyingContract ${expectedContract}`,
@@ -385,7 +385,7 @@ export async function submitPreparedSignalContainer(
   input: SubmitPreparedSignalContainerInput,
 ): Promise<SubmittedSignalContainer> {
   const signature = normalizeSignature(input.signature);
-  const walletAddress = normalizeAddress(input.walletAddress, 'walletAddress');
+  const walletAddress = normalizeAddressChecksummed(input.walletAddress, 'walletAddress');
   const { body, requestId } = await requestProductApiJson(
     input,
     'POST',
@@ -497,8 +497,8 @@ export function summarizeSubmittedSignalContainer(
 export function parsePreparedSignalContainer(value: unknown, label = 'prepared submission'): PreparedSignalContainer {
   const record = requireRecord(value, label);
   const typedData = parseProductSubmitTypedData(record.typedData, `${label}.typedData`);
-  const submitter = normalizeAddress(requiredString(record, 'submitter', label), `${label}.submitter`);
-  const typedDataSubmitter = normalizeAddress(typedData.message.submitter, `${label}.typedData.message.submitter`);
+  const submitter = normalizeAddressChecksummed(requiredString(record, 'submitter', label), `${label}.submitter`);
+  const typedDataSubmitter = normalizeAddressChecksummed(typedData.message.submitter, `${label}.typedData.message.submitter`);
   if (submitter !== typedDataSubmitter) {
     throw new ValidationError(`${label}.submitter must match typedData.message.submitter`);
   }
@@ -618,7 +618,7 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
       name: domainName,
       version: domainVersion,
       chainId,
-      verifyingContract: normalizeAddress(
+      verifyingContract: normalizeAddressChecksummed(
         requiredString(domain, 'verifyingContract', `${label}.domain`),
         `${label}.domain.verifyingContract`,
       ),
@@ -637,7 +637,7 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
         requiredString(message, 'idempotencyKey', `${label}.message`),
         `${label}.message.idempotencyKey`,
       ),
-      submitter: normalizeAddress(requiredString(message, 'submitter', `${label}.message`), `${label}.message.submitter`),
+      submitter: normalizeAddressChecksummed(requiredString(message, 'submitter', `${label}.message`), `${label}.message.submitter`),
       deadline: validateFutureDeadline(requiredString(message, 'deadline', `${label}.message`), `${label}.message.deadline`),
     },
   };

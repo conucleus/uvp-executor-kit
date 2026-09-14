@@ -2,7 +2,7 @@ import { access, chmod, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import type { Address, Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import { normalizeAddress, ValidationError } from './validation.js';
+import { normalizeAddressChecksummed, ValidationError } from './validation.js';
 
 export const DEFAULT_WALLET_PRIVATE_KEY_ENV = 'UVP_ETH_DEPLOYER_PRIVATE_KEY';
 export const DEFAULT_WALLET_ADDRESS_ENV = 'UVP_ETH_DEPLOYER_ADDRESS';
@@ -97,7 +97,7 @@ export function getFaucetInfo(network = 'base-sepolia', address?: string): Fauce
     throw new ValidationError(`unsupported faucet network: ${network}`);
   }
 
-  const normalizedAddress = address ? normalizeAddress(address, 'address') : undefined;
+  const normalizedAddress = address ? normalizeAddressChecksummed(address, 'address') : undefined;
   return {
     network: 'base-sepolia',
     chainId: 84532,

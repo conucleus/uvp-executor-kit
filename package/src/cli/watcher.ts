@@ -1,6 +1,6 @@
 import { dirname, join, resolve } from 'node:path';
 import {
-  normalizeAddress,
+  normalizeAddressChecksummed,
   parsePositiveInteger,
   ValidationError,
 } from '../validation.js';
@@ -137,7 +137,7 @@ export async function buildStateMachineWatcherFromCli(
     );
   }
   const stateMachineAddress = options.stateMachine
-    ? normalizeAddress(options.stateMachine, 'stateMachine')
+    ? normalizeAddressChecksummed(options.stateMachine, 'stateMachine')
     : config.stateMachineAddress ?? configuredStateMachines[0]?.stateMachineAddress;
   if (!stateMachineAddress) {
     throw new ValidationError('missing state machine address: pass --state-machine or set stateMachines[] in config');
@@ -169,7 +169,7 @@ export async function buildStateMachineWatcherFromCli(
         : [{ stateMachineAddress }],
       chainId: parsePositiveInteger(options.chainId, 'chainId'),
       ...(config.supplierId ?? config.executorId ? { supplierId: config.supplierId ?? config.executorId } : {}),
-      ...(options.walletAddress ? { walletAddress: normalizeAddress(options.walletAddress, 'walletAddress') } : config.walletAddress ? { walletAddress: config.walletAddress } : {}),
+      ...(options.walletAddress ? { walletAddress: normalizeAddressChecksummed(options.walletAddress, 'walletAddress') } : config.walletAddress ? { walletAddress: config.walletAddress } : {}),
       privateKeyEnv: options.privateKeyEnv,
       handlers: createStateMachineHandlersFromConfig(config),
       ...(config.artifact ? { artifact: config.artifact } : {}),
