@@ -10,7 +10,6 @@
   },
   "exports": {
     ".": "./src/index.ts",
-    "./mcp": "./src/mcp.ts",
     "./participant": "./src/participant/index.ts",
     "./participant/evm": "./src/participant/evm.ts",
     "./participant/solana": "./src/participant/solana.ts"

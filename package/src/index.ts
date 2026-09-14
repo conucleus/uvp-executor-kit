@@ -3,7 +3,6 @@ export * from './constants.js';
 export * from './doctor.js';
 export * from './evidence.js';
 export * from './errors.js';
-export * from './mcp.js';
 export * from './product.js';
 export * from './runtime.js';
 export * from './server.js';

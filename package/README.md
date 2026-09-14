@@ -299,19 +299,6 @@ UTC) is display context and never overturns it. Normal output
 omits protocol fields and bearer token values; pass `--verbose` for raw API
 payloads.
 
-The MCP adapter exposes the same checks via `uvp_doctor`:
-
-```ts
-import { createProductMcpAdapter } from '@uvp-eth/executor-kit/mcp';
-const uvp = createProductMcpAdapter({ chainServicesUrl: 'http://127.0.0.1:8787' });
-const report = await uvp.uvp_doctor({
-  walletAddress: '0x...',
-  taskId: 'task_123',
-});
-console.log(report.taskReadiness?.nextActionLabel);
-// "Ready to prepare. Run product prepare to build the signal container."
-```
-
 Enterprise scripts can use the same SDK helpers without shelling out:
 
 ```ts
@@ -345,47 +332,6 @@ await submitPreparedSignalContainer({
   walletAddress: signed.walletAddress,
 });
 ```
-
-## MCP Gate
-
-The MCP adapter (`@uvp-eth/executor-kit/mcp`) is a thin wrapper over the Product
-API SDK calls. It does not introduce a separate Product API client implementation
-or divergent logic.
-
-MCP tools are another supervised signal-producer surface — not a privileged
-backend. An AI agent, MCP tool, enterprise system, or script all dock at the same
-Product API boundary as the browser Order App. The authorized participant wallet
-still produces the business signature; the MCP layer may assist, route, or
-automate but must not replace the participant signature.
-
-```ts
-import { createProductMcpAdapter } from '@uvp-eth/executor-kit/mcp';
-
-const uvp = createProductMcpAdapter({ chainServicesUrl: 'http://127.0.0.1:8787' });
-await uvp.uvp_list_tasks({ walletAddress });
-await uvp.uvp_get_task({ taskId: 'task_123' });
-await uvp.uvp_hash_evidence({ path: './evidence/customs.json' });
-const preparedResult = await uvp.uvp_prepare_signal({
-  taskId: 'task_123',
-  walletAddress,
-  evidenceIds: ['ev_123'],
-  intent: 'confirm_stage',
-  includeRaw: true,
-});
-if (!preparedResult.rawPrepared) {
-  throw new Error('raw prepared response required for signing');
-}
-await uvp.uvp_submit_signal({
-  prepared: preparedResult.rawPrepared,
-  privateKeyEnv: 'UVP_PARTICIPANT_PRIVATE_KEY',
-  walletAddress,
-});
-await uvp.uvp_get_proof({ submissionId: 'sub_123' });
-```
-
-Normal adapter results return product summaries and omit typed data, raw
-signatures, and source/signal identifiers. Pass `includeRaw: true` only for an
-explicit wallet-signing handoff or protocol debugging.
 
 Query and operate local watcher jobs:
 
@@ -502,11 +448,7 @@ Watcher job semantics:
 - `hashEvidenceFile`: hashes off-chain evidence without storing plaintext.
 - `listSignalContainers`, `getSignalContainer`, `prepareSignalContainer`,
   `signPreparedSignalContainer`, `submitPreparedSignalContainer`, and
-  `getSignalContainerProof`: thin Product API task helpers for future MCP
-  adapters.
-- `createProductMcpAdapter`: exposes `uvp_list_tasks`, `uvp_get_task`,
-  `uvp_prepare_signal`, `uvp_hash_evidence`, `uvp_submit_signal`, and
-  `uvp_get_proof` as a thin Product API SDK adapter.
+  `getSignalContainerProof`: thin Product API task helpers.
 - `loadPrivateKeyFromEnv`: loads a wallet key from an explicit env var without
   logging it.
 
