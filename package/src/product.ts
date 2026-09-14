@@ -1,10 +1,14 @@
 import { isHex, type Address, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import {
+  PRODUCT_SUBMIT_DOMAIN_NAME,
   PRODUCT_SUBMIT_DOMAIN_VERSION,
+  PRODUCT_SUBMIT_PRIMARY_TYPE,
   PRODUCT_SUBMIT_TYPED_DATA_FIELDS,
+  validateTypedDataForSigning,
   type ProductSubmitTypedData,
   type ProductSubmitTypedDataField,
+  type TypedDataSigningMismatchReason,
 } from '@uvp-eth/protocol-bindings';
 import { hashEvidenceFile, type EvidenceHashResult } from './evidence.js';
 import { loadPrivateKeyFromEnv } from './signing.js';
@@ -346,27 +350,29 @@ export async function signPreparedSignalContainer(
   const configuredWallet = normalizeAddressChecksummed(input.walletAddress ?? signerAddress, 'walletAddress');
   const submitter = normalizeAddressChecksummed(prepared.typedData.message.submitter, 'typedData.message.submitter');
 
-  if (submitter !== configuredWallet) {
-    throw new ValidationError('typedData.message.submitter does not match configured wallet');
-  }
-  if (prepared.submitter !== submitter) {
-    throw new ValidationError('prepared.submitter does not match typedData.message.submitter');
-  }
-  if (signerAddress !== configuredWallet) {
-    throw new ValidationError('private key signer does not match configured wallet');
-  }
-  if (input.expectedDomain?.chainId !== undefined && prepared.typedData.domain.chainId !== input.expectedDomain.chainId) {
-    throw new ValidationError(
-      `prepared typedData.domain.chainId ${prepared.typedData.domain.chainId} does not match expected chainId ${input.expectedDomain.chainId}`,
-    );
-  }
+  // 签名前闸门单源（protocol-bindings validateTypedDataForSigning，P1-1
+  // 安全面）：判定语义收敛到上游，本仓只把 reason 映射为既有文案。本仓独有
+  // 的“私钥签名者与配置钱包一致”检查经 connectedAddress 承载——上游为
+  // 浏览器钱包“当前连接地址”预留的同一语义位，私钥路径等价复用。
+  // expectedDomain 锚参数化传入：未提供 chainId/verifyingContract 时不比对。
   if (input.expectedDomain?.verifyingContract !== undefined) {
-    const expectedContract = normalizeAddressChecksummed(input.expectedDomain.verifyingContract, 'expectedDomain.verifyingContract');
-    if (prepared.typedData.domain.verifyingContract !== expectedContract) {
-      throw new ValidationError(
-        `prepared typedData.domain.verifyingContract ${prepared.typedData.domain.verifyingContract} does not match expected verifyingContract ${expectedContract}`,
-      );
-    }
+    // 锚本身先过严格校验：垃圾锚报“非法地址”而非含混的“不匹配”。
+    normalizeAddressChecksummed(input.expectedDomain.verifyingContract, 'expectedDomain.verifyingContract');
+  }
+  const gate = validateTypedDataForSigning(prepared.typedData, {
+    primaryType: PRODUCT_SUBMIT_PRIMARY_TYPE,
+    domainName: PRODUCT_SUBMIT_DOMAIN_NAME,
+    domainVersion: PRODUCT_SUBMIT_DOMAIN_VERSION,
+    ...(input.expectedDomain?.chainId !== undefined ? { chainId: input.expectedDomain.chainId } : {}),
+    ...(input.expectedDomain?.verifyingContract !== undefined
+      ? { verifyingContract: input.expectedDomain.verifyingContract }
+      : {}),
+    submitter: configuredWallet,
+    connectedAddress: signerAddress,
+    preparedSubmitters: [prepared.submitter],
+  });
+  if (!gate.ok) {
+    throw signingGateError(gate.reason, prepared, input);
   }
 
   const signature = await account.signTypedData(
@@ -379,6 +385,35 @@ export async function signPreparedSignalContainer(
     submitter,
     signature,
   };
+}
+
+/** 闸门 reason → 本仓既有错误文案：判定在单源，宿主只保留错误形态与措辞。 */
+function signingGateError(
+  reason: TypedDataSigningMismatchReason,
+  prepared: PreparedSignalContainer,
+  input: SignPreparedSignalContainerInput,
+): ValidationError {
+  switch (reason) {
+    case 'signer-not-expected':
+      return new ValidationError('typedData.message.submitter does not match configured wallet');
+    case 'signer-not-prepared':
+      return new ValidationError('prepared.submitter does not match typedData.message.submitter');
+    case 'signer-not-connected':
+      return new ValidationError('private key signer does not match configured wallet');
+    case 'domain-chain-id':
+      return new ValidationError(
+        `prepared typedData.domain.chainId ${prepared.typedData.domain.chainId} does not match expected chainId ${input.expectedDomain?.chainId}`,
+      );
+    case 'domain-verifying-contract':
+      return new ValidationError(
+        `prepared typedData.domain.verifyingContract ${prepared.typedData.domain.verifyingContract} does not match expected verifyingContract ${input.expectedDomain?.verifyingContract}`,
+      );
+    default:
+      // 其余 reason（信封形状/primaryType/域常量类）在本路径不可达：上方
+      // parsePreparedSignalContainer 已用冻结字段表与域常量先行拒绝。
+      // 保底 fail-closed，不静默放行。
+      return new ValidationError(`prepared typedData rejected by the signing gate: ${reason}`);
+  }
 }
 
 export async function submitPreparedSignalContainer(
