@@ -7,6 +7,11 @@ import { encodeAbiParameters, keccak256, stringToBytes, stringToHex, type Hex } 
 import { describe, expect, it, vi } from 'vitest';
 import { classifyExecutorKitError, CodedExecutorKitError } from '../src/errors.js';
 import {
+  stateMachineHandlerConfigToExecutorConfigDTO,
+  stateMachineJobToExecutorJobDTO,
+  summarizeSupplierOps,
+} from '../src/cli/output.js';
+import {
   buildSubmitStateMachineSignalCall,
   createStateMachineHandlersFromConfig,
   createStateMachineWatcher,
@@ -20,13 +25,11 @@ import {
   retryStateMachineJob,
   submitStateMachineSignal,
   SubmitSignalReceiptError,
-  stateMachineHandlerConfigToExecutorConfigDTO,
-  stateMachineJobToExecutorJobDTO,
   stateMachineJobId,
-  summarizeSupplierOps,
+  type StateMachineJobStore,
   type StateMachinePublicClient,
   type StateMachineRawLog,
-} from '../src/watcher.js';
+} from '../src/watcher/index.js';
 import { ValidationError } from '../src/validation.js';
 
 const STATE_MACHINE = '0x0000000000000000000000000000000000000001';
@@ -4107,3 +4110,111 @@ function fakeReceiptClient(chainId: number, receipt: { readonly status?: string 
     },
   };
 }
+
+describe('watcher finality runtime-environment gate', () => {
+  it('keeps the silent default 1 confirmations for local and undeclared runtime environments', () => {
+    const localWatcher = createStateMachineWatcher({ ...gateBaseConfig(), runtimeEnvironment: 'local' });
+    const undeclaredWatcher = createStateMachineWatcher(gateBaseConfig());
+
+    expect(localWatcher.describe().confirmations).toBe(1);
+    expect(undeclaredWatcher.describe().confirmations).toBe(1);
+  });
+
+  it('requires an explicit positive confirmations outside local (chain-services caliber)', () => {
+    for (const runtimeEnvironment of ['testnet', 'staging', 'production'] as const) {
+      expect(() => createStateMachineWatcher({ ...gateBaseConfig(), runtimeEnvironment }))
+        .toThrow(ValidationError);
+      expect(() => createStateMachineWatcher({ ...gateBaseConfig(), runtimeEnvironment }))
+        .toThrow(/confirmations must be explicitly configured/);
+      // 0 (tip scanning) is a local throwaway-chain convenience only.
+      expect(() => createStateMachineWatcher({ ...gateBaseConfig(), runtimeEnvironment, confirmations: 0 }))
+        .toThrow(/must be a positive integer/);
+      const watcher = createStateMachineWatcher({ ...gateBaseConfig(), runtimeEnvironment, confirmations: 5 });
+      expect(watcher.describe().confirmations).toBe(5);
+      expect(watcher.describe().runtimeEnvironment).toBe(runtimeEnvironment);
+    }
+  });
+
+  it('rejects unknown runtimeEnvironment values instead of guessing', () => {
+    expect(() => createStateMachineWatcher({ ...gateBaseConfig(), runtimeEnvironment: 'dev' as never }))
+      .toThrow(/runtimeEnvironment must be local, testnet, staging, or production/);
+  });
+
+  function gateBaseConfig() {
+    return {
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      privateKeyEnv: 'UVP_TEST_PRIVATE_KEY',
+      handlers: {},
+    };
+  }
+});
+
+describe('watcher run-claim release retry', () => {
+  it('alerts on a failed claim release and frees the job on a later poll round', async () => {
+    const inner = new InMemoryStateMachineJobStore();
+    let failRelease = true;
+    const store: StateMachineJobStore = {
+      kind: 'flaky-memory',
+      upsertDetected: (event, options) => inner.upsertDetected(event, options),
+      async update(jobId, patch) {
+        // Only the run-claim release write (claim:null + expectClaimPid guard,
+        // no status change) fails here; every other store write passes.
+        if (patch.claim === null && patch.status === undefined && failRelease) {
+          throw new Error('EACCES: jobs store unavailable');
+        }
+        return await inner.update(jobId, patch);
+      },
+      get: (jobId) => inner.get(jobId),
+      list: () => inner.list(),
+    };
+    const errors: string[] = [];
+    const watcher = createStateMachineWatcher({
+      rpcUrl: 'http://127.0.0.1:8545',
+      stateMachineAddress: STATE_MACHINE,
+      chainId: 31_337,
+      privateKeyEnv: 'UVP_TEST_PRIVATE_KEY',
+      dryRun: true,
+      artifact: artifactIndex(),
+      jobStore: store,
+      handlers: {
+        // 无信号返回：dry-run 收敛为 matched（结论写入不带释放），运行结束
+        // 只能靠 finally 里的 releaseRunClaim 释放认领——正是要演练的路径。
+        '*': () => undefined,
+      },
+      onError: (error) => {
+        errors.push(error instanceof Error ? error.message : String(error));
+      },
+      publicClient: {
+        async getChainId() {
+          return 31_337;
+        },
+        async getBlockNumber() {
+          return 12n;
+        },
+        async getLogs() {
+          return [];
+        },
+      },
+    });
+
+    const result = await watcher.handleLog(hookReadyLog());
+    const jobId = result.job?.id;
+    if (!jobId) {
+      throw new Error('expected a processed job');
+    }
+    // The release write failed: the claim is still held by this live pid, and
+    // the operator channel saw the alert instead of silence.
+    const stuck = await store.get(jobId);
+    expect(stuck?.claim?.pid).toBe(process.pid);
+    expect(errors.some((message) => message.includes('failed to release the run claim'))).toBe(true);
+
+    // Store recovers: the next poll round retries the release and frees the
+    // job for scans and manual retries.
+    failRelease = false;
+    await watcher.pollOnce();
+    const released = await store.get(jobId);
+    expect(released?.claim).toBeUndefined();
+  });
+});

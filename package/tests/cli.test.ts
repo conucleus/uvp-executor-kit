@@ -13,7 +13,7 @@ import {
   resolveWatcherStorage,
   WATCHER_STATE_DIR_ENV,
 } from '../src/cli.js';
-import { FileStateMachineCursorStore, FileStateMachineJobStore, loadStateMachineHandlerConfig } from '../src/watcher.js';
+import { FileStateMachineCursorStore, FileStateMachineJobStore, loadStateMachineHandlerConfig } from '../src/watcher/index.js';
 import { ValidationError } from '../src/validation.js';
 
 const RETRY_STATE_MACHINE = '0x0000000000000000000000000000000000000001';

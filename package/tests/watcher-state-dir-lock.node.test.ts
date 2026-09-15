@@ -15,11 +15,11 @@ import {
   InMemoryStateMachineJobStore,
   retryStateMachineJob,
   stateMachineJobId,
-} from '../src/watcher.js';
+} from '../src/watcher/index.js';
 import { main } from '../src/cli.js';
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const watcherEntryUrl = pathToFileURL(join(packageDir, 'src/watcher.ts')).href;
+const watcherEntryUrl = pathToFileURL(join(packageDir, 'src/watcher/storage/lock.ts')).href;
 const stateMachine = '0x1111111111111111111111111111111111111111' as const;
 const wallet = '0x2222222222222222222222222222222222222222' as const;
 

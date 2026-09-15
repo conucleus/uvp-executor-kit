@@ -1,17 +1,21 @@
 import { isHex, type Address, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import {
+  PRODUCT_SUBMIT_DOMAIN_NAME,
   PRODUCT_SUBMIT_DOMAIN_VERSION,
+  PRODUCT_SUBMIT_PRIMARY_TYPE,
   PRODUCT_SUBMIT_TYPED_DATA_FIELDS,
+  validateTypedDataForSigning,
   type ProductSubmitTypedData,
   type ProductSubmitTypedDataField,
+  type TypedDataSigningMismatchReason,
 } from '@uvp-eth/protocol-bindings';
 import { hashEvidenceFile, type EvidenceHashResult } from './evidence.js';
 import { loadPrivateKeyFromEnv } from './signing.js';
 import { UnsupportedChainTargetError, type ChainTarget } from './chain-target.js';
 import {
   ExecutorKitError,
-  normalizeAddress,
+  normalizeAddressChecksummed,
   normalizeBytes32,
   ValidationError,
 } from './validation.js';
@@ -289,7 +293,7 @@ export class ProductApiError extends ExecutorKitError {
 }
 
 export async function listSignalContainers(input: ListSignalContainersInput): Promise<readonly ProductSignalContainer[]> {
-  const walletAddress = normalizeAddress(input.walletAddress, 'walletAddress');
+  const walletAddress = normalizeAddressChecksummed(input.walletAddress, 'walletAddress');
   const { body, requestId } = await requestProductApiJson(input, 'GET', '/product/tasks', undefined, {
     assignee: walletAddress,
     ...(input.orderId ? { orderId: input.orderId } : {}),
@@ -307,7 +311,7 @@ export async function listSignalContainers(input: ListSignalContainersInput): Pr
 
 export async function getSignalContainer(input: GetSignalContainerInput): Promise<ProductSignalContainer> {
   if (input.walletAddress) {
-    normalizeAddress(input.walletAddress, 'walletAddress');
+    normalizeAddressChecksummed(input.walletAddress, 'walletAddress');
   }
   const { body, requestId } = await requestProductApiJson(input, 'GET', `/product/tasks/${encodeURIComponent(requiredText(input.taskId, 'taskId'))}`);
   const record = requireRecord(body, 'Product task response');
@@ -319,7 +323,7 @@ export async function hashContainerEvidence(input: HashContainerEvidenceInput): 
 }
 
 export async function prepareSignalContainer(input: PrepareSignalContainerInput): Promise<PreparedSignalContainer> {
-  const walletAddress = normalizeAddress(input.walletAddress, 'walletAddress');
+  const walletAddress = normalizeAddressChecksummed(input.walletAddress, 'walletAddress');
   const { body, requestId } = await requestProductApiJson(
     input,
     'POST',
@@ -342,31 +346,33 @@ export async function signPreparedSignalContainer(
   const prepared = parsePreparedSignalContainer(input.prepared, 'prepared submission');
   const privateKey = loadProductPrivateKeyFromEnv(input.privateKeyEnv);
   const account = privateKeyToAccount(privateKey);
-  const signerAddress = normalizeAddress(account.address, 'privateKeyEnv signer');
-  const configuredWallet = normalizeAddress(input.walletAddress ?? signerAddress, 'walletAddress');
-  const submitter = normalizeAddress(prepared.typedData.message.submitter, 'typedData.message.submitter');
+  const signerAddress = normalizeAddressChecksummed(account.address, 'privateKeyEnv signer');
+  const configuredWallet = normalizeAddressChecksummed(input.walletAddress ?? signerAddress, 'walletAddress');
+  const submitter = normalizeAddressChecksummed(prepared.typedData.message.submitter, 'typedData.message.submitter');
 
-  if (submitter !== configuredWallet) {
-    throw new ValidationError('typedData.message.submitter does not match configured wallet');
-  }
-  if (prepared.submitter !== submitter) {
-    throw new ValidationError('prepared.submitter does not match typedData.message.submitter');
-  }
-  if (signerAddress !== configuredWallet) {
-    throw new ValidationError('private key signer does not match configured wallet');
-  }
-  if (input.expectedDomain?.chainId !== undefined && prepared.typedData.domain.chainId !== input.expectedDomain.chainId) {
-    throw new ValidationError(
-      `prepared typedData.domain.chainId ${prepared.typedData.domain.chainId} does not match expected chainId ${input.expectedDomain.chainId}`,
-    );
-  }
+  // 签名前闸门单源（protocol-bindings validateTypedDataForSigning，P1-1
+  // 安全面）：判定语义收敛到上游，本仓只把 reason 映射为既有文案。本仓独有
+  // 的“私钥签名者与配置钱包一致”检查经 connectedAddress 承载——上游为
+  // 浏览器钱包“当前连接地址”预留的同一语义位，私钥路径等价复用。
+  // expectedDomain 锚参数化传入：未提供 chainId/verifyingContract 时不比对。
   if (input.expectedDomain?.verifyingContract !== undefined) {
-    const expectedContract = normalizeAddress(input.expectedDomain.verifyingContract, 'expectedDomain.verifyingContract');
-    if (prepared.typedData.domain.verifyingContract !== expectedContract) {
-      throw new ValidationError(
-        `prepared typedData.domain.verifyingContract ${prepared.typedData.domain.verifyingContract} does not match expected verifyingContract ${expectedContract}`,
-      );
-    }
+    // 锚本身先过严格校验：垃圾锚报“非法地址”而非含混的“不匹配”。
+    normalizeAddressChecksummed(input.expectedDomain.verifyingContract, 'expectedDomain.verifyingContract');
+  }
+  const gate = validateTypedDataForSigning(prepared.typedData, {
+    primaryType: PRODUCT_SUBMIT_PRIMARY_TYPE,
+    domainName: PRODUCT_SUBMIT_DOMAIN_NAME,
+    domainVersion: PRODUCT_SUBMIT_DOMAIN_VERSION,
+    ...(input.expectedDomain?.chainId !== undefined ? { chainId: input.expectedDomain.chainId } : {}),
+    ...(input.expectedDomain?.verifyingContract !== undefined
+      ? { verifyingContract: input.expectedDomain.verifyingContract }
+      : {}),
+    submitter: configuredWallet,
+    connectedAddress: signerAddress,
+    preparedSubmitters: [prepared.submitter],
+  });
+  if (!gate.ok) {
+    throw signingGateError(gate.reason, prepared, input);
   }
 
   const signature = await account.signTypedData(
@@ -381,11 +387,40 @@ export async function signPreparedSignalContainer(
   };
 }
 
+/** 闸门 reason → 本仓既有错误文案：判定在单源，宿主只保留错误形态与措辞。 */
+function signingGateError(
+  reason: TypedDataSigningMismatchReason,
+  prepared: PreparedSignalContainer,
+  input: SignPreparedSignalContainerInput,
+): ValidationError {
+  switch (reason) {
+    case 'signer-not-expected':
+      return new ValidationError('typedData.message.submitter does not match configured wallet');
+    case 'signer-not-prepared':
+      return new ValidationError('prepared.submitter does not match typedData.message.submitter');
+    case 'signer-not-connected':
+      return new ValidationError('private key signer does not match configured wallet');
+    case 'domain-chain-id':
+      return new ValidationError(
+        `prepared typedData.domain.chainId ${prepared.typedData.domain.chainId} does not match expected chainId ${input.expectedDomain?.chainId}`,
+      );
+    case 'domain-verifying-contract':
+      return new ValidationError(
+        `prepared typedData.domain.verifyingContract ${prepared.typedData.domain.verifyingContract} does not match expected verifyingContract ${input.expectedDomain?.verifyingContract}`,
+      );
+    default:
+      // 其余 reason（信封形状/primaryType/域常量类）在本路径不可达：上方
+      // parsePreparedSignalContainer 已用冻结字段表与域常量先行拒绝。
+      // 保底 fail-closed，不静默放行。
+      return new ValidationError(`prepared typedData rejected by the signing gate: ${reason}`);
+  }
+}
+
 export async function submitPreparedSignalContainer(
   input: SubmitPreparedSignalContainerInput,
 ): Promise<SubmittedSignalContainer> {
   const signature = normalizeSignature(input.signature);
-  const walletAddress = normalizeAddress(input.walletAddress, 'walletAddress');
+  const walletAddress = normalizeAddressChecksummed(input.walletAddress, 'walletAddress');
   const { body, requestId } = await requestProductApiJson(
     input,
     'POST',
@@ -497,8 +532,8 @@ export function summarizeSubmittedSignalContainer(
 export function parsePreparedSignalContainer(value: unknown, label = 'prepared submission'): PreparedSignalContainer {
   const record = requireRecord(value, label);
   const typedData = parseProductSubmitTypedData(record.typedData, `${label}.typedData`);
-  const submitter = normalizeAddress(requiredString(record, 'submitter', label), `${label}.submitter`);
-  const typedDataSubmitter = normalizeAddress(typedData.message.submitter, `${label}.typedData.message.submitter`);
+  const submitter = normalizeAddressChecksummed(requiredString(record, 'submitter', label), `${label}.submitter`);
+  const typedDataSubmitter = normalizeAddressChecksummed(typedData.message.submitter, `${label}.typedData.message.submitter`);
   if (submitter !== typedDataSubmitter) {
     throw new ValidationError(`${label}.submitter must match typedData.message.submitter`);
   }
@@ -618,7 +653,7 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
       name: domainName,
       version: domainVersion,
       chainId,
-      verifyingContract: normalizeAddress(
+      verifyingContract: normalizeAddressChecksummed(
         requiredString(domain, 'verifyingContract', `${label}.domain`),
         `${label}.domain.verifyingContract`,
       ),
@@ -637,7 +672,7 @@ function parseProductSubmitTypedData(value: unknown, label: string): ProductSubm
         requiredString(message, 'idempotencyKey', `${label}.message`),
         `${label}.message.idempotencyKey`,
       ),
-      submitter: normalizeAddress(requiredString(message, 'submitter', `${label}.message`), `${label}.message.submitter`),
+      submitter: normalizeAddressChecksummed(requiredString(message, 'submitter', `${label}.message`), `${label}.message.submitter`),
       deadline: validateFutureDeadline(requiredString(message, 'deadline', `${label}.message`), `${label}.message.deadline`),
     },
   };
@@ -913,7 +948,10 @@ function requiredText(value: string, fieldName: string): string {
 
 function requireStringList(value: readonly string[], label: string): readonly string[] {
   if (!Array.isArray(value) || !value.every((item) => typeof item === 'string' && item.trim().length > 0)) {
-    throw new ValidationError(`${label} must be a non-empty array of strings`);
+    // An empty list is valid on purpose: prepare-submit with no evidenceIds is
+    // the pure-confirmation submission. Only non-string/blank entries are
+    // rejected — the old "non-empty array" wording contradicted the [] pass.
+    throw new ValidationError(`${label} must be an array of non-empty strings (an empty array is valid and submits as a pure confirmation without evidence)`);
   }
   return value.map((item) => item.trim());
 }

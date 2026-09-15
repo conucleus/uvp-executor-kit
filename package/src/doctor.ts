@@ -14,7 +14,7 @@ import {
   type SubmittedSignalContainerSummary,
 } from './product.js';
 import { classifyExecutorKitError } from './errors.js';
-import { normalizeAddress } from './validation.js';
+import { normalizeAddress, normalizeAddressChecksummed } from './validation.js';
 
 export interface ProductDoctorInput extends ProductApiClientOptions {
   readonly walletAddress?: string;
@@ -96,7 +96,7 @@ export async function runProductDoctor(input: ProductDoctorInput): Promise<Produ
   checks.push(reachability);
 
   const effectiveWallet = input.walletAddress
-    ? normalizeAddress(input.walletAddress, 'walletAddress')
+    ? normalizeAddressChecksummed(input.walletAddress, 'walletAddress')
     : undefined;
   if (effectiveWallet) {
     walletAddress = effectiveWallet;

@@ -36,6 +36,43 @@ and nothing republishes it automatically when `src/` changes: run the build
 before invoking the installed `uvp-executor` bin. Workspace consumers import
 the TypeScript sources through the package `exports` and never need `dist`.
 
+## Source Layout
+
+The watcher code is organized by scan-and-delivery lifecycle (B2 治理结构); all
+modules below are internal wiring behind the unchanged SDK surface re-exported
+by `src/index.ts`:
+
+```text
+package/src/
+├── index.ts                   # SDK 公共出口（export * 面保持稳定）
+├── cli.ts                     # CLI 入口：main/buildProgram 与 bin（dist/cli.js）
+├── cli/
+│   ├── commands/              # 命令分发：wallet/product/serve/config/doctor/jobs/chain
+│   ├── options.ts             # 选项类型与参数解析辅助
+│   ├── output.ts              # ExecutorJobDTO 等 DTO 映射与退出码适配
+│   └── watcher.ts             # CLI 装配 watcher（state-dir 锁、存储选择、runtime env）
+├── watcher/
+│   ├── index.ts               # watcher 域公共面（原 src/watcher.ts 的导出集）
+│   ├── watcher.ts             # 扫描与执行编排（StateMachineWatcher 及配置归一化）
+│   ├── scan/logs.ts           # 日志扫描：区块分段与日志排序
+│   ├── scan/reorg.ts          # 重组回退：finality 缓冲、checkpoint 锚点、回滚证据
+│   ├── jobs/model.ts          # job 数据模型、store 契约与 patch/CAS 机制
+│   ├── jobs/claim.ts          # 任务级运行认领（isHeldRunClaim、结论性写入释放）
+│   ├── jobs/retry.ts          # 手工重试、重试/重发回退配置
+│   ├── jobs/deadletter.ts     # 手工 dead-letter
+│   ├── storage/memory.ts      # 内存 job store
+│   ├── storage/file.ts        # jobs.json 持久化（原子写、损坏隔离、复活）
+│   ├── storage/cursor.ts      # cursor.json 持久化与身份校验
+│   ├── storage/lock.ts        # jobs 文件锁与 state-dir 进程锁
+│   ├── execution/handler.ts   # handler 配置、解析与装配
+│   └── execution/receipt.ts   # 交付/回执判定：确认、未决广播与终态规则
+├── signal/
+│   ├── decode.ts              # HookReady 事件解码与 artifact 元数据
+│   ├── build.ts               # submitSignal 调用构建与配置归一化
+│   └── submit.ts              # 交易提交、签名账户与链客户端
+└── participant/               # 参与者侧（浏览器/Order App）导出，子路径不变
+```
+
 ## CLI
 
 Create or inspect a local wallet env file:
@@ -109,7 +146,11 @@ configurable parameters (`--confirmations`, `--reorg-window`,
 - **Finality buffer**: each round scans only up to `head - confirmations`
   (default 1), so a short reorg cannot flip already-processed logs and their
   confirmed submissions behind the cursor. `--confirmations 0` restores tip
-  scanning for throwaway local chains.
+  scanning for throwaway local chains. The silent default is local-only:
+  declaring a non-local runtime with `--runtime-env <env>` on
+  `chain-once`/`chain-watch` (or `UVP_EXECUTOR_RUNTIME_ENV`) makes an explicit
+  positive `--confirmations` mandatory — the same caliber as chain-services
+  requiring an explicit `UVP_FINALITY_CONFIRMATIONS` outside local.
 - **Cursor block-hash continuity**: each successful round remembers the
   canonical hash of its last scanned block (plus exponentially spaced anchors
   inside the reorg window, default 64 blocks). The next round verifies the
@@ -138,6 +179,12 @@ configurable parameters (`--confirmations`, `--reorg-window`,
   unknown. Dedupe on chain is the contract's `SignalAlreadyExists` check on
   the `(planId, orderId, sourceId, signalId)` tuple; the backoff only stops
   the per-round gas burn. Manual `jobs retry` bypasses the throttle.
+- **Run-claim release retries**: a run-claim release whose store write fails
+  is reported through the error channel and retried on every poll round. A
+  live pid's claim blocks both scans and manual retries, so a silently stuck
+  release would park the job in this process forever — the release path gets
+  the same recovery guarantee the dead-holder pid check gives crashed
+  processes.
 
 Build or submit one state-machine signal:
 
@@ -252,19 +299,6 @@ UTC) is display context and never overturns it. Normal output
 omits protocol fields and bearer token values; pass `--verbose` for raw API
 payloads.
 
-The MCP adapter exposes the same checks via `uvp_doctor`:
-
-```ts
-import { createProductMcpAdapter } from '@uvp-eth/executor-kit/mcp';
-const uvp = createProductMcpAdapter({ chainServicesUrl: 'http://127.0.0.1:8787' });
-const report = await uvp.uvp_doctor({
-  walletAddress: '0x...',
-  taskId: 'task_123',
-});
-console.log(report.taskReadiness?.nextActionLabel);
-// "Ready to prepare. Run product prepare to build the signal container."
-```
-
 Enterprise scripts can use the same SDK helpers without shelling out:
 
 ```ts
@@ -298,47 +332,6 @@ await submitPreparedSignalContainer({
   walletAddress: signed.walletAddress,
 });
 ```
-
-## MCP Gate
-
-The MCP adapter (`@uvp-eth/executor-kit/mcp`) is a thin wrapper over the Product
-API SDK calls. It does not introduce a separate Product API client implementation
-or divergent logic.
-
-MCP tools are another supervised signal-producer surface — not a privileged
-backend. An AI agent, MCP tool, enterprise system, or script all dock at the same
-Product API boundary as the browser Order App. The authorized participant wallet
-still produces the business signature; the MCP layer may assist, route, or
-automate but must not replace the participant signature.
-
-```ts
-import { createProductMcpAdapter } from '@uvp-eth/executor-kit/mcp';
-
-const uvp = createProductMcpAdapter({ chainServicesUrl: 'http://127.0.0.1:8787' });
-await uvp.uvp_list_tasks({ walletAddress });
-await uvp.uvp_get_task({ taskId: 'task_123' });
-await uvp.uvp_hash_evidence({ path: './evidence/customs.json' });
-const preparedResult = await uvp.uvp_prepare_signal({
-  taskId: 'task_123',
-  walletAddress,
-  evidenceIds: ['ev_123'],
-  intent: 'confirm_stage',
-  includeRaw: true,
-});
-if (!preparedResult.rawPrepared) {
-  throw new Error('raw prepared response required for signing');
-}
-await uvp.uvp_submit_signal({
-  prepared: preparedResult.rawPrepared,
-  privateKeyEnv: 'UVP_PARTICIPANT_PRIVATE_KEY',
-  walletAddress,
-});
-await uvp.uvp_get_proof({ submissionId: 'sub_123' });
-```
-
-Normal adapter results return product summaries and omit typed data, raw
-signatures, and source/signal identifiers. Pass `includeRaw: true` only for an
-explicit wallet-signing handoff or protocol debugging.
 
 Query and operate local watcher jobs:
 
@@ -455,11 +448,7 @@ Watcher job semantics:
 - `hashEvidenceFile`: hashes off-chain evidence without storing plaintext.
 - `listSignalContainers`, `getSignalContainer`, `prepareSignalContainer`,
   `signPreparedSignalContainer`, `submitPreparedSignalContainer`, and
-  `getSignalContainerProof`: thin Product API task helpers for future MCP
-  adapters.
-- `createProductMcpAdapter`: exposes `uvp_list_tasks`, `uvp_get_task`,
-  `uvp_prepare_signal`, `uvp_hash_evidence`, `uvp_submit_signal`, and
-  `uvp_get_proof` as a thin Product API SDK adapter.
+  `getSignalContainerProof`: thin Product API task helpers.
 - `loadPrivateKeyFromEnv`: loads a wallet key from an explicit env var without
   logging it.
 
